@@ -30,7 +30,6 @@ def _tunnel_to_dict(tunnel: Tunnel) -> dict[str, Any]:
         "peer_ip": str(tunnel.peer_ip),
         "local_cidrs": list(tunnel.local_cidrs),
         "remote_cidrs": list(tunnel.remote_cidrs),
-        "psk_secret_name": tunnel.psk_secret_name,
         "ike_version": tunnel.ike_version,
         "ike_proposals": tunnel.ike_proposals,
         "esp_proposals": tunnel.esp_proposals,
@@ -168,14 +167,13 @@ async def create_tunnel(
     # Acquire lock
     await require_lock(session, LOCK_IPSEC_CONFIG)
 
-    # Insert tunnel
+    # Insert tunnel (PSK is NOT stored in DB — only written to S3)
     tunnel = Tunnel(
         name=data.name,
         description=data.description,
         peer_ip=str(data.peer_ip),
         local_cidrs=[str(c) for c in data.local_cidrs],
         remote_cidrs=[str(c) for c in data.remote_cidrs],
-        psk_secret_name=data.psk_secret_name,
         ike_version=data.ike_version,
         ike_proposals=data.ike_proposals,
         esp_proposals=data.esp_proposals,
@@ -189,9 +187,9 @@ async def create_tunnel(
     session.add(tunnel)
     await session.flush()
 
-    # Sync infrastructure
+    # Sync infrastructure — upload .conf + .secrets to S3, reload ipsec
     try:
-        await ipsec_config.sync_ipsec_config(session)
+        await ipsec_config.sync_tunnel_config(tunnel, psk=data.psk)
         tunnel.sync_status = "synced"
         tunnel.sync_error = None
         logger.info("tunnel_create_synced", tunnel_id=tunnel.id, name=tunnel.name)
@@ -272,12 +270,16 @@ async def update_tunnel(
     # Acquire lock
     await require_lock(session, LOCK_IPSEC_CONFIG)
 
+    # Extract PSK before applying updates (not a DB field)
+    psk = update_data.pop("psk", None)
+    old_name = tunnel.name
+
     # Determine if infra sync is needed
     infra_fields = {"peer_ip", "local_cidrs", "remote_cidrs", "ike_version", "ike_proposals",
                     "esp_proposals", "dpd_action", "dpd_delay", "dpd_timeout", "name"}
-    needs_sync = bool(infra_fields & set(update_data.keys()))
+    needs_sync = bool(infra_fields & set(update_data.keys())) or psk is not None
 
-    # Apply updates
+    # Apply updates to DB fields (excludes psk which is not in the model)
     for field, value in update_data.items():
         if field == "peer_ip" and value is not None:
             setattr(tunnel, field, str(value))
@@ -286,14 +288,32 @@ async def update_tunnel(
         else:
             setattr(tunnel, field, value)
 
-    # Sync infrastructure if connection params changed
+    # Sync infrastructure if connection params or PSK changed
     if needs_sync:
         tunnel.sync_status = "pending"
         try:
-            await ipsec_config.sync_ipsec_config(session)
-            tunnel.sync_status = "synced"
-            tunnel.sync_error = None
-            logger.info("tunnel_update_synced", tunnel_id=tunnel.id)
+            if "name" in update_data and update_data["name"] != old_name and psk is not None:
+                # Rename: delete old files, upload new
+                await ipsec_config.rename_tunnel_config(old_name, tunnel, psk)
+            elif "name" in update_data and update_data["name"] != old_name:
+                # Rename without PSK change — need to read old secrets first
+                # For now, require PSK on rename
+                tunnel.sync_status = "failed"
+                tunnel.sync_error = "PSK is required when renaming a tunnel"
+            elif psk is not None:
+                # PSK or config changed, same name
+                await ipsec_config.sync_tunnel_config(tunnel, psk)
+            else:
+                # Config changed but no PSK — re-upload .conf only, keep .secrets
+                conf_content = ipsec_config.render_connection_conf(tunnel)
+                from app.services import s3
+                await s3.upload_file(f"connections/{tunnel.name}.conf", conf_content)
+                await ssm.reload_ipsec()
+
+            if tunnel.sync_status != "failed":
+                tunnel.sync_status = "synced"
+                tunnel.sync_error = None
+                logger.info("tunnel_update_synced", tunnel_id=tunnel.id)
         except InfrastructureError as exc:
             tunnel.sync_status = "failed"
             tunnel.sync_error = exc.message
@@ -411,9 +431,9 @@ async def delete_tunnel(
     tunnel.deleted_at = now
     tunnel.sync_status = "pending_delete"
 
-    # Regenerate ipsec.conf without the deleted tunnel
+    # Remove connection .conf and .secrets from S3, reload ipsec
     try:
-        await ipsec_config.sync_ipsec_config(session)
+        await ipsec_config.remove_tunnel_config(tunnel.name)
         logger.info("tunnel_delete_synced", tunnel_id=tunnel_id)
     except InfrastructureError as exc:
         logger.error(
@@ -474,7 +494,11 @@ async def retry_tunnel_sync(
 
     tunnel.sync_status = "pending"
     try:
-        await ipsec_config.sync_ipsec_config(session)
+        # Re-upload .conf from current DB state; .secrets already exists in S3
+        from app.services import s3
+        conf_content = ipsec_config.render_connection_conf(tunnel)
+        await s3.upload_file(f"connections/{tunnel.name}.conf", conf_content)
+        await ssm.reload_ipsec()
         tunnel.sync_status = "synced"
         tunnel.sync_error = None
         logger.info("tunnel_retry_synced", tunnel_id=tunnel.id)

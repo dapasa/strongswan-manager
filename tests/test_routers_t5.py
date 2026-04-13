@@ -309,7 +309,7 @@ class TestMiddleware:
                         "peer_ip": "1.2.3.4",
                         "local_cidrs": ["10.0.0.0/24"],
                         "remote_cidrs": ["192.168.0.0/24"],
-                        "psk_secret_name": "vpn/psk",
+                        "psk": "vpn/psk",
                     },
                 )
 

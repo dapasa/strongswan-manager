@@ -144,7 +144,7 @@ Security Associations (0 up, 1 connecting):
 
 class TestTunnelServiceCreate:
     @patch("app.services.tunnel_service.audit.log_action", new_callable=AsyncMock)
-    @patch("app.services.tunnel_service.ipsec_config.sync_ipsec_config", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.ipsec_config.sync_tunnel_config", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
     async def test_create_tunnel_success(self, mock_lock, mock_sync, mock_audit):
         from app.services.tunnel_service import create_tunnel
@@ -164,7 +164,7 @@ class TestTunnelServiceCreate:
         data.peer_ip = "203.0.113.1"
         data.local_cidrs = ["10.0.0.0/24"]
         data.remote_cidrs = ["192.168.1.0/24"]
-        data.psk_secret_name = "vpn/psk"
+        data.psk = "vpn/psk"
         data.ike_version = "2"
         data.ike_proposals = None
         data.esp_proposals = None
@@ -207,10 +207,12 @@ class TestTunnelServiceCreate:
 
 class TestTunnelServiceRetry:
     @patch("app.services.tunnel_service.audit.log_action", new_callable=AsyncMock)
-    @patch("app.services.tunnel_service.ipsec_config.sync_ipsec_config", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.ssm.reload_ipsec", new_callable=AsyncMock)
+    @patch("app.services.s3.upload_file", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.ipsec_config.render_connection_conf", return_value="conn test\n")
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
-    async def test_retry_success(self, mock_get, mock_lock, mock_sync, mock_audit):
+    async def test_retry_success(self, mock_get, mock_lock, mock_render, mock_upload, mock_reload, mock_audit):
         from app.services.tunnel_service import retry_tunnel_sync
 
         tunnel = MagicMock()
@@ -230,7 +232,8 @@ class TestTunnelServiceRetry:
 
         result = await retry_tunnel_sync(session, 1, user=user)
         assert result.sync_status == "synced"
-        mock_sync.assert_called_once()
+        mock_upload.assert_called_once()
+        mock_reload.assert_called_once()
 
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
     async def test_retry_not_failed_raises_conflict(self, mock_get):

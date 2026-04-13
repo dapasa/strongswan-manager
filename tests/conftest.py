@@ -179,7 +179,6 @@ def create_test_tunnel(db_session: AsyncSession):
             "peer_ip": "203.0.113.1",
             "local_cidrs": ["10.0.0.0/24"],
             "remote_cidrs": ["192.168.1.0/24"],
-            "psk_secret_name": "vpn/test-tunnel-psk",
             "ike_version": "2",
             "dpd_action": "restart",
             "dpd_delay": 30,
@@ -263,16 +262,19 @@ def create_test_iptables_rule(db_session: AsyncSession):
 def mock_s3_service():
     """Patch S3 service functions with AsyncMock."""
     with (
-        patch("app.services.s3.download_ipsec_conf", new_callable=AsyncMock) as mock_download,
-        patch("app.services.s3.upload_ipsec_conf", new_callable=AsyncMock) as mock_upload,
+        patch("app.services.s3.upload_file", new_callable=AsyncMock) as mock_upload,
+        patch("app.services.s3.download_file", new_callable=AsyncMock) as mock_download,
+        patch("app.services.s3.delete_file", new_callable=AsyncMock) as mock_delete,
         patch("app.services.s3.check_connectivity", new_callable=AsyncMock) as mock_check,
     ):
-        mock_download.return_value = "# ipsec.conf test content"
+        mock_download.return_value = "conn test\n"
         mock_upload.return_value = None
+        mock_delete.return_value = None
         mock_check.return_value = True
         yield {
-            "download_ipsec_conf": mock_download,
-            "upload_ipsec_conf": mock_upload,
+            "upload_file": mock_upload,
+            "download_file": mock_download,
+            "delete_file": mock_delete,
             "check_connectivity": mock_check,
         }
 

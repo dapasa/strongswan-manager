@@ -138,12 +138,11 @@ class TestAuditService:
 class TestS3Service:
     @patch("app.services.s3._get_s3_client")
     @patch("app.services.s3.get_settings")
-    async def test_download_ipsec_conf_success(self, mock_settings, mock_client_fn):
-        from app.services.s3 import download_ipsec_conf
+    async def test_download_file_success(self, mock_settings, mock_client_fn):
+        from app.services.s3 import download_file
 
         settings = MagicMock()
         settings.s3_bucket = "test-bucket"
-        settings.s3_ipsec_key = "ipsec.conf"
         mock_settings.return_value = settings
 
         body_mock = MagicMock()
@@ -152,18 +151,17 @@ class TestS3Service:
         mock_client.get_object.return_value = {"Body": body_mock}
         mock_client_fn.return_value = mock_client
 
-        content = await download_ipsec_conf()
+        content = await download_file("connections/test.conf")
         assert "conn test" in content
-        mock_client.get_object.assert_called_once_with(Bucket="test-bucket", Key="ipsec.conf")
+        mock_client.get_object.assert_called_once_with(Bucket="test-bucket", Key="connections/test.conf")
 
     @patch("app.services.s3._get_s3_client")
     @patch("app.services.s3.get_settings")
-    async def test_download_ipsec_conf_no_such_key(self, mock_settings, mock_client_fn):
-        from app.services.s3 import download_ipsec_conf
+    async def test_download_file_no_such_key(self, mock_settings, mock_client_fn):
+        from app.services.s3 import download_file
 
         settings = MagicMock()
         settings.s3_bucket = "test-bucket"
-        settings.s3_ipsec_key = "ipsec.conf"
         mock_settings.return_value = settings
 
         error_response = {"Error": {"Code": "NoSuchKey", "Message": "Not found"}}
@@ -172,36 +170,34 @@ class TestS3Service:
         mock_client_fn.return_value = mock_client
 
         with pytest.raises(InfrastructureError) as exc_info:
-            await download_ipsec_conf()
+            await download_file("connections/missing.conf")
         assert "not found" in exc_info.value.message.lower()
 
     @patch("app.services.s3._get_s3_client")
     @patch("app.services.s3.get_settings")
-    async def test_upload_ipsec_conf_success(self, mock_settings, mock_client_fn):
-        from app.services.s3 import upload_ipsec_conf
+    async def test_upload_file_success(self, mock_settings, mock_client_fn):
+        from app.services.s3 import upload_file
 
         settings = MagicMock()
         settings.s3_bucket = "test-bucket"
-        settings.s3_ipsec_key = "ipsec.conf"
         mock_settings.return_value = settings
 
         mock_client = MagicMock()
         mock_client_fn.return_value = mock_client
 
-        await upload_ipsec_conf("conn test\n")
+        await upload_file("connections/test.conf", "conn test\n")
         mock_client.put_object.assert_called_once()
         call_kwargs = mock_client.put_object.call_args[1]
         assert call_kwargs["Bucket"] == "test-bucket"
-        assert call_kwargs["Key"] == "ipsec.conf"
+        assert call_kwargs["Key"] == "connections/test.conf"
 
     @patch("app.services.s3._get_s3_client")
     @patch("app.services.s3.get_settings")
-    async def test_upload_ipsec_conf_failure(self, mock_settings, mock_client_fn):
-        from app.services.s3 import upload_ipsec_conf
+    async def test_upload_file_failure(self, mock_settings, mock_client_fn):
+        from app.services.s3 import upload_file
 
         settings = MagicMock()
         settings.s3_bucket = "test-bucket"
-        settings.s3_ipsec_key = "ipsec.conf"
         mock_settings.return_value = settings
 
         error_response = {"Error": {"Code": "AccessDenied", "Message": "Denied"}}
@@ -210,7 +206,7 @@ class TestS3Service:
         mock_client_fn.return_value = mock_client
 
         with pytest.raises(InfrastructureError) as exc_info:
-            await upload_ipsec_conf("content")
+            await upload_file("connections/test.conf", "content")
         assert exc_info.value.service == "S3"
 
 
@@ -309,21 +305,8 @@ class TestSSMService:
 
 
 class TestIPSecConfigGenerator:
-    async def test_generate_empty_config(self):
-        from app.services.ipsec_config import generate_ipsec_conf
-
-        session = AsyncMock()
-        mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = []
-        session.execute.return_value = mock_result
-
-        content = await generate_ipsec_conf(session)
-        assert "AUTO-GENERATED" in content
-        assert "config setup" in content
-        assert "conn " not in content
-
-    async def test_generate_with_tunnels(self):
-        from app.services.ipsec_config import generate_ipsec_conf
+    def test_render_connection_conf(self):
+        from app.services.ipsec_config import render_connection_conf
 
         tunnel = MagicMock()
         tunnel.name = "prod-tunnel"
@@ -331,66 +314,92 @@ class TestIPSecConfigGenerator:
         tunnel.local_cidrs = ["10.0.0.0/24", "10.0.1.0/24"]
         tunnel.peer_ip = "203.0.113.1"
         tunnel.remote_cidrs = ["192.168.1.0/24"]
+        tunnel.ike_proposals = "aes256-sha512-ecp521"
+        tunnel.esp_proposals = "aes256-sha512-ecp521"
         tunnel.dpd_action = "restart"
         tunnel.dpd_delay = 30
         tunnel.dpd_timeout = 150
 
-        session = AsyncMock()
-        mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = [tunnel]
-        session.execute.return_value = mock_result
-
-        content = await generate_ipsec_conf(session)
+        content = render_connection_conf(tunnel)
         assert "conn prod-tunnel" in content
         assert "keyexchange=ikev2" in content
-        assert "left=%defaultroute" in content
+        assert "left=%any" in content
         assert "leftsubnet=10.0.0.0/24,10.0.1.0/24" in content
         assert "right=203.0.113.1" in content
         assert "rightsubnet=192.168.1.0/24" in content
         assert "dpdaction=restart" in content
+        assert "ike=aes256-sha512-ecp521" in content
+        assert "esp=aes256-sha512-ecp521" in content
 
-    async def test_generate_multiple_tunnels(self):
-        from app.services.ipsec_config import generate_ipsec_conf
+    def test_render_connection_conf_no_proposals(self):
+        from app.services.ipsec_config import render_connection_conf
 
-        tunnels = []
-        for i, name in enumerate(["alpha", "beta"]):
-            t = MagicMock()
-            t.name = name
-            t.ike_version = "2"
-            t.local_cidrs = [f"10.{i}.0.0/24"]
-            t.peer_ip = f"203.0.113.{i + 1}"
-            t.remote_cidrs = [f"192.168.{i}.0/24"]
-            t.dpd_action = "restart"
-            t.dpd_delay = 30
-            t.dpd_timeout = 150
-            tunnels.append(t)
+        tunnel = MagicMock()
+        tunnel.name = "simple"
+        tunnel.ike_version = "2"
+        tunnel.local_cidrs = ["10.0.0.0/24"]
+        tunnel.peer_ip = "1.2.3.4"
+        tunnel.remote_cidrs = ["192.168.0.0/24"]
+        tunnel.ike_proposals = None
+        tunnel.esp_proposals = None
+        tunnel.dpd_action = "restart"
+        tunnel.dpd_delay = 30
+        tunnel.dpd_timeout = 150
 
-        session = AsyncMock()
-        mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = tunnels
-        session.execute.return_value = mock_result
+        content = render_connection_conf(tunnel)
+        assert "conn simple" in content
+        assert "\n    ike=" not in content
+        assert "\n    esp=" not in content
 
-        content = await generate_ipsec_conf(session)
-        assert "conn alpha" in content
-        assert "conn beta" in content
+    def test_render_secrets_file(self):
+        from app.services.ipsec_config import render_secrets_file
+
+        tunnel = MagicMock()
+        tunnel.peer_ip = "203.0.113.1"
+        tunnel.local_cidrs = ["10.0.0.0/24"]
+
+        content = render_secrets_file(tunnel, "MySecretPSK")
+        assert '203.0.113.1 10.0.0.0 : PSK "MySecretPSK"' in content
 
     @patch("app.services.ipsec_config.ssm.reload_ipsec", new_callable=AsyncMock)
-    @patch("app.services.ipsec_config.s3.upload_ipsec_conf", new_callable=AsyncMock)
-    async def test_sync_ipsec_config(self, mock_upload, mock_reload):
-        from app.services.ipsec_config import sync_ipsec_config
+    @patch("app.services.ipsec_config.s3.upload_file", new_callable=AsyncMock)
+    async def test_sync_tunnel_config(self, mock_upload, mock_reload):
+        from app.services.ipsec_config import sync_tunnel_config
 
-        session = AsyncMock()
-        mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = []
-        session.execute.return_value = mock_result
+        tunnel = MagicMock()
+        tunnel.name = "test-tunnel"
+        tunnel.ike_version = "2"
+        tunnel.local_cidrs = ["10.0.0.0/24"]
+        tunnel.peer_ip = "1.2.3.4"
+        tunnel.remote_cidrs = ["192.168.0.0/24"]
+        tunnel.ike_proposals = None
+        tunnel.esp_proposals = None
+        tunnel.dpd_action = "restart"
+        tunnel.dpd_delay = 30
+        tunnel.dpd_timeout = 150
 
-        await sync_ipsec_config(session)
+        await sync_tunnel_config(tunnel, psk="TestPSK123")
 
-        mock_upload.assert_called_once()
+        assert mock_upload.call_count == 2  # .conf + .secrets
         mock_reload.assert_called_once()
-        # Verify the uploaded content is valid
-        uploaded_content = mock_upload.call_args[0][0]
-        assert "AUTO-GENERATED" in uploaded_content
+
+        # Verify keys
+        conf_call = mock_upload.call_args_list[0]
+        secrets_call = mock_upload.call_args_list[1]
+        assert conf_call[0][0] == "connections/test-tunnel.conf"
+        assert secrets_call[0][0] == "secrets/test-tunnel.secrets"
+
+    @patch("app.services.ipsec_config.ssm.reload_ipsec", new_callable=AsyncMock)
+    @patch("app.services.ipsec_config.s3.delete_file", new_callable=AsyncMock)
+    async def test_remove_tunnel_config(self, mock_delete, mock_reload):
+        from app.services.ipsec_config import remove_tunnel_config
+
+        await remove_tunnel_config("old-tunnel")
+
+        assert mock_delete.call_count == 2  # .conf + .secrets
+        mock_reload.assert_called_once()
+        mock_delete.assert_any_call("connections/old-tunnel.conf")
+        mock_delete.assert_any_call("secrets/old-tunnel.secrets")
 
 
 # ---------------------------------------------------------------------------

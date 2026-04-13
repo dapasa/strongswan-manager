@@ -25,7 +25,7 @@ def test_tunnel_create_valid():
         peer_ip="203.0.113.1",
         local_cidrs=["10.0.0.0/24"],
         remote_cidrs=["192.168.1.0/24"],
-        psk_secret_name="vpn/prod-psk",
+        psk="vpn/prod-psk",
     )
     assert t.name == "prod-tunnel"
     assert t.peer_ip == IPv4Address("203.0.113.1")
@@ -41,7 +41,7 @@ def test_tunnel_create_missing_name():
             peer_ip="203.0.113.1",
             local_cidrs=["10.0.0.0/24"],
             remote_cidrs=["192.168.1.0/24"],
-            psk_secret_name="vpn/psk",
+            psk="vpn/psk",
         )
     assert "name" in str(exc_info.value)
 
@@ -53,7 +53,7 @@ def test_tunnel_create_empty_name():
             peer_ip="203.0.113.1",
             local_cidrs=["10.0.0.0/24"],
             remote_cidrs=["192.168.1.0/24"],
-            psk_secret_name="vpn/psk",
+            psk="vpn/psk",
         )
 
 
@@ -64,7 +64,7 @@ def test_tunnel_create_invalid_peer_ip():
             peer_ip="not-an-ip",
             local_cidrs=["10.0.0.0/24"],
             remote_cidrs=["192.168.1.0/24"],
-            psk_secret_name="vpn/psk",
+            psk="vpn/psk",
         )
 
 
@@ -75,7 +75,7 @@ def test_tunnel_create_empty_cidrs():
             peer_ip="203.0.113.1",
             local_cidrs=[],
             remote_cidrs=["192.168.1.0/24"],
-            psk_secret_name="vpn/psk",
+            psk="vpn/psk",
         )
 
 
@@ -86,7 +86,7 @@ def test_tunnel_create_invalid_cidr():
             peer_ip="203.0.113.1",
             local_cidrs=["not-a-cidr"],
             remote_cidrs=["192.168.1.0/24"],
-            psk_secret_name="vpn/psk",
+            psk="vpn/psk",
         )
 
 
@@ -97,7 +97,7 @@ def test_tunnel_create_invalid_ike_version():
             peer_ip="203.0.113.1",
             local_cidrs=["10.0.0.0/24"],
             remote_cidrs=["192.168.1.0/24"],
-            psk_secret_name="vpn/psk",
+            psk="vpn/psk",
             ike_version="3",
         )
 

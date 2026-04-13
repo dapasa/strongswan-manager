@@ -1,4 +1,9 @@
-"""S3 service — manages ipsec.conf upload and download via boto3."""
+"""S3 service — manages per-connection config and secrets files in S3.
+
+Bucket structure:
+    connections/{name}.conf     — StrongSwan connection config
+    secrets/{name}.secrets      — PSK secrets for the connection
+"""
 
 from __future__ import annotations
 
@@ -22,18 +27,55 @@ def _get_s3_client():  # noqa: ANN202
     return boto3.client("s3", region_name=settings.aws_region)
 
 
-async def download_ipsec_conf() -> str:
-    """Download ipsec.conf from S3.
+async def upload_file(key: str, content: str) -> None:
+    """Upload a text file to the S3 config bucket.
 
-    Returns:
-        The file content as a string.
+    Args:
+        key: S3 object key (e.g., ``connections/my-tunnel.conf``).
+        content: File content as string.
 
     Raises:
-        InfrastructureError: On S3 download failure (missing key, permissions, etc.).
+        InfrastructureError: On S3 upload failure.
     """
     settings = get_settings()
     bucket = settings.s3_bucket
-    key = settings.s3_ipsec_key
+
+    logger.info("s3_upload_start", bucket=bucket, key=key, size=len(content))
+
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: _get_s3_client().put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=content.encode("utf-8"),
+                ContentType="text/plain",
+            ),
+        )
+        logger.info("s3_upload_complete", bucket=bucket, key=key)
+    except ClientError as exc:
+        raise InfrastructureError(
+            service="S3",
+            message=f"Failed to upload s3://{bucket}/{key}",
+            detail=str(exc),
+        ) from exc
+
+
+async def download_file(key: str) -> str:
+    """Download a text file from the S3 config bucket.
+
+    Args:
+        key: S3 object key.
+
+    Returns:
+        File content as string.
+
+    Raises:
+        InfrastructureError: On S3 download failure.
+    """
+    settings = get_settings()
+    bucket = settings.s3_bucket
 
     logger.info("s3_download_start", bucket=bucket, key=key)
 
@@ -62,61 +104,73 @@ async def download_ipsec_conf() -> str:
             message=f"Failed to download s3://{bucket}/{key}",
             detail=str(exc),
         ) from exc
-    except Exception as exc:
-        raise InfrastructureError(
-            service="S3",
-            message=f"Unexpected error downloading s3://{bucket}/{key}",
-            detail=str(exc),
-        ) from exc
 
 
-async def upload_ipsec_conf(content: str) -> None:
-    """Upload ipsec.conf content to S3.
+async def delete_file(key: str) -> None:
+    """Delete a file from the S3 config bucket.
 
     Args:
-        content: The full ipsec.conf file content.
+        key: S3 object key to delete.
 
     Raises:
-        InfrastructureError: On S3 upload failure.
+        InfrastructureError: On S3 delete failure.
     """
     settings = get_settings()
     bucket = settings.s3_bucket
-    key = settings.s3_ipsec_key
 
-    logger.info("s3_upload_start", bucket=bucket, key=key, size=len(content))
+    logger.info("s3_delete_start", bucket=bucket, key=key)
 
     loop = asyncio.get_running_loop()
     try:
         await loop.run_in_executor(
             None,
-            lambda: _get_s3_client().put_object(
-                Bucket=bucket,
-                Key=key,
-                Body=content.encode("utf-8"),
-                ContentType="text/plain",
-            ),
+            lambda: _get_s3_client().delete_object(Bucket=bucket, Key=key),
         )
-        logger.info("s3_upload_complete", bucket=bucket, key=key)
+        logger.info("s3_delete_complete", bucket=bucket, key=key)
     except ClientError as exc:
         raise InfrastructureError(
             service="S3",
-            message=f"Failed to upload s3://{bucket}/{key}",
+            message=f"Failed to delete s3://{bucket}/{key}",
             detail=str(exc),
         ) from exc
-    except Exception as exc:
+
+
+async def list_connections() -> list[str]:
+    """List all connection config files in the bucket.
+
+    Returns:
+        List of connection names (without path prefix or extension).
+    """
+    settings = get_settings()
+    bucket = settings.s3_bucket
+    prefix = "connections/"
+
+    loop = asyncio.get_running_loop()
+    try:
+        response = await loop.run_in_executor(
+            None,
+            lambda: _get_s3_client().list_objects_v2(
+                Bucket=bucket,
+                Prefix=prefix,
+            ),
+        )
+        names = []
+        for obj in response.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith(".conf"):
+                name = key.removeprefix(prefix).removesuffix(".conf")
+                names.append(name)
+        return sorted(names)
+    except ClientError as exc:
         raise InfrastructureError(
             service="S3",
-            message=f"Unexpected error uploading s3://{bucket}/{key}",
+            message=f"Failed to list connections in s3://{bucket}/{prefix}",
             detail=str(exc),
         ) from exc
 
 
 async def check_connectivity() -> bool:
-    """Verify S3 bucket access for the health endpoint.
-
-    Returns:
-        True if the bucket is accessible, False otherwise.
-    """
+    """Verify S3 bucket access for the health endpoint."""
     settings = get_settings()
     loop = asyncio.get_running_loop()
     try:

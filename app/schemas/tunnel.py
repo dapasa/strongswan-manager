@@ -19,7 +19,7 @@ class TunnelCreate(BaseModel):
     peer_ip: IPv4Address = Field(..., description="Remote peer IP address")
     local_cidrs: list[IPv4Network] = Field(..., min_length=1, description="Local CIDR ranges")
     remote_cidrs: list[IPv4Network] = Field(..., min_length=1, description="Remote CIDR ranges")
-    psk_secret_name: str = Field(..., min_length=1, description="AWS Secrets Manager secret name for PSK")
+    psk: str = Field(..., min_length=1, description="Pre-shared key for the tunnel (not stored in DB, written to S3 only)")
     ike_version: Literal["1", "2"] = Field(default="2", description="IKE protocol version")
     ike_proposals: str | None = Field(None, description="Custom IKE proposals (e.g., 'aes256-sha256-modp2048')")
     esp_proposals: str | None = Field(None, description="Custom ESP proposals")
@@ -36,7 +36,7 @@ class TunnelUpdate(BaseModel):
     peer_ip: IPv4Address | None = None
     local_cidrs: list[IPv4Network] | None = None
     remote_cidrs: list[IPv4Network] | None = None
-    psk_secret_name: str | None = None
+    psk: str | None = Field(None, description="New PSK value (rewrites S3 secrets file if provided)")
     ike_version: Literal["1", "2"] | None = None
     ike_proposals: str | None = None
     esp_proposals: str | None = None
@@ -71,7 +71,6 @@ class TunnelDetail(BaseModel):
     peer_ip: str
     local_cidrs: list[str]
     remote_cidrs: list[str]
-    psk_secret_name: str
     ike_version: str
     ike_proposals: str | None = None
     esp_proposals: str | None = None

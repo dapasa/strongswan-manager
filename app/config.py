@@ -28,8 +28,7 @@ class Settings(BaseSettings):
     oidc_audience: str = Field(..., description="OIDC audience claim to validate")
 
     # AWS / S3
-    s3_bucket: str = Field(..., description="S3 bucket for ipsec.conf")
-    s3_ipsec_key: str = Field(default="ipsec/ipsec.conf", description="S3 key for ipsec.conf")
+    s3_bucket: str = Field(..., description="S3 bucket for StrongSwan config files")
     aws_region: str = Field(default="us-east-1")
 
     # SSM
@@ -72,6 +71,7 @@ class Settings(BaseSettings):
         "env_file": ".env",
         "env_file_encoding": "utf-8",
         "case_sensitive": False,
+        "extra": "ignore",
     }
 
 

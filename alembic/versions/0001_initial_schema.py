@@ -50,7 +50,6 @@ def upgrade() -> None:
         sa.Column("peer_ip", postgresql.INET, nullable=False),
         sa.Column("local_cidrs", postgresql.ARRAY(postgresql.CIDR), nullable=False),
         sa.Column("remote_cidrs", postgresql.ARRAY(postgresql.CIDR), nullable=False),
-        sa.Column("psk_secret_name", sa.Text, nullable=False),
         sa.Column("ike_version", sa.Text, nullable=False, server_default="2"),
         sa.Column("ike_proposals", sa.Text, nullable=True),
         sa.Column("esp_proposals", sa.Text, nullable=True),

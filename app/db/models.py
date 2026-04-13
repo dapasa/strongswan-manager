@@ -56,7 +56,6 @@ class Tunnel(TimestampMixin, SoftDeleteMixin, Base):
     peer_ip: Mapped[str] = mapped_column(INET, nullable=False)
     local_cidrs: Mapped[list[str]] = mapped_column(ARRAY(CIDR), nullable=False)
     remote_cidrs: Mapped[list[str]] = mapped_column(ARRAY(CIDR), nullable=False)
-    psk_secret_name: Mapped[str] = mapped_column(Text, nullable=False)
     ike_version: Mapped[str] = mapped_column(Text, nullable=False, server_default="2")
     ike_proposals: Mapped[str | None] = mapped_column(Text, nullable=True)
     esp_proposals: Mapped[str | None] = mapped_column(Text, nullable=True)

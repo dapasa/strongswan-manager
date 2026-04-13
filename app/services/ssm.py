@@ -258,7 +258,7 @@ async def check_connectivity() -> bool:
     try:
         await loop.run_in_executor(
             None,
-            lambda: _get_ssm_client().describe_instance_information(MaxResults=1),
+            lambda: _get_ssm_client().describe_instance_information(MaxResults=5),
         )
         return True
     except Exception:
