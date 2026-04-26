@@ -61,30 +61,37 @@ class TestHealthRouter:
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 
-    @patch("app.routers.health.ssm.check_connectivity", new_callable=AsyncMock, return_value=True)
+    @patch("app.routers.health.execute_on_all_servers", new_callable=AsyncMock)
     @patch("app.routers.health.s3.check_connectivity", new_callable=AsyncMock, return_value=True)
-    async def test_health_readiness_all_ok(self, mock_s3, mock_ssm):
-        client = await _get_client()
-        async with client:
-            # Mock the DB execute for SELECT 1
-            with patch("app.routers.health.get_db") as mock_get_db:
-                mock_session = AsyncMock()
-                mock_session.execute.return_value = MagicMock()
+    async def test_health_readiness_all_ok(self, mock_s3, mock_fan_out):
+        from app.utils.fan_out import FanOutResult, ServerResult
 
-                async def _override():
-                    yield mock_session
+        mock_fan_out.return_value = FanOutResult(
+            total=1, succeeded=1, failed=0,
+            servers=[ServerResult(server_id=1, server_name="vpn-1", success=True, output="ok")],
+        )
 
-                from app.main import app
-                from app.db.session import get_db
-                app.dependency_overrides[get_db] = _override
+        from app.main import app
+        from app.db.session import get_db
 
-                resp = await client.get("/health/ready")
+        async def _override():
+            db = AsyncMock()
+            db.execute = AsyncMock(return_value=MagicMock())
+            yield db
+
+        app.dependency_overrides[get_db] = _override
+
+        transport = __import__("httpx").ASGITransport(app=app)
+        async with __import__("httpx").AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/health/ready")
+
+        app.dependency_overrides.clear()
 
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
         assert data["checks"]["s3"] == "ok"
-        assert data["checks"]["ssm"] == "ok"
+        assert data["checks"]["ssh"] == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -135,8 +142,9 @@ class TestTunnelRouter:
         assert call_kwargs.kwargs["page"] == 2
         assert call_kwargs.kwargs["page_size"] == 10
 
+    @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.create_tunnel", new_callable=AsyncMock)
-    async def test_create_tunnel_returns_201(self, mock_create):
+    async def test_create_tunnel_returns_201(self, mock_create, mock_get_tunnel):
         now = datetime.now(timezone.utc)
         tunnel = MagicMock()
         tunnel.id = 1
@@ -161,6 +169,7 @@ class TestTunnelRouter:
         tunnel.created_at = now
         tunnel.updated_at = now
         mock_create.return_value = tunnel
+        mock_get_tunnel.return_value = tunnel
 
         client = await _get_client()
         async with client:

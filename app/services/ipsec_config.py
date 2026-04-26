@@ -5,16 +5,23 @@ Each tunnel maps to two S3 objects:
     secrets/{name}.secrets      — PSK secret for the connection
 
 The sync_config function uploads both files and triggers an ipsec reload on
-the VPN instances. The remove_config function deletes both files and reloads.
+all VPN servers via SSH fan-out. The remove_config function deletes both files
+and reloads.
 """
 
 from __future__ import annotations
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.db.models import Tunnel
 from app.logging_config import get_logger
-from app.services import s3, ssm
+from app.services import s3
+from app.services.server_service import execute_on_all_servers
+from app.utils.fan_out import FanOutResult
 
 logger = get_logger(__name__)
+
+_SYNC_SCRIPT = "/opt/strongswan/scripts/sync_config.sh"
 
 
 def render_connection_conf(tunnel: Tunnel) -> str:
@@ -29,13 +36,13 @@ def render_connection_conf(tunnel: Tunnel) -> str:
     Returns:
         The rendered .conf file content.
     """
-    local_cidrs = ",".join(tunnel.local_cidrs)
-    remote_cidrs = ",".join(tunnel.remote_cidrs)
+    local_cidrs = ",".join(str(c) for c in tunnel.local_cidrs)
+    remote_cidrs = ",".join(str(c) for c in tunnel.remote_cidrs)
 
     lines = [
         f"conn {tunnel.name}",
         "    left=%any",
-        f"    leftid={tunnel.local_cidrs[0].split('/')[0] if tunnel.local_cidrs else '%any'}",
+        f"    leftid={str(tunnel.local_cidrs[0]).split('/')[0] if tunnel.local_cidrs else '%any'}",
         f"    leftsubnet={local_cidrs}",
         "    leftauth=psk",
         "    leftsendcert=never",
@@ -84,7 +91,7 @@ def render_secrets_file(tunnel: Tunnel, psk: str) -> str:
     Returns:
         The rendered .secrets file content.
     """
-    left_ip = tunnel.local_cidrs[0].split("/")[0] if tunnel.local_cidrs else "%any"
+    left_ip = str(tunnel.local_cidrs[0]).split("/")[0] if tunnel.local_cidrs else "%any"
     return f'{tunnel.peer_ip} {left_ip} : PSK "{psk}"\n'
 
 
@@ -98,18 +105,25 @@ def _secrets_key(name: str) -> str:
     return f"secrets/{name}.secrets"
 
 
-async def sync_tunnel_config(tunnel: Tunnel, psk: str) -> None:
-    """Upload connection config and secrets to S3, then reload ipsec.
+async def sync_tunnel_config(tunnel: Tunnel, psk: str, session: AsyncSession) -> FanOutResult:
+    """Upload connection config and secrets to S3, then reload ipsec on all servers.
 
     Called after tunnel create or update. The caller MUST have acquired
     the LOCK_IPSEC_CONFIG advisory lock.
 
+    S3 upload failure raises InfrastructureError (fatal). SSH fan-out failures
+    are captured in the returned FanOutResult (non-fatal — caller decides).
+
     Args:
         tunnel: The Tunnel model instance with current field values.
         psk: The pre-shared key for this tunnel.
+        session: Active database session for server discovery.
+
+    Returns:
+        FanOutResult with per-server SSH execution outcomes.
 
     Raises:
-        InfrastructureError: If S3 upload or SSM reload fails.
+        InfrastructureError: If S3 upload fails or no active servers are registered.
     """
     logger.info("ipsec_sync_start", tunnel=tunnel.name)
 
@@ -118,55 +132,71 @@ async def sync_tunnel_config(tunnel: Tunnel, psk: str) -> None:
 
     await s3.upload_file(_conf_key(tunnel.name), conf_content)
     await s3.upload_file(_secrets_key(tunnel.name), secrets_content)
-    await ssm.reload_ipsec()
+
+    result = await execute_on_all_servers(session, [_SYNC_SCRIPT])
 
     logger.info("ipsec_sync_complete", tunnel=tunnel.name)
+    return result
 
 
-async def remove_tunnel_config(name: str) -> None:
-    """Delete connection config and secrets from S3, then reload ipsec.
+async def remove_tunnel_config(name: str, session: AsyncSession) -> FanOutResult:
+    """Delete connection config and secrets from S3, then reload ipsec on all servers.
 
     Called after tunnel soft-delete. The caller MUST have acquired
     the LOCK_IPSEC_CONFIG advisory lock.
 
     Args:
         name: The tunnel connection name.
+        session: Active database session for server discovery.
+
+    Returns:
+        FanOutResult with per-server SSH execution outcomes.
 
     Raises:
-        InfrastructureError: If S3 delete or SSM reload fails.
+        InfrastructureError: If S3 delete fails or no active servers are registered.
     """
     logger.info("ipsec_remove_start", tunnel=name)
 
     await s3.delete_file(_conf_key(name))
     await s3.delete_file(_secrets_key(name))
-    await ssm.reload_ipsec()
+
+    result = await execute_on_all_servers(session, [_SYNC_SCRIPT])
 
     logger.info("ipsec_remove_complete", tunnel=name)
+    return result
 
 
-async def rename_tunnel_config(old_name: str, tunnel: Tunnel, psk: str) -> None:
+async def rename_tunnel_config(
+    old_name: str,
+    tunnel: Tunnel,
+    psk: str,
+    session: AsyncSession,
+) -> FanOutResult:
     """Handle tunnel rename by removing old files and uploading new ones.
 
     Args:
         old_name: The previous tunnel name.
         tunnel: The Tunnel model with the new name.
         psk: The pre-shared key.
+        session: Active database session for server discovery.
+
+    Returns:
+        FanOutResult with per-server SSH execution outcomes.
 
     Raises:
-        InfrastructureError: If any S3 or SSM operation fails.
+        InfrastructureError: If any S3 operation fails or no active servers are registered.
     """
     logger.info("ipsec_rename_start", old_name=old_name, new_name=tunnel.name)
 
-    # Delete old files
     await s3.delete_file(_conf_key(old_name))
     await s3.delete_file(_secrets_key(old_name))
 
-    # Upload new files
     conf_content = render_connection_conf(tunnel)
     secrets_content = render_secrets_file(tunnel, psk)
     await s3.upload_file(_conf_key(tunnel.name), conf_content)
     await s3.upload_file(_secrets_key(tunnel.name), secrets_content)
 
-    await ssm.reload_ipsec()
+    result = await execute_on_all_servers(session, [_SYNC_SCRIPT])
 
     logger.info("ipsec_rename_complete", old_name=old_name, new_name=tunnel.name)
+    return result

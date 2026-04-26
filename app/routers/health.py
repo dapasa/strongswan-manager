@@ -7,9 +7,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
+from app.exceptions import InfrastructureError
 from app.logging_config import get_logger
 from app.schemas.common import HealthResponse
-from app.services import s3, ssm
+from app.services import s3
+from app.services.server_service import execute_on_all_servers
 
 logger = get_logger(__name__)
 
@@ -34,7 +36,14 @@ async def health_check() -> HealthResponse:
 async def readiness_check(
     db: AsyncSession = Depends(get_db),
 ) -> HealthResponse:
-    """Check connectivity to database, S3, and SSM. No authentication required."""
+    """Check connectivity to database, S3, and SSH servers. No authentication required.
+
+    SSH check semantics:
+    - No servers registered  → ``warn``   (degraded, not an error)
+    - All servers reachable  → ``ok``
+    - Some servers reachable → ``degraded``
+    - All servers unreachable → ``failed``
+    """
     checks: dict[str, str] = {}
 
     # Database check
@@ -53,13 +62,34 @@ async def readiness_check(
         logger.warning("readiness_s3_check_failed")
         checks["s3"] = "failed"
 
-    # SSM check
+    # SSH fan-out check — replaces SSM connectivity check
     try:
-        ssm_ok = await ssm.check_connectivity()
-        checks["ssm"] = "ok" if ssm_ok else "failed"
+        fan_out = await execute_on_all_servers(db, ["echo ok"])
+        if fan_out.is_success:
+            checks["ssh"] = "ok"
+        elif fan_out.is_partial:
+            logger.warning(
+                "readiness_ssh_check_degraded",
+                succeeded=fan_out.succeeded,
+                failed=fan_out.failed,
+                total=fan_out.total,
+            )
+            checks["ssh"] = "degraded"
+        else:
+            # All failed
+            logger.warning(
+                "readiness_ssh_check_failed",
+                failed=fan_out.failed,
+                total=fan_out.total,
+            )
+            checks["ssh"] = "failed"
+    except InfrastructureError:
+        # No active servers registered — warn but don't block readiness
+        logger.warning("readiness_ssh_no_servers")
+        checks["ssh"] = "warn"
     except Exception:
-        logger.warning("readiness_ssm_check_failed")
-        checks["ssm"] = "failed"
+        logger.warning("readiness_ssh_check_error")
+        checks["ssh"] = "failed"
 
     all_ok = all(v == "ok" for v in checks.values())
     return HealthResponse(

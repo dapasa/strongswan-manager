@@ -5,15 +5,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Terraform 1.8.2
-RUN curl -fsSL https://releases.hashicorp.com/terraform/1.8.2/terraform_1.8.2_linux_amd64.zip \
+# Install Terraform 1.14.8
+RUN curl -fsSL https://releases.hashicorp.com/terraform/1.14.8/terraform_1.14.8_linux_amd64.zip \
         -o /tmp/terraform.zip \
     && unzip /tmp/terraform.zip -d /usr/local/bin/ \
     && rm /tmp/terraform.zip \
     && terraform --version
 
-# Install Terragrunt 0.57.12
-RUN curl -fsSL https://github.com/gruntwork-io/terragrunt/releases/download/v0.57.12/terragrunt_linux_amd64 \
+# Install Terragrunt 0.93.5
+RUN curl -fsSL https://github.com/gruntwork-io/terragrunt/releases/download/v0.93.5/terragrunt_linux_amd64 \
         -o /usr/local/bin/terragrunt \
     && chmod +x /usr/local/bin/terragrunt \
     && terragrunt --version

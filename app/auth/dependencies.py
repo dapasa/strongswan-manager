@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import Depends
@@ -9,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.oidc import validate_token
+from app.config import get_settings
 from app.db.models import User
 from app.db.session import get_db
 from app.exceptions import AuthenticationError, AuthorizationError
@@ -20,11 +22,34 @@ logger = get_logger(__name__)
 # tokenUrl is a placeholder — actual OIDC flow happens externally via the SPA.
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-# Role hierarchy: admin > viewer
+# Role hierarchy: admin > operator > viewer
 _ROLE_HIERARCHY: dict[str, int] = {
     "viewer": 0,
-    "admin": 1,
+    "operator": 1,
+    "admin": 2,
 }
+
+_DEV_BYPASS_TOKEN = "dev-bypass-token"
+
+
+class _DevUser:
+    """Lightweight mock user for dev bypass. Quacks like User model."""
+
+    def __init__(self):
+        self.id = None
+        self.sub = "dev-bypass"
+        self.email = "dev@localhost"
+        self.display_name = "Dev Admin"
+        self.role = "admin"
+        self.is_active = True
+        self.last_login_at = None
+        self.created_at = datetime.now(timezone.utc)
+        self.updated_at = datetime.now(timezone.utc)
+
+
+def _build_dev_user():
+    """Build a mock admin user for local development (DEBUG only)."""
+    return _DevUser()
 
 
 async def get_current_user(
@@ -39,7 +64,17 @@ async def get_current_user(
     - Syncs email and display_name from token claims on every login.
     - Raises AuthenticationError if token is invalid.
     - Raises AuthorizationError if user account is deactivated.
+
+    When ``settings.debug`` is True and the token is ``dev-bypass-token``,
+    JWT validation is skipped and a mock admin user is returned.
+    This MUST NEVER be enabled in production (DEBUG=false).
     """
+    # --- Dev auth bypass (DEBUG mode only) ---
+    settings = get_settings()
+    if settings.debug and token == _DEV_BYPASS_TOKEN:
+        logger.warning("Dev auth bypass active — returning mock admin user")
+        return _build_dev_user()
+
     claims = await validate_token(token)
 
     sub: str = claims["sub"]
@@ -80,8 +115,8 @@ async def get_current_user(
 def require_role(required_role: str) -> Callable[..., Any]:
     """Return a FastAPI dependency that enforces a minimum role level.
 
-    Role hierarchy: admin > viewer.
-    Admin has access to everything. Viewer is restricted to read operations.
+    Role hierarchy: admin > operator > viewer.
+    Admin has full access. Operator can manage resources. Viewer is read-only.
 
     Usage::
 
@@ -105,6 +140,21 @@ def require_role(required_role: str) -> Callable[..., Any]:
         return current_user
 
     return _check_role
+
+
+async def require_operator(current_user: User = Depends(get_current_user)) -> User:
+    """Convenience dependency: require operator or admin role.
+
+    Allows both operators and admins through. Viewers are rejected.
+
+    Usage::
+
+        @router.post("/tunnels", dependencies=[Depends(require_operator)])
+        async def create_tunnel(...): ...
+    """
+    if _ROLE_HIERARCHY.get(current_user.role, 0) < _ROLE_HIERARCHY["operator"]:
+        raise AuthorizationError("Operator access required")
+    return current_user
 
 
 async def require_admin(current_user: User = Depends(get_current_user)) -> User:

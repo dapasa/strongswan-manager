@@ -28,6 +28,18 @@ services:
       - repos:/repos
     restart: unless-stopped
 
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_OIDC_AUTHORITY: ${VITE_OIDC_AUTHORITY}
+        VITE_OIDC_CLIENT_ID: ${VITE_OIDC_CLIENT_ID}
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+    restart: unless-stopped
+
 volumes:
   pgdata:
   repos:

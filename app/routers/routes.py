@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import require_admin, require_viewer
+from app.auth import require_operator, require_viewer
 from app.db.models import User
 from app.db.session import async_session_factory, get_db
 from app.logging_config import get_logger
@@ -62,7 +62,7 @@ async def create_route(
     request: Request,
     tunnel_id: int = Query(..., description="Tunnel to add the route to"),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_operator),
 ) -> AsyncOperationRef:
     """Create a route and launch async terragrunt operation.
 
@@ -96,7 +96,7 @@ async def retry_route(
     route_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_operator),
 ) -> AsyncOperationRef:
     """Retry a failed route operation. Only works when sync_status='failed'."""
     from app.services import route_service
@@ -126,7 +126,7 @@ async def delete_route(
     route_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_operator),
 ) -> AsyncOperationRef:
     """Soft-delete a route and launch async terragrunt teardown.
 

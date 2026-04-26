@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -22,6 +23,49 @@ logger = get_logger(__name__)
 _BACKOFF_BASE_SECONDS: float = 1.0
 _BACKOFF_MAX_SECONDS: float = 30.0
 _MAX_LOCK_RETRIES: int = 5
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape codes from text."""
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
+def _extract_error_summary(exc: Exception, max_length: int = 500) -> str:
+    """Extract a concise, ANSI-free error summary from an exception.
+
+    For InfrastructureError with detail (stderr output), extracts the key
+    error lines. Otherwise falls back to str(exc).
+    """
+    if isinstance(exc, InfrastructureError) and exc.detail:
+        raw = _strip_ansi(exc.detail)
+        # Look for lines containing "Error" or "error" as they are most informative
+        error_lines = [
+            line.strip()
+            for line in raw.splitlines()
+            if line.strip() and ("error" in line.lower() or "Error" in line)
+        ]
+        if error_lines:
+            summary = "\n".join(error_lines[:5])
+        else:
+            # Fall back to last non-empty lines (often the most relevant)
+            non_empty = [line.strip() for line in raw.splitlines() if line.strip()]
+            summary = "\n".join(non_empty[-5:]) if non_empty else raw
+        return summary[:max_length]
+    return _strip_ansi(str(exc))[:max_length]
+
+
+async def _update_route_stage(
+    session: AsyncSession,
+    route_id: int,
+    stage: str,
+) -> None:
+    """Update a route's sync_status to the given stage and commit."""
+    route = await session.get(Route, route_id)
+    if route is not None:
+        route.sync_status = stage
+        await session.commit()
 
 
 def _route_to_dict(route: Route) -> dict[str, Any]:
@@ -160,6 +204,10 @@ async def create_route(
     )
     session.add(operation)
     await session.flush()
+
+    # Refresh route to eagerly load server-generated columns (e.g. updated_at)
+    # that were expired by flush — avoids MissingGreenlet with asyncpg driver.
+    await session.refresh(route)
 
     # Audit log
     await audit.log_action(
@@ -340,6 +388,10 @@ async def retry_route(
     session.add(operation)
     await session.flush()
 
+    # Refresh route to eagerly load server-generated columns (e.g. updated_at)
+    # that were expired by flush — avoids MissingGreenlet with asyncpg driver.
+    await session.refresh(route)
+
     # Audit log
     await audit.log_action(
         session,
@@ -438,10 +490,24 @@ async def _execute_route_create(
             # Acquire lock with backoff
             await _acquire_lock_with_backoff(session)
 
-            # Perform terragrunt operation
-            await terragrunt.add_route(cidr, tunnel_name)
+            # Stage: cloning (git clone/pull)
+            await _update_route_stage(session, route_id, "cloning")
+            repo = await terragrunt.ensure_repo()
 
-            # Update route sync_status
+            # Stage: pushing (modify file, commit, push to remote)
+            await _update_route_stage(session, route_id, "pushing")
+            await terragrunt.add_route_file(cidr, tunnel_name, repo)
+            await terragrunt.commit_and_push(repo, f"vpn-manager: add route {cidr} for tunnel {tunnel_name}")
+
+            # Stage: planning (terragrunt plan)
+            await _update_route_stage(session, route_id, "planning")
+            await terragrunt.run_plan()
+
+            # Stage: applying (terragrunt apply)
+            await _update_route_stage(session, route_id, "applying")
+            await terragrunt.run_apply_plan()
+
+            # Done — mark synced
             route = await session.get(Route, route_id)
             if route is not None:
                 route.sync_status = "synced"
@@ -463,11 +529,12 @@ async def _execute_route_create(
                 operation_id=operation_id,
                 error=str(exc),
             )
+            error_summary = _extract_error_summary(exc)
             await _mark_operation_failed(
                 db_factory=db_factory,
                 operation_id=operation_id,
                 route_id=route_id,
-                error=str(exc),
+                error=error_summary,
             )
 
 
@@ -503,8 +570,22 @@ async def _execute_route_delete(
             # Acquire lock with backoff
             await _acquire_lock_with_backoff(session)
 
-            # Perform terragrunt operation
-            await terragrunt.remove_route(cidr, tunnel_name)
+            # Stage: cloning (git clone/pull)
+            await _update_route_stage(session, route_id, "cloning")
+            repo = await terragrunt.ensure_repo()
+
+            # Stage: pushing (modify file, commit, push to remote)
+            await _update_route_stage(session, route_id, "pushing")
+            await terragrunt.remove_route_file(cidr, tunnel_name, repo)
+            await terragrunt.commit_and_push(repo, f"vpn-manager: remove route {cidr} from tunnel {tunnel_name}")
+
+            # Stage: planning (terragrunt plan)
+            await _update_route_stage(session, route_id, "planning")
+            await terragrunt.run_plan()
+
+            # Stage: applying (terragrunt apply)
+            await _update_route_stage(session, route_id, "applying")
+            await terragrunt.run_apply_plan()
 
             # Update operation
             operation = await _load_operation(session, operation_id)
@@ -522,11 +603,12 @@ async def _execute_route_delete(
                 operation_id=operation_id,
                 error=str(exc),
             )
+            error_summary = _extract_error_summary(exc)
             await _mark_operation_failed(
                 db_factory=db_factory,
                 operation_id=operation_id,
                 route_id=route_id,
-                error=str(exc),
+                error=error_summary,
             )
 
 

@@ -40,7 +40,7 @@ class User(TimestampMixin, Base):
     audit_logs: Mapped[list[AuditLog]] = relationship(back_populates="user", lazy="noload")
 
     __table_args__ = (
-        CheckConstraint("role IN ('admin', 'viewer')", name="ck_users_role"),
+        CheckConstraint("role IN ('admin', 'operator', 'viewer')", name="ck_users_role"),
         Index("idx_users_email", "email"),
     )
 
@@ -65,6 +65,8 @@ class Tunnel(TimestampMixin, SoftDeleteMixin, Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
     sync_status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
     sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sync_details: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    psk_secret_name: Mapped[str] = mapped_column(Text, nullable=False)
     created_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
 
     # Relationships
@@ -74,9 +76,9 @@ class Tunnel(TimestampMixin, SoftDeleteMixin, Base):
 
     __table_args__ = (
         CheckConstraint("ike_version IN ('1', '2')", name="ck_tunnels_ike_version"),
-        CheckConstraint("status IN ('active', 'inactive')", name="ck_tunnels_status"),
+        CheckConstraint("status IN ('active', 'inactive', 'up', 'down', 'unknown')", name="ck_tunnels_status"),
         CheckConstraint(
-            "sync_status IN ('synced', 'pending', 'failed', 'pending_delete')",
+            "sync_status IN ('synced', 'pending', 'failed', 'pending_delete', 'partial')",
             name="ck_tunnels_sync_status",
         ),
         CheckConstraint("dpd_action IN ('none', 'clear', 'restart')", name="ck_tunnels_dpd_action"),
@@ -114,7 +116,7 @@ class Route(TimestampMixin, SoftDeleteMixin, Base):
 
     __table_args__ = (
         CheckConstraint(
-            "sync_status IN ('synced', 'pending', 'failed', 'pending_delete')",
+            "sync_status IN ('synced', 'pending', 'failed', 'pending_delete', 'cloning', 'planning', 'applying', 'pushing')",
             name="ck_routes_sync_status",
         ),
         Index(
@@ -186,6 +188,38 @@ class IPTablesRule(TimestampMixin, SoftDeleteMixin, Base):
             "dest_cidr",
             "dport",
             "action",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+    )
+
+
+class Server(TimestampMixin, SoftDeleteMixin, Base):
+    """VPN server with encrypted SSH key storage for connectivity testing."""
+
+    __tablename__ = "servers"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    hostname: Mapped[str] = mapped_column(Text, nullable=False)
+    ssh_port: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("22"))
+    ssh_user: Mapped[str] = mapped_column(Text, nullable=False, server_default="admin")
+    ssh_private_key_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_check_status: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "last_check_status IN ('reachable', 'unreachable')",
+            name="ck_servers_check_status",
+        ),
+        CheckConstraint("ssh_port BETWEEN 1 AND 65535", name="ck_servers_ssh_port"),
+        Index(
+            "idx_servers_name_active",
+            "name",
             unique=True,
             postgresql_where=text("deleted_at IS NULL"),
         ),

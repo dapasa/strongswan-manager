@@ -101,6 +101,19 @@ def mock_admin_user() -> User:
 
 
 @pytest.fixture
+def mock_operator_user() -> User:
+    """Return a mock operator User object for dependency overrides."""
+    user = MagicMock(spec=User)
+    user.id = 3
+    user.sub = "test-operator-sub"
+    user.email = "operator@test.com"
+    user.display_name = "Test Operator"
+    user.role = "operator"
+    user.is_active = True
+    return user
+
+
+@pytest.fixture
 def mock_viewer_user() -> User:
     """Return a mock viewer User object for dependency overrides."""
     user = MagicMock(spec=User)
@@ -189,6 +202,7 @@ def create_test_tunnel(db_session: AsyncSession):
         if user is not None:
             defaults["created_by"] = user.id
         defaults.update(overrides)
+        defaults.setdefault("psk_secret_name", f"secrets/{defaults['name']}.secrets")
         tunnel = Tunnel(**defaults)
         db_session.add(tunnel)
         await db_session.flush()

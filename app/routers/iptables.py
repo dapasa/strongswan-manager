@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import require_admin, require_viewer
+from app.auth import require_operator, require_viewer
 from app.db.models import User
 from app.db.session import get_db
 from app.logging_config import get_logger
@@ -101,7 +101,7 @@ async def create_rule(
     request: Request,
     tunnel_id: int = Query(..., description="Tunnel this rule belongs to"),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_operator),
 ) -> IPTablesRuleDetail:
     """Create an iptables rule, apply via SSM, and persist."""
     rule = await iptables_service.create_rule(
@@ -142,7 +142,7 @@ async def update_rule(
     data: IPTablesRuleUpdate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_operator),
 ) -> IPTablesRuleDetail:
     """Update an iptables rule — removes old and applies new via SSM if structural fields changed."""
     rule = await iptables_service.update_rule(
@@ -182,7 +182,7 @@ async def retry_rule(
     rule_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_operator),
 ) -> IPTablesRuleDetail:
     """Retry a failed iptables rule sync. Only works when sync_status='failed'."""
     rule = await iptables_service.retry_rule(
@@ -221,7 +221,7 @@ async def delete_rule(
     rule_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_operator),
 ) -> None:
     """Remove iptables rule via SSM and soft-delete from database."""
     await iptables_service.delete_rule(

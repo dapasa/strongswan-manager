@@ -31,9 +31,24 @@ class Settings(BaseSettings):
     s3_bucket: str = Field(..., description="S3 bucket for StrongSwan config files")
     aws_region: str = Field(default="us-east-1")
 
+    # AWS Cross-Account
+    aws_assume_role_arn: str | None = Field(
+        default=None,
+        description="IAM role ARN to assume for dev-account access (SSM, EC2, S3). "
+        "If unset, uses default credentials.",
+    )
+
     # SSM
     vpn_primary_instance_name: str = Field(..., description="EC2 Name tag for primary VPN instance")
     vpn_secondary_instance_name: str = Field(..., description="EC2 Name tag for secondary VPN instance")
+    vpn_primary_instance_id: str | None = Field(
+        default=None,
+        description="EC2 instance ID for primary VPN instance (bypasses Name tag lookup)",
+    )
+    vpn_secondary_instance_id: str | None = Field(
+        default=None,
+        description="EC2 instance ID for secondary VPN instance (bypasses Name tag lookup)",
+    )
     ssm_command_timeout: int = Field(default=60, ge=10, le=300)
 
     # Git / Terragrunt
@@ -41,12 +56,24 @@ class Settings(BaseSettings):
     github_token: str = Field(..., description="GitHub PAT for repo push/pull")
     git_repo_path: str = Field(..., description="Local path to git repo with vpn_routes.json")
     git_branch: str = Field(default="main")
+    git_base_branch: str = Field(
+        default="master",
+        description="Branch where route commits are made before syncing to git_branch",
+    )
     terragrunt_routes_path: str = Field(
         ...,
         description="Path to vpn_routes.json relative to git repo root",
     )
     terragrunt_working_dir: str = Field(..., description="Terragrunt working directory")
     terragrunt_timeout: int = Field(default=300, ge=60, le=600)
+
+    # SSH Key Encryption
+    ssh_command_timeout: int = Field(default=30, ge=5, le=120)
+    ssh_key_encryption_key: str = Field(
+        default="",
+        description="Fernet key for encrypting SSH private keys. "
+        "Generate with: python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'",
+    )
 
     # CORS
     cors_origins: list[str] = Field(default=["http://localhost:3000"])

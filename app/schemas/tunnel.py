@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from ipaddress import IPv4Address, IPv4Network
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 from app.schemas.iptables import IPTablesRuleDetail
 from app.schemas.route import RouteDetail
@@ -68,9 +68,9 @@ class TunnelDetail(BaseModel):
     id: int
     name: str
     description: str | None = None
-    peer_ip: str
-    local_cidrs: list[str]
-    remote_cidrs: list[str]
+    peer_ip: Any
+    local_cidrs: list[Any]
+    remote_cidrs: list[Any]
     ike_version: str
     ike_proposals: str | None = None
     esp_proposals: str | None = None
@@ -88,12 +88,42 @@ class TunnelDetail(BaseModel):
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
+    @field_serializer("peer_ip")
+    def serialize_peer_ip(self, v: Any) -> str:
+        return str(v) if v is not None else None
+
+    @field_serializer("local_cidrs", "remote_cidrs")
+    def serialize_cidrs(self, v: list[Any]) -> list[str]:
+        return [str(c) for c in v] if v else []
+
+
+class ServerStateResult(BaseModel):
+    """Per-server state from a tunnel status check."""
+
+    server_id: int
+    server_name: str
+    state: str
+    success: bool
+    error: str | None = None
+
 
 class TunnelStatus(BaseModel):
-    """Live tunnel status from strongSwan via SSM."""
+    """Live tunnel status from strongSwan via SSH fan-out."""
 
     tunnel_id: int
     name: str
-    state: Literal["UP", "DOWN", "UNKNOWN"] = Field(description="Current tunnel state from ipsec statusall")
+    state: Literal["UP", "DOWN", "UNKNOWN", "PARTIAL"] = Field(description="Aggregated tunnel state across all servers")
     details: str | None = Field(None, description="Raw status details from strongSwan")
+    per_server: list[ServerStateResult] = Field(default_factory=list, description="Per-server state breakdown")
+    checked_at: datetime
+
+
+class TunnelCheckStatusResult(BaseModel):
+    """Result of an on-demand tunnel status check via SSH fan-out."""
+
+    tunnel_id: int
+    name: str
+    state: Literal["UP", "DOWN", "UNKNOWN", "PARTIAL"] = Field(description="Aggregated operational state from ipsec status")
+    raw_output: str = Field(description="Raw output from ipsec status command (last successful server)")
+    per_server: list[ServerStateResult] = Field(default_factory=list, description="Per-server state breakdown")
     checked_at: datetime

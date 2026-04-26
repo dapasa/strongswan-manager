@@ -9,7 +9,9 @@ from app.routers.health import router as health_router
 from app.routers.iptables import router as iptables_router
 from app.routers.operations import router as operations_router
 from app.routers.routes import router as routes_router
+from app.routers.servers import router as servers_router
 from app.routers.tunnels import router as tunnels_router
+from app.routers.users import router as users_router
 
 __all__ = [
     "audit_router",
@@ -19,5 +21,7 @@ __all__ = [
     "iptables_router",
     "operations_router",
     "routes_router",
+    "servers_router",
     "tunnels_router",
+    "users_router",
 ]

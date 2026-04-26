@@ -57,3 +57,9 @@ class AuthorizationError(AppError):
     """Insufficient permissions."""
 
     pass
+
+
+class EncryptionError(AppError):
+    """Encryption or decryption operation failed."""
+
+    pass

@@ -269,7 +269,9 @@ class TestSSMService:
 
         mock_settings.return_value = MagicMock()
         await reload_ipsec()
-        mock_run.assert_called_once_with(commands=["ipsec reload"], target="both")
+        mock_run.assert_called_once_with(
+            commands=["/opt/strongswan/scripts/sync_config.sh"], target="both"
+        )
 
     @patch("app.services.ssm.execute_command", new_callable=AsyncMock)
     @patch("app.services.ssm.resolve_instance_id", new_callable=AsyncMock)
@@ -361,10 +363,16 @@ class TestIPSecConfigGenerator:
         content = render_secrets_file(tunnel, "MySecretPSK")
         assert '203.0.113.1 10.0.0.0 : PSK "MySecretPSK"' in content
 
-    @patch("app.services.ipsec_config.ssm.reload_ipsec", new_callable=AsyncMock)
+    @patch("app.services.ipsec_config.execute_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.ipsec_config.s3.upload_file", new_callable=AsyncMock)
-    async def test_sync_tunnel_config(self, mock_upload, mock_reload):
+    async def test_sync_tunnel_config(self, mock_upload, mock_fan_out):
         from app.services.ipsec_config import sync_tunnel_config
+        from app.utils.fan_out import FanOutResult, ServerResult
+
+        mock_fan_out.return_value = FanOutResult(
+            total=1, succeeded=1, failed=0,
+            servers=[ServerResult(server_id=1, server_name="vpn-1", success=True, output="ok")],
+        )
 
         tunnel = MagicMock()
         tunnel.name = "test-tunnel"
@@ -378,10 +386,12 @@ class TestIPSecConfigGenerator:
         tunnel.dpd_delay = 30
         tunnel.dpd_timeout = 150
 
-        await sync_tunnel_config(tunnel, psk="TestPSK123")
+        session = AsyncMock()
+        result = await sync_tunnel_config(tunnel, psk="TestPSK123", session=session)
 
         assert mock_upload.call_count == 2  # .conf + .secrets
-        mock_reload.assert_called_once()
+        mock_fan_out.assert_called_once()
+        assert result.is_success is True
 
         # Verify keys
         conf_call = mock_upload.call_args_list[0]
@@ -389,15 +399,22 @@ class TestIPSecConfigGenerator:
         assert conf_call[0][0] == "connections/test-tunnel.conf"
         assert secrets_call[0][0] == "secrets/test-tunnel.secrets"
 
-    @patch("app.services.ipsec_config.ssm.reload_ipsec", new_callable=AsyncMock)
+    @patch("app.services.ipsec_config.execute_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.ipsec_config.s3.delete_file", new_callable=AsyncMock)
-    async def test_remove_tunnel_config(self, mock_delete, mock_reload):
+    async def test_remove_tunnel_config(self, mock_delete, mock_fan_out):
         from app.services.ipsec_config import remove_tunnel_config
+        from app.utils.fan_out import FanOutResult, ServerResult
 
-        await remove_tunnel_config("old-tunnel")
+        mock_fan_out.return_value = FanOutResult(
+            total=1, succeeded=1, failed=0,
+            servers=[ServerResult(server_id=1, server_name="vpn-1", success=True, output="ok")],
+        )
+
+        session = AsyncMock()
+        result = await remove_tunnel_config("old-tunnel", session=session)
 
         assert mock_delete.call_count == 2  # .conf + .secrets
-        mock_reload.assert_called_once()
+        mock_fan_out.assert_called_once()
         mock_delete.assert_any_call("connections/old-tunnel.conf")
         mock_delete.assert_any_call("secrets/old-tunnel.secrets")
 
@@ -412,7 +429,7 @@ class TestTerragruntFileOps:
         from app.services.terragrunt import _read_routes_file
 
         routes_file = tmp_path / "vpn_routes.json"
-        routes_file.write_text(json.dumps({"cidrs": ["10.0.0.0/8", "172.16.0.0/12"]}))
+        routes_file.write_text(json.dumps(["10.0.0.0/8", "172.16.0.0/12"]))
 
         cidrs = _read_routes_file(routes_file)
         assert cidrs == ["10.0.0.0/8", "172.16.0.0/12"]
@@ -431,7 +448,7 @@ class TestTerragruntFileOps:
         _write_routes_file(routes_file, ["172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16"])
 
         data = json.loads(routes_file.read_text())
-        assert data["cidrs"] == ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+        assert data == ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 
     def test_write_routes_file_deduplication(self, tmp_path):
         from app.services.terragrunt import _read_routes_file, _write_routes_file

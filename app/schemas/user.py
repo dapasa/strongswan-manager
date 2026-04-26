@@ -21,7 +21,7 @@ class UserDetail(BaseModel):
     id: int
     email: str
     display_name: str | None = None
-    role: str = Field(description="User role: 'admin' or 'viewer'")
+    role: str = Field(description="User role: 'admin', 'operator', or 'viewer'")
     is_active: bool
     last_login_at: datetime | None = None
     created_at: datetime
@@ -40,5 +40,15 @@ class UserCreate(BaseModel):
 class UserUpdate(BaseModel):
     """Schema for updating user role/status (admin only)."""
 
-    role: str | None = Field(None, pattern="^(admin|viewer)$", description="User role")
+    role: str | None = Field(None, pattern="^(admin|operator|viewer)$", description="User role")
     is_active: bool | None = None
+
+
+class UserListResponse(BaseModel):
+    """Paginated user list response for admin endpoints."""
+
+    items: list[UserDetail]
+    total: int = Field(description="Total number of users")
+    page: int = Field(description="Current page number")
+    page_size: int = Field(description="Items per page")
+    has_next: bool = Field(description="Whether more pages are available")

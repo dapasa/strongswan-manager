@@ -78,7 +78,7 @@ _EXCEPTION_MAP: list[tuple[type[AppError], int]] = [
     (NotFoundError, 404),
     (ConflictError, 409),
     (LockConflictError, 409),
-    (ValidationError, 422),
+    (ValidationError, 400),
     (AuthenticationError, 401),
     (AuthorizationError, 403),
     (InfrastructureError, 502),

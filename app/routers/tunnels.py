@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import require_admin, require_viewer
+from app.auth import require_operator, require_viewer
 from app.db.models import User
 from app.db.session import async_session_factory, get_db
 from app.logging_config import get_logger
@@ -14,6 +14,7 @@ from app.schemas.iptables import IPTablesRuleCreate, IPTablesRuleDetail
 from app.schemas.operations import AsyncOperationRef
 from app.schemas.route import RouteCreate, RouteDetail
 from app.schemas.tunnel import (
+    TunnelCheckStatusResult,
     TunnelCreate,
     TunnelDetail,
     TunnelStatus,
@@ -100,7 +101,7 @@ async def create_tunnel(
     data: TunnelCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_operator),
 ) -> TunnelDetail:
     """Create a new IPSec tunnel and sync to infrastructure."""
     tunnel = await tunnel_service.create_tunnel(
@@ -109,7 +110,8 @@ async def create_tunnel(
         user=current_user,
         request=request,
     )
-    return TunnelDetail.model_validate(tunnel)
+    fresh = await tunnel_service.get_tunnel(db, tunnel.id)
+    return TunnelDetail.model_validate(fresh)
 
 
 @router.patch(
@@ -122,16 +124,17 @@ async def update_tunnel(
     data: TunnelUpdate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_operator),
 ) -> TunnelDetail:
     """Update an existing tunnel and re-sync if connection parameters changed."""
-    tunnel = await tunnel_service.update_tunnel(
+    await tunnel_service.update_tunnel(
         db,
         tunnel_id,
         data=data,
         user=current_user,
         request=request,
     )
+    tunnel = await tunnel_service.get_tunnel(db, tunnel_id)
     return TunnelDetail.model_validate(tunnel)
 
 
@@ -144,7 +147,7 @@ async def delete_tunnel(
     tunnel_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_operator),
 ) -> None:
     """Soft-delete a tunnel and cascade to routes and iptables rules."""
     await tunnel_service.delete_tunnel(
@@ -164,15 +167,17 @@ async def retry_tunnel_sync(
     tunnel_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_operator),
 ) -> TunnelDetail:
     """Retry a failed tunnel sync operation. Only works when sync_status='failed'."""
-    tunnel = await tunnel_service.retry_tunnel_sync(
+    await tunnel_service.retry_tunnel_sync(
         db,
         tunnel_id,
         user=current_user,
         request=request,
     )
+    # Re-fetch fresh from DB after commit to avoid expired state issues
+    tunnel = await tunnel_service.get_tunnel(db, tunnel_id)
     return TunnelDetail.model_validate(tunnel)
 
 
@@ -189,6 +194,21 @@ async def get_tunnel_status(
     """Query strongSwan via SSM for real-time tunnel state."""
     result = await tunnel_service.get_tunnel_status(db, tunnel_id)
     return TunnelStatus(**result)
+
+
+@router.post(
+    "/{tunnel_id}/check-status",
+    response_model=TunnelCheckStatusResult,
+    summary="Check operational tunnel status via SSM",
+)
+async def check_tunnel_status(
+    tunnel_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_viewer),
+) -> TunnelCheckStatusResult:
+    """Run 'ipsec status <tunnel_name>' on the primary instance and update the tunnel's status in the DB."""
+    result = await tunnel_service.check_tunnel_status(db, tunnel_id)
+    return TunnelCheckStatusResult(**result)
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +244,7 @@ async def create_tunnel_route(
     data: RouteCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_operator),
 ) -> AsyncOperationRef:
     """Create a route on a tunnel and launch async terragrunt operation."""
     route, operation = await route_service.create_route(
@@ -297,7 +317,7 @@ async def create_tunnel_iptables(
     data: IPTablesRuleCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_operator),
 ) -> IPTablesRuleDetail:
     """Create an iptables rule on a tunnel, apply via SSM."""
     rule = await iptables_service.create_rule(

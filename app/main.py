@@ -27,7 +27,9 @@ from app.routers import (
     iptables_router,
     operations_router,
     routes_router,
+    servers_router,
     tunnels_router,
+    users_router,
 )
 
 logger = get_logger(__name__)
@@ -107,11 +109,13 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(auth_router)
     app.include_router(tunnels_router)
+    app.include_router(servers_router)
     app.include_router(routes_router)
     app.include_router(iptables_router)
     app.include_router(dashboard_router)
     app.include_router(audit_router)
     app.include_router(operations_router)
+    app.include_router(users_router)
 
     return app
 

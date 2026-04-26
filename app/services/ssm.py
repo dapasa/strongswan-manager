@@ -3,40 +3,40 @@
 from __future__ import annotations
 
 import asyncio
-from functools import lru_cache
 
-import boto3
 from botocore.exceptions import ClientError
 
 from app.config import get_settings
 from app.exceptions import InfrastructureError
 from app.logging_config import get_logger
+from app.services.aws_session import get_client
 
 logger = get_logger(__name__)
 
 # Simple in-memory cache for instance ID resolution
 _instance_id_cache: dict[str, str] = {}
 
+
 _POLL_INTERVAL_SECONDS: float = 2.0
 _MAX_POLL_ATTEMPTS: int = 30
 
 
-@lru_cache
 def _get_ec2_client():  # noqa: ANN202
-    """Return a cached boto3 EC2 client."""
-    settings = get_settings()
-    return boto3.client("ec2", region_name=settings.aws_region)
+    """Return a boto3 EC2 client (cached, refreshed on credential rotation)."""
+    return get_client("ec2")
 
 
-@lru_cache
 def _get_ssm_client():  # noqa: ANN202
-    """Return a cached boto3 SSM client."""
-    settings = get_settings()
-    return boto3.client("ssm", region_name=settings.aws_region)
+    """Return a boto3 SSM client (cached, refreshed on credential rotation)."""
+    return get_client("ssm")
 
 
 async def resolve_instance_id(instance_name: str) -> str:
-    """Resolve an EC2 instance ID from its Name tag.
+    """Resolve an EC2 instance ID from its Name tag or config.
+
+    If a direct instance ID is configured for this name, returns it
+    immediately without an EC2 API call. Otherwise falls back to
+    ``describe_instances`` with Name tag filter.
 
     Results are cached in-memory since instance IDs rarely change.
 
@@ -51,6 +51,23 @@ async def resolve_instance_id(instance_name: str) -> str:
     """
     if instance_name in _instance_id_cache:
         return _instance_id_cache[instance_name]
+
+    # Check if a direct instance ID is configured for this name
+    settings = get_settings()
+    direct_id: str | None = None
+    if instance_name == settings.vpn_primary_instance_name and settings.vpn_primary_instance_id:
+        direct_id = settings.vpn_primary_instance_id
+    elif instance_name == settings.vpn_secondary_instance_name and settings.vpn_secondary_instance_id:
+        direct_id = settings.vpn_secondary_instance_id
+
+    if direct_id:
+        _instance_id_cache[instance_name] = direct_id
+        logger.info(
+            "ssm_instance_from_config",
+            instance_name=instance_name,
+            instance_id=direct_id,
+        )
+        return direct_id
 
     logger.info("ssm_resolve_instance", instance_name=instance_name)
 
@@ -204,13 +221,18 @@ async def execute_command(
 
 
 async def reload_ipsec() -> None:
-    """Execute ``ipsec reload`` on both primary and secondary VPN instances.
+    """Sync configs from S3 and reload ipsec on both VPN instances.
+
+    Runs the sync_config.sh script which:
+    1. Downloads connection configs and secrets from S3 to local disk
+    2. Detects changes via hash comparison
+    3. Runs ipsec update + rereadsecrets if changed
 
     Raises:
-        InfrastructureError: If the reload fails on either instance.
+        InfrastructureError: If the sync/reload fails on either instance.
     """
     settings = get_settings()
-    await run_on_instances(commands=["ipsec reload"], target="both")
+    await run_on_instances(commands=["/opt/strongswan/scripts/sync_config.sh"], target="both")
     logger.info("ssm_ipsec_reloaded")
 
 
@@ -239,12 +261,41 @@ async def run_on_instances(
     if not instance_names:
         raise ValueError(f"Invalid target '{target}'. Must be 'primary', 'secondary', or 'both'.")
 
+    results: list[dict] = []
     for name in instance_names:
-        instance_id = await resolve_instance_id(name)
-        await execute_command(
-            instance_id=instance_id,
-            commands=commands,
-            timeout=settings.ssm_command_timeout,
+        try:
+            instance_id = await resolve_instance_id(name)
+            await execute_command(
+                instance_id=instance_id,
+                commands=commands,
+                timeout=settings.ssm_command_timeout,
+            )
+            results.append({"instance": name, "status": "ok"})
+            logger.info("ssm_instance_ok", instance_name=name)
+        except InfrastructureError as exc:
+            results.append({"instance": name, "status": "failed", "error": exc.message})
+            logger.error("ssm_instance_failed", instance_name=name, error=exc.message)
+
+    failed = [r for r in results if r["status"] == "failed"]
+    if failed:
+        status_parts = []
+        for r in results:
+            short_name = r["instance"].replace("dev-strongswan-", "").replace("vpn-", "")
+            if r["status"] == "ok":
+                status_parts.append(f"{short_name}: OK")
+            else:
+                status_parts.append(f"{short_name}: FAILED")
+        summary = " | ".join(status_parts)
+
+        detail_lines = []
+        for r in results:
+            if r["status"] == "failed":
+                detail_lines.append(f"{r['instance']}: {r['error']}")
+        detail = "\n".join(detail_lines)
+
+        raise InfrastructureError(
+            service="SSM",
+            message=f"Reload {len(failed)}/{len(results)} failed — {summary}\n{detail}",
         )
 
 

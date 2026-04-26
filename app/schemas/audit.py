@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+from ipaddress import IPv4Address
+from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 from app.schemas.user import UserBrief
 
@@ -18,10 +20,14 @@ class AuditLogEntry(BaseModel):
     entity_id: int | None = None
     previous_state: dict | None = None
     new_state: dict | None = None
-    ip_address: str | None = None
+    ip_address: Any | None = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_serializer("ip_address")
+    def serialize_ip(self, v: Any) -> str | None:
+        return str(v) if v is not None else None
 
 
 class AuditLogFilter(BaseModel):

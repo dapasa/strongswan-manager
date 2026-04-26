@@ -207,13 +207,14 @@ class TestTunnelServiceCreate:
 
 class TestTunnelServiceRetry:
     @patch("app.services.tunnel_service.audit.log_action", new_callable=AsyncMock)
-    @patch("app.services.tunnel_service.ssm.reload_ipsec", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.execute_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.s3.upload_file", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.ipsec_config.render_connection_conf", return_value="conn test\n")
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
-    async def test_retry_success(self, mock_get, mock_lock, mock_render, mock_upload, mock_reload, mock_audit):
+    async def test_retry_success(self, mock_get, mock_lock, mock_render, mock_upload, mock_fan_out, mock_audit):
         from app.services.tunnel_service import retry_tunnel_sync
+        from app.utils.fan_out import FanOutResult, ServerResult
 
         tunnel = MagicMock()
         tunnel.id = 1
@@ -225,6 +226,10 @@ class TestTunnelServiceRetry:
         tunnel.created_at = datetime.now(timezone.utc)
         tunnel.updated_at = datetime.now(timezone.utc)
         mock_get.return_value = tunnel
+        mock_fan_out.return_value = FanOutResult(
+            total=1, succeeded=1, failed=0,
+            servers=[ServerResult(server_id=1, server_name="vpn-1", success=True, output="ok")],
+        )
 
         session = AsyncMock()
         user = MagicMock()
@@ -233,7 +238,7 @@ class TestTunnelServiceRetry:
         result = await retry_tunnel_sync(session, 1, user=user)
         assert result.sync_status == "synced"
         mock_upload.assert_called_once()
-        mock_reload.assert_called_once()
+        mock_fan_out.assert_called_once()
 
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
     async def test_retry_not_failed_raises_conflict(self, mock_get):

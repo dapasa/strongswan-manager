@@ -10,6 +10,7 @@ from app.schemas.common import PaginationParams, ErrorResponse, HealthResponse
 from app.schemas.dashboard import DashboardSummary
 from app.schemas.iptables import IPTablesRuleCreate, IPTablesRuleUpdate
 from app.schemas.route import RouteCreate
+from app.schemas.server import ServerCreate, ServerUpdate
 from app.schemas.tunnel import TunnelCreate, TunnelUpdate
 from app.schemas.user import UserCreate, UserUpdate
 
@@ -398,3 +399,145 @@ def test_health_response():
     h = HealthResponse(status="ok", checks={"db": "ok", "s3": "ok"})
     assert h.status == "ok"
     assert h.checks["db"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# ServerCreate
+# ---------------------------------------------------------------------------
+
+
+def test_server_create_valid():
+    s = ServerCreate(
+        name="vpn-primary",
+        hostname="10.0.1.50",
+        ssh_private_key="-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+    )
+    assert s.name == "vpn-primary"
+    assert s.hostname == "10.0.1.50"
+    assert s.ssh_port == 22
+    assert s.ssh_user == "admin"
+    assert s.description is None
+
+
+def test_server_create_with_all_fields():
+    s = ServerCreate(
+        name="vpn-secondary",
+        hostname="10.0.1.51",
+        ssh_port=2222,
+        ssh_user="ubuntu",
+        ssh_private_key="-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+        description="Secondary VPN instance",
+    )
+    assert s.ssh_port == 2222
+    assert s.ssh_user == "ubuntu"
+    assert s.description == "Secondary VPN instance"
+
+
+def test_server_create_missing_name():
+    with pytest.raises(ValidationError) as exc_info:
+        ServerCreate(
+            hostname="10.0.1.50",
+            ssh_private_key="fake-key",
+        )
+    assert "name" in str(exc_info.value)
+
+
+def test_server_create_missing_hostname():
+    with pytest.raises(ValidationError) as exc_info:
+        ServerCreate(
+            name="vpn-primary",
+            ssh_private_key="fake-key",
+        )
+    assert "hostname" in str(exc_info.value)
+
+
+def test_server_create_missing_ssh_key():
+    with pytest.raises(ValidationError) as exc_info:
+        ServerCreate(
+            name="vpn-primary",
+            hostname="10.0.1.50",
+        )
+    assert "ssh_private_key" in str(exc_info.value)
+
+
+def test_server_create_invalid_port_zero():
+    with pytest.raises(ValidationError):
+        ServerCreate(
+            name="vpn-primary",
+            hostname="10.0.1.50",
+            ssh_port=0,
+            ssh_private_key="fake-key",
+        )
+
+
+def test_server_create_invalid_port_too_high():
+    with pytest.raises(ValidationError):
+        ServerCreate(
+            name="vpn-primary",
+            hostname="10.0.1.50",
+            ssh_port=70000,
+            ssh_private_key="fake-key",
+        )
+
+
+def test_server_create_empty_name():
+    with pytest.raises(ValidationError):
+        ServerCreate(
+            name="",
+            hostname="10.0.1.50",
+            ssh_private_key="fake-key",
+        )
+
+
+def test_server_create_name_too_long():
+    with pytest.raises(ValidationError):
+        ServerCreate(
+            name="x" * 256,
+            hostname="10.0.1.50",
+            ssh_private_key="fake-key",
+        )
+
+
+# ---------------------------------------------------------------------------
+# ServerUpdate
+# ---------------------------------------------------------------------------
+
+
+def test_server_update_partial():
+    s = ServerUpdate(hostname="10.0.1.51")
+    assert s.hostname == "10.0.1.51"
+    assert s.name is None
+    assert s.ssh_port is None
+    assert s.ssh_private_key is None
+    assert s.is_active is None
+
+
+def test_server_update_empty():
+    s = ServerUpdate()
+    assert s.name is None
+    assert s.hostname is None
+
+
+def test_server_update_all_fields():
+    s = ServerUpdate(
+        name="new-name",
+        hostname="new-host",
+        ssh_port=3333,
+        ssh_user="ec2-user",
+        ssh_private_key="new-key",
+        description="updated",
+        is_active=False,
+    )
+    assert s.name == "new-name"
+    assert s.ssh_port == 3333
+    assert s.is_active is False
+
+
+def test_server_update_invalid_port():
+    with pytest.raises(ValidationError):
+        ServerUpdate(ssh_port=0)
+
+
+def test_server_update_invalid_port_too_high():
+    with pytest.raises(ValidationError):
+        ServerUpdate(ssh_port=70000)

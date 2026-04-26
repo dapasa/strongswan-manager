@@ -4,7 +4,9 @@ from datetime import datetime
 from ipaddress import IPv4Network
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 class IPTablesRuleCreate(BaseModel):
     """Schema for creating a structured iptables rule."""
@@ -75,8 +77,8 @@ class IPTablesRuleDetail(BaseModel):
     tunnel_id: int
     chain: str
     protocol: str
-    source_cidr: str | None = None
-    dest_cidr: str | None = None
+    source_cidr: Any | None = None
+    dest_cidr: Any | None = None
     sport: int | None = None
     dport: int | None = None
     action: str
@@ -91,3 +93,7 @@ class IPTablesRuleDetail(BaseModel):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_serializer("source_cidr", "dest_cidr")
+    def serialize_cidrs(self, v: Any) -> str | None:
+        return str(v) if v is not None else None

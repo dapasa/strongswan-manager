@@ -8,23 +8,20 @@ Bucket structure:
 from __future__ import annotations
 
 import asyncio
-from functools import lru_cache
 
-import boto3
 from botocore.exceptions import ClientError
 
 from app.config import get_settings
 from app.exceptions import InfrastructureError
 from app.logging_config import get_logger
+from app.services.aws_session import get_client
 
 logger = get_logger(__name__)
 
 
-@lru_cache
 def _get_s3_client():  # noqa: ANN202
-    """Return a cached boto3 S3 client."""
-    settings = get_settings()
-    return boto3.client("s3", region_name=settings.aws_region)
+    """Return a boto3 S3 client (cached, refreshed on credential rotation)."""
+    return get_client("s3")
 
 
 async def upload_file(key: str, content: str) -> None:

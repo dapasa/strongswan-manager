@@ -1,4 +1,4 @@
-"""Tunnel orchestration service — coordinates DB, S3, SSM for tunnel CRUD."""
+"""Tunnel orchestration service — coordinates DB, S3, SSH for tunnel CRUD."""
 
 from __future__ import annotations
 
@@ -10,13 +10,15 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.config import get_settings
 from app.db.models import IPTablesRule, Route, Tunnel, User
 from app.exceptions import ConflictError, InfrastructureError, NotFoundError
 from app.logging_config import get_logger
-from app.services import audit, ipsec_config, ssm
+from app.services import audit, ipsec_config
+from app.services import ssm  # SSM retained for iptables cascade — migrate with iptables-ssh-migration
 from app.services.iptables_service import build_iptables_command
 from app.services.locks import LOCK_IPSEC_CONFIG, require_lock
+from app.services.server_service import execute_on_all_servers
+from app.utils.fan_out import FanOutResult
 
 logger = get_logger(__name__)
 
@@ -28,8 +30,8 @@ def _tunnel_to_dict(tunnel: Tunnel) -> dict[str, Any]:
         "name": tunnel.name,
         "description": tunnel.description,
         "peer_ip": str(tunnel.peer_ip),
-        "local_cidrs": list(tunnel.local_cidrs),
-        "remote_cidrs": list(tunnel.remote_cidrs),
+        "local_cidrs": [str(c) for c in tunnel.local_cidrs],
+        "remote_cidrs": [str(c) for c in tunnel.remote_cidrs],
         "ike_version": tunnel.ike_version,
         "ike_proposals": tunnel.ike_proposals,
         "esp_proposals": tunnel.esp_proposals,
@@ -39,10 +41,19 @@ def _tunnel_to_dict(tunnel: Tunnel) -> dict[str, Any]:
         "status": tunnel.status,
         "sync_status": tunnel.sync_status,
         "sync_error": tunnel.sync_error,
+        "sync_details": tunnel.sync_details,
+        "psk_secret_name": tunnel.psk_secret_name,
         "created_by": tunnel.created_by,
         "created_at": tunnel.created_at.isoformat() if tunnel.created_at else None,
         "updated_at": tunnel.updated_at.isoformat() if tunnel.updated_at else None,
     }
+
+
+def _apply_fan_out_result(tunnel: Tunnel, result: FanOutResult) -> None:
+    """Apply a FanOutResult to a tunnel's sync fields."""
+    tunnel.sync_status = result.to_sync_status()
+    tunnel.sync_error = result.to_sync_error()
+    tunnel.sync_details = result.to_sync_details()
 
 
 async def list_tunnels(
@@ -136,8 +147,8 @@ async def create_tunnel(
     1. Validate name uniqueness among active tunnels.
     2. Acquire IPSEC_CONF_LOCK advisory lock.
     3. Insert tunnel with sync_status='pending'.
-    4. Regenerate ipsec.conf from DB, upload to S3, reload via SSM.
-    5. Set sync_status='synced' on success, 'failed' on infra error.
+    4. Regenerate ipsec.conf from DB, upload to S3, reload via SSH fan-out.
+    5. Apply FanOutResult to sync_status/sync_error/sync_details.
     6. Create audit log entry.
     7. Commit transaction.
 
@@ -182,16 +193,16 @@ async def create_tunnel(
         dpd_timeout=data.dpd_timeout,
         status="active",
         sync_status="pending",
+        psk_secret_name=f"secrets/{data.name}.secrets",
         created_by=user.id,
     )
     session.add(tunnel)
     await session.flush()
 
-    # Sync infrastructure — upload .conf + .secrets to S3, reload ipsec
+    # Sync infrastructure — upload .conf + .secrets to S3, reload ipsec via SSH
     try:
-        await ipsec_config.sync_tunnel_config(tunnel, psk=data.psk)
-        tunnel.sync_status = "synced"
-        tunnel.sync_error = None
+        fan_out_result = await ipsec_config.sync_tunnel_config(tunnel, psk=data.psk, session=session)
+        _apply_fan_out_result(tunnel, fan_out_result)
         logger.info("tunnel_create_synced", tunnel_id=tunnel.id, name=tunnel.name)
     except InfrastructureError as exc:
         tunnel.sync_status = "failed"
@@ -201,6 +212,15 @@ async def create_tunnel(
             tunnel_id=tunnel.id,
             name=tunnel.name,
             error=exc.message,
+        )
+    except Exception as exc:
+        tunnel.sync_status = "failed"
+        tunnel.sync_error = f"Unexpected sync error: {exc}"
+        logger.error(
+            "tunnel_create_sync_unexpected",
+            tunnel_id=tunnel.id,
+            name=tunnel.name,
+            error=str(exc),
         )
 
     # Audit log
@@ -231,8 +251,8 @@ async def update_tunnel(
     1. Get existing tunnel, capture previous state.
     2. Acquire IPSEC_CONF_LOCK.
     3. Update changed fields.
-    4. If connection-relevant fields changed, regenerate ipsec.conf.
-    5. Update sync_status accordingly.
+    4. If connection-relevant fields changed, regenerate ipsec.conf via SSH fan-out.
+    5. Apply FanOutResult to sync fields.
     6. Create audit log entry.
     7. Commit transaction.
 
@@ -288,32 +308,43 @@ async def update_tunnel(
         else:
             setattr(tunnel, field, value)
 
+    # Keep psk_secret_name in sync with tunnel name
+    if "name" in update_data:
+        tunnel.psk_secret_name = f"secrets/{tunnel.name}.secrets"
+
     # Sync infrastructure if connection params or PSK changed
     if needs_sync:
         tunnel.sync_status = "pending"
         try:
             if "name" in update_data and update_data["name"] != old_name and psk is not None:
                 # Rename: delete old files, upload new
-                await ipsec_config.rename_tunnel_config(old_name, tunnel, psk)
+                fan_out_result = await ipsec_config.rename_tunnel_config(
+                    old_name, tunnel, psk, session
+                )
+                _apply_fan_out_result(tunnel, fan_out_result)
             elif "name" in update_data and update_data["name"] != old_name:
-                # Rename without PSK change — need to read old secrets first
-                # For now, require PSK on rename
+                # Rename without PSK change — not supported
                 tunnel.sync_status = "failed"
                 tunnel.sync_error = "PSK is required when renaming a tunnel"
             elif psk is not None:
                 # PSK or config changed, same name
-                await ipsec_config.sync_tunnel_config(tunnel, psk)
+                fan_out_result = await ipsec_config.sync_tunnel_config(tunnel, psk, session)
+                _apply_fan_out_result(tunnel, fan_out_result)
             else:
                 # Config changed but no PSK — re-upload .conf only, keep .secrets
-                conf_content = ipsec_config.render_connection_conf(tunnel)
                 from app.services import s3
+                conf_content = ipsec_config.render_connection_conf(tunnel)
                 await s3.upload_file(f"connections/{tunnel.name}.conf", conf_content)
-                await ssm.reload_ipsec()
+                fan_out_result = await execute_on_all_servers(
+                    session, ["/opt/strongswan/scripts/sync_config.sh"]
+                )
+                _apply_fan_out_result(tunnel, fan_out_result)
 
-            if tunnel.sync_status != "failed":
-                tunnel.sync_status = "synced"
-                tunnel.sync_error = None
-                logger.info("tunnel_update_synced", tunnel_id=tunnel.id)
+            logger.info(
+                "tunnel_update_sync_done",
+                tunnel_id=tunnel.id,
+                sync_status=tunnel.sync_status,
+            )
         except InfrastructureError as exc:
             tunnel.sync_status = "failed"
             tunnel.sync_error = exc.message
@@ -339,44 +370,28 @@ async def update_tunnel(
     return tunnel
 
 
-async def delete_tunnel(
+async def _cleanup_tunnel_iptables(
+    tunnel: Tunnel,
     session: AsyncSession,
-    tunnel_id: int,
-    *,
     user: User,
     request: Request | None = None,
+    now: datetime | None = None,
 ) -> None:
-    """Soft-delete a tunnel with cascade deletion of routes and iptables rules.
+    """Remove iptables rules for a tunnel via SSM and soft-delete them.
 
-    This is the most complex operation:
-    1. Get tunnel with its active routes and iptables rules.
-    2. Acquire IPSEC_CONF_LOCK.
-    3. For each active iptables rule: remove via SSM, soft-delete.
-    4. For each active route: soft-delete (terragrunt cleanup noted as async ops).
-    5. Soft-delete the tunnel.
-    6. Regenerate ipsec.conf (tunnel now excluded).
-    7. Create audit log entries for tunnel and all cascaded entities.
-    8. Commit transaction.
+    TEMPORARY: Still uses SSM. Will be migrated to SSH in iptables-migration change.
+    Extracted from delete_tunnel() to isolate the SSM dependency.
 
     Args:
+        tunnel: The Tunnel instance whose rules to clean up.
         session: Active database session.
-        tunnel_id: Primary key of the tunnel to delete.
         user: Authenticated user performing the operation.
         request: FastAPI request for audit context.
-
-    Raises:
-        NotFoundError: If the tunnel does not exist.
-        LockConflictError: If the IPSEC_CONF_LOCK is held.
+        now: Timestamp to use for deleted_at; defaults to current UTC time.
     """
-    tunnel = await get_tunnel(session, tunnel_id)
-    previous_state = _tunnel_to_dict(tunnel)
+    if now is None:
+        now = datetime.now(timezone.utc)
 
-    # Acquire lock
-    await require_lock(session, LOCK_IPSEC_CONFIG)
-
-    now = datetime.now(timezone.utc)
-
-    # Cascade: remove iptables rules via SSM, then soft-delete
     active_rules = [r for r in tunnel.iptables_rules if r.deleted_at is None]
     for rule in active_rules:
         try:
@@ -393,12 +408,11 @@ async def delete_tunnel(
             logger.error(
                 "cascade_iptables_remove_failed",
                 rule_id=rule.id,
-                tunnel_id=tunnel_id,
+                tunnel_id=tunnel.id,
                 error=exc.message,
             )
 
         rule.deleted_at = now
-        rule.status = "inactive" if hasattr(rule, "status") else rule.status  # noqa: PLW0120
         rule.sync_status = "pending_delete"
 
         await audit.log_action(
@@ -410,6 +424,51 @@ async def delete_tunnel(
             previous_state=_iptables_rule_to_dict(rule),
             request=request,
         )
+
+
+async def delete_tunnel(
+    session: AsyncSession,
+    tunnel_id: int,
+    *,
+    user: User,
+    request: Request | None = None,
+) -> None:
+    """Soft-delete a tunnel with cascade deletion of routes and iptables rules.
+
+    Delete uses blocking semantics: ALL servers must confirm removal of the
+    config or the delete is aborted (no soft-delete). This prevents orphaned
+    configs on servers that would keep tunnels active after the DB record is gone.
+
+    1. Get tunnel with its active routes and iptables rules.
+    2. Acquire IPSEC_CONF_LOCK.
+    3. Clean up iptables rules via SSM (extracted helper).
+    4. Soft-delete active routes.
+    5. Remove .conf and .secrets from S3.
+    6. SSH fan-out: run sync_config.sh on all servers.
+    7. If any server fails: raise InfrastructureError — do NOT soft-delete.
+    8. Soft-delete tunnel, create audit log, commit.
+
+    Args:
+        session: Active database session.
+        tunnel_id: Primary key of the tunnel to delete.
+        user: Authenticated user performing the operation.
+        request: FastAPI request for audit context.
+
+    Raises:
+        NotFoundError: If the tunnel does not exist.
+        LockConflictError: If the IPSEC_CONF_LOCK is held.
+        InfrastructureError: If any server fails to confirm config removal.
+    """
+    tunnel = await get_tunnel(session, tunnel_id)
+    previous_state = _tunnel_to_dict(tunnel)
+
+    # Acquire lock
+    await require_lock(session, LOCK_IPSEC_CONFIG)
+
+    now = datetime.now(timezone.utc)
+
+    # Cascade: remove iptables rules via SSM, then soft-delete
+    await _cleanup_tunnel_iptables(tunnel, session, user, request=request, now=now)
 
     # Cascade: soft-delete routes
     active_routes = [r for r in tunnel.routes if r.deleted_at is None]
@@ -427,20 +486,31 @@ async def delete_tunnel(
             request=request,
         )
 
-    # Soft-delete the tunnel itself
-    tunnel.deleted_at = now
-    tunnel.sync_status = "pending_delete"
+    # Remove connection .conf and .secrets from S3, then fan-out sync to all servers
+    fan_out_result = await ipsec_config.remove_tunnel_config(tunnel.name, session)
 
-    # Remove connection .conf and .secrets from S3, reload ipsec
-    try:
-        await ipsec_config.remove_tunnel_config(tunnel.name)
-        logger.info("tunnel_delete_synced", tunnel_id=tunnel_id)
-    except InfrastructureError as exc:
+    if fan_out_result.is_total_failure or fan_out_result.failed > 0:
+        # Persist sync failure state before raising — spec requires sync_details to be set
+        _apply_fan_out_result(tunnel, fan_out_result)
         logger.error(
             "tunnel_delete_sync_failed",
             tunnel_id=tunnel_id,
-            error=exc.message,
+            failed=fan_out_result.failed,
+            total=fan_out_result.total,
         )
+        raise InfrastructureError(
+            service="SSH",
+            message=(
+                f"Config removal failed on {fan_out_result.failed}/{fan_out_result.total} servers "
+                f"— delete aborted to prevent orphaned configs"
+            ),
+        )
+
+    logger.info("tunnel_delete_synced", tunnel_id=tunnel_id)
+
+    # All servers confirmed — safe to soft-delete
+    tunnel.deleted_at = now
+    tunnel.sync_status = "pending_delete"
 
     # Audit log for tunnel
     await audit.log_action(
@@ -463,10 +533,10 @@ async def retry_tunnel_sync(
     user: User,
     request: Request | None = None,
 ) -> Tunnel:
-    """Retry a failed tunnel sync operation.
+    """Retry a failed or partial tunnel sync operation.
 
-    Only works when the tunnel's sync_status is 'failed'. Re-runs the
-    ipsec.conf regeneration, S3 upload, and SSM reload cycle.
+    Accepts sync_status of 'failed' or 'partial'. Re-uploads the .conf from
+    current DB state and runs SSH fan-out sync_config.sh on all servers.
 
     Args:
         session: Active database session.
@@ -479,14 +549,15 @@ async def retry_tunnel_sync(
 
     Raises:
         NotFoundError: If the tunnel does not exist.
-        ConflictError: If sync_status is not 'failed'.
+        ConflictError: If sync_status is not 'failed' or 'partial'.
         LockConflictError: If the IPSEC_CONF_LOCK is held.
     """
     tunnel = await get_tunnel(session, tunnel_id)
 
-    if tunnel.sync_status != "failed":
+    if tunnel.sync_status not in ("failed", "partial"):
         raise ConflictError(
-            f"Tunnel {tunnel_id} sync_status is '{tunnel.sync_status}', not 'failed'. Retry only works on failed syncs."
+            f"Tunnel {tunnel_id} sync_status is '{tunnel.sync_status}', not 'failed' or 'partial'. "
+            "Retry only works on failed or partial syncs."
         )
 
     # Acquire lock
@@ -498,10 +569,15 @@ async def retry_tunnel_sync(
         from app.services import s3
         conf_content = ipsec_config.render_connection_conf(tunnel)
         await s3.upload_file(f"connections/{tunnel.name}.conf", conf_content)
-        await ssm.reload_ipsec()
-        tunnel.sync_status = "synced"
-        tunnel.sync_error = None
-        logger.info("tunnel_retry_synced", tunnel_id=tunnel.id)
+        fan_out_result = await execute_on_all_servers(
+            session, ["/opt/strongswan/scripts/sync_config.sh"]
+        )
+        _apply_fan_out_result(tunnel, fan_out_result)
+        logger.info(
+            "tunnel_retry_synced",
+            tunnel_id=tunnel.id,
+            sync_status=tunnel.sync_status,
+        )
     except InfrastructureError as exc:
         tunnel.sync_status = "failed"
         tunnel.sync_error = exc.message
@@ -509,6 +585,14 @@ async def retry_tunnel_sync(
             "tunnel_retry_sync_failed",
             tunnel_id=tunnel.id,
             error=exc.message,
+        )
+    except Exception as exc:
+        tunnel.sync_status = "failed"
+        tunnel.sync_error = f"Unexpected sync error: {exc}"
+        logger.error(
+            "tunnel_retry_sync_unexpected",
+            tunnel_id=tunnel.id,
+            error=str(exc),
         )
 
     # Audit log
@@ -530,35 +614,49 @@ async def get_tunnel_status(
     session: AsyncSession,
     tunnel_id: int,
 ) -> dict[str, Any]:
-    """Get live tunnel status by running 'ipsec statusall' on the primary instance.
+    """Get live tunnel status by running 'ipsec statusall' on all servers via SSH.
 
     Args:
         session: Active database session.
         tunnel_id: Primary key of the tunnel to check.
 
     Returns:
-        Dict with tunnel_id, name, state (UP/DOWN/UNKNOWN), details, checked_at.
+        Dict with tunnel_id, name, state (UP/DOWN/UNKNOWN), details,
+        per_server results, checked_at.
 
     Raises:
         NotFoundError: If the tunnel does not exist.
     """
     tunnel = await get_tunnel(session, tunnel_id)
-    settings = get_settings()
     checked_at = datetime.now(timezone.utc)
 
     try:
-        primary_id = await ssm.resolve_instance_id(settings.vpn_primary_instance_name)
-        output = await ssm.execute_command(
-            instance_id=primary_id,
-            commands=["ipsec statusall"],
-            timeout=settings.ssm_command_timeout,
-        )
-        state = _parse_tunnel_state(tunnel.name, output)
+        fan_out_result = await execute_on_all_servers(session, ["ipsec statusall"])
+
+        per_server = []
+        states = []
+        for srv in fan_out_result.servers:
+            if srv.success:
+                state = _parse_tunnel_state(tunnel.name, srv.output)
+            else:
+                state = "UNKNOWN"
+            per_server.append({
+                "server_id": srv.server_id,
+                "server_name": srv.server_name,
+                "state": state,
+                "success": srv.success,
+                "error": srv.error or None,
+            })
+            states.append(state)
+
+        aggregated_state = _aggregate_tunnel_states(states)
+
         return {
             "tunnel_id": tunnel.id,
             "name": tunnel.name,
-            "state": state,
-            "details": output if state != "UNKNOWN" else None,
+            "state": aggregated_state,
+            "details": None,
+            "per_server": per_server,
             "checked_at": checked_at,
         }
     except InfrastructureError as exc:
@@ -572,19 +670,100 @@ async def get_tunnel_status(
             "name": tunnel.name,
             "state": "UNKNOWN",
             "details": None,
+            "per_server": [],
             "checked_at": checked_at,
         }
 
 
+async def check_tunnel_status(
+    session: AsyncSession,
+    tunnel_id: int,
+) -> dict[str, Any]:
+    """Check operational tunnel status by running 'ipsec status <name>' on all servers.
+
+    Runs the targeted ``ipsec status <tunnel_name>`` command via SSH fan-out,
+    aggregates per-server states, and persists the result to tunnel.status.
+
+    Args:
+        session: Active database session.
+        tunnel_id: Primary key of the tunnel to check.
+
+    Returns:
+        Dict with tunnel_id, name, state, raw_output, per_server, checked_at.
+
+    Raises:
+        NotFoundError: If the tunnel does not exist.
+    """
+    tunnel = await get_tunnel(session, tunnel_id)
+    checked_at = datetime.now(timezone.utc)
+
+    per_server = []
+    states = []
+    raw_output = ""
+
+    try:
+        fan_out_result = await execute_on_all_servers(
+            session, [f"ipsec status {tunnel.name}"]
+        )
+
+        for srv in fan_out_result.servers:
+            if srv.success:
+                state = _parse_tunnel_state(tunnel.name, srv.output)
+                raw_output = srv.output
+            else:
+                state = "UNKNOWN"
+            per_server.append({
+                "server_id": srv.server_id,
+                "server_name": srv.server_name,
+                "state": state,
+                "success": srv.success,
+                "error": srv.error or None,
+            })
+            states.append(state)
+
+        aggregated_state = _aggregate_tunnel_states(states)
+
+    except InfrastructureError as exc:
+        logger.error(
+            "tunnel_check_status_failed",
+            tunnel_id=tunnel_id,
+            error=exc.message,
+        )
+        aggregated_state = "UNKNOWN"
+        raw_output = f"SSH error: {exc.message}"
+
+    # Map parsed state to DB status value and persist
+    # PARTIAL means UP on some servers — store as "up" at DB level per spec (any UP = up at DB level)
+    status_map = {"UP": "up", "PARTIAL": "up", "DOWN": "down", "UNKNOWN": "unknown"}
+    tunnel.status = status_map.get(aggregated_state, "unknown")
+    await session.commit()
+
+    logger.info(
+        "tunnel_check_status_done",
+        tunnel_id=tunnel_id,
+        name=tunnel.name,
+        state=aggregated_state,
+    )
+
+    return {
+        "tunnel_id": tunnel.id,
+        "name": tunnel.name,
+        "state": aggregated_state,
+        "raw_output": raw_output,
+        "per_server": per_server,
+        "checked_at": checked_at,
+    }
+
+
 def _parse_tunnel_state(tunnel_name: str, ipsec_output: str) -> str:
-    """Parse 'ipsec statusall' output to determine tunnel state.
+    """Parse ipsec status output to determine tunnel state.
 
     Looks for the connection name in the output and checks for ESTABLISHED
     or INSTALLED keywords which indicate an active tunnel.
 
     Args:
         tunnel_name: Name of the tunnel connection.
-        ipsec_output: Raw output from ipsec statusall.
+        ipsec_output: Raw output from ipsec status / statusall.
 
     Returns:
         'UP', 'DOWN', or 'UNKNOWN'.
@@ -592,7 +771,6 @@ def _parse_tunnel_state(tunnel_name: str, ipsec_output: str) -> str:
     if not ipsec_output:
         return "UNKNOWN"
 
-    # Look for connection-specific status lines
     lines = ipsec_output.lower().splitlines()
     found_connection = False
     for line in lines:
@@ -602,6 +780,34 @@ def _parse_tunnel_state(tunnel_name: str, ipsec_output: str) -> str:
                 return "UP"
 
     return "DOWN" if found_connection else "UNKNOWN"
+
+
+def _aggregate_tunnel_states(states: list[str]) -> str:
+    """Aggregate per-server tunnel states into a single state.
+
+    Rules:
+    - All UP → UP
+    - Mix of UP and DOWN/UNKNOWN → PARTIAL
+    - All DOWN (with or without UNKNOWN) → DOWN
+    - All UNKNOWN or empty → UNKNOWN
+
+    Args:
+        states: List of per-server state strings ('UP', 'DOWN', 'UNKNOWN').
+
+    Returns:
+        Aggregated state string: 'UP', 'PARTIAL', 'DOWN', or 'UNKNOWN'.
+    """
+    if not states:
+        return "UNKNOWN"
+    has_up = "UP" in states
+    has_down_or_unknown = any(s in ("DOWN", "UNKNOWN") for s in states)
+    if has_up and has_down_or_unknown:
+        return "PARTIAL"
+    if has_up:
+        return "UP"
+    if "DOWN" in states:
+        return "DOWN"
+    return "UNKNOWN"
 
 
 def _iptables_rule_to_dict(rule: IPTablesRule) -> dict[str, Any]:
