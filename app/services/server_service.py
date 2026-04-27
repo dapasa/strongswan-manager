@@ -79,18 +79,21 @@ async def execute_command(
 
         if result.exit_status != 0:
             stderr = result.stderr or ""
+            stdout = result.stdout or ""
             logger.warning(
                 "server_execute_command_nonzero",
                 server_id=server.id,
                 name=server.name,
                 exit_status=result.exit_status,
+                stdout=stdout,
                 stderr=stderr,
             )
+            detail = (stderr or stdout).strip() or f"exit {result.exit_status}"
             return ServerResult(
                 server_id=server.id,
                 server_name=server.name,
                 success=False,
-                error=f"Command exited with status {result.exit_status}: {stderr}".strip(": "),
+                error=f"Command exited with status {result.exit_status}: {detail}",
             )
 
         logger.info("server_execute_command_success", server_id=server.id, name=server.name)

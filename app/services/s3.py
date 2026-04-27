@@ -125,6 +125,10 @@ async def delete_file(key: str) -> None:
         )
         logger.info("s3_delete_complete", bucket=bucket, key=key)
     except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code", "Unknown")
+        if error_code in ("NoSuchKey", "404"):
+            logger.info("s3_delete_skipped_not_found", bucket=bucket, key=key)
+            return
         raise InfrastructureError(
             service="S3",
             message=f"Failed to delete s3://{bucket}/{key}",

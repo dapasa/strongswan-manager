@@ -336,7 +336,7 @@ async def update_tunnel(
                 conf_content = ipsec_config.render_connection_conf(tunnel)
                 await s3.upload_file(f"connections/{tunnel.name}.conf", conf_content)
                 fan_out_result = await execute_on_all_servers(
-                    session, ["/opt/strongswan/scripts/sync_config.sh"]
+                    session, ["sudo /opt/strongswan/scripts/sync_config.sh", "sudo /usr/sbin/swanctl --load-all"]
                 )
                 _apply_fan_out_result(tunnel, fan_out_result)
 
@@ -353,6 +353,9 @@ async def update_tunnel(
                 tunnel_id=tunnel.id,
                 error=exc.message,
             )
+
+    await session.flush()
+    await session.refresh(tunnel)
 
     # Audit log
     await audit.log_action(
@@ -570,7 +573,7 @@ async def retry_tunnel_sync(
         conf_content = ipsec_config.render_connection_conf(tunnel)
         await s3.upload_file(f"connections/{tunnel.name}.conf", conf_content)
         fan_out_result = await execute_on_all_servers(
-            session, ["/opt/strongswan/scripts/sync_config.sh"]
+            session, ["sudo /opt/strongswan/scripts/sync_config.sh", "sudo /usr/sbin/swanctl --load-all"]
         )
         _apply_fan_out_result(tunnel, fan_out_result)
         logger.info(
@@ -594,6 +597,9 @@ async def retry_tunnel_sync(
             tunnel_id=tunnel.id,
             error=str(exc),
         )
+
+    await session.flush()
+    await session.refresh(tunnel)
 
     # Audit log
     await audit.log_action(
@@ -631,7 +637,7 @@ async def get_tunnel_status(
     checked_at = datetime.now(timezone.utc)
 
     try:
-        fan_out_result = await execute_on_all_servers(session, ["ipsec statusall"])
+        fan_out_result = await execute_on_all_servers(session, ["sudo /usr/sbin/ipsec statusall"])
 
         per_server = []
         states = []
@@ -703,7 +709,7 @@ async def check_tunnel_status(
 
     try:
         fan_out_result = await execute_on_all_servers(
-            session, [f"ipsec status {tunnel.name}"]
+            session, ["sudo /usr/sbin/ipsec statusall"]
         )
 
         for srv in fan_out_result.servers:

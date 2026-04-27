@@ -21,7 +21,8 @@ from app.utils.fan_out import FanOutResult
 
 logger = get_logger(__name__)
 
-_SYNC_SCRIPT = "/opt/strongswan/scripts/sync_config.sh"
+_SYNC_SCRIPT = "sudo /opt/strongswan/scripts/sync_config.sh"
+_LOAD_ALL = "sudo /usr/sbin/swanctl --load-all"
 
 
 def render_connection_conf(tunnel: Tunnel) -> str:
@@ -133,7 +134,7 @@ async def sync_tunnel_config(tunnel: Tunnel, psk: str, session: AsyncSession) ->
     await s3.upload_file(_conf_key(tunnel.name), conf_content)
     await s3.upload_file(_secrets_key(tunnel.name), secrets_content)
 
-    result = await execute_on_all_servers(session, [_SYNC_SCRIPT])
+    result = await execute_on_all_servers(session, [_SYNC_SCRIPT, _LOAD_ALL])
 
     logger.info("ipsec_sync_complete", tunnel=tunnel.name)
     return result
@@ -160,7 +161,7 @@ async def remove_tunnel_config(name: str, session: AsyncSession) -> FanOutResult
     await s3.delete_file(_conf_key(name))
     await s3.delete_file(_secrets_key(name))
 
-    result = await execute_on_all_servers(session, [_SYNC_SCRIPT])
+    result = await execute_on_all_servers(session, [_SYNC_SCRIPT, _LOAD_ALL])
 
     logger.info("ipsec_remove_complete", tunnel=name)
     return result
@@ -196,7 +197,7 @@ async def rename_tunnel_config(
     await s3.upload_file(_conf_key(tunnel.name), conf_content)
     await s3.upload_file(_secrets_key(tunnel.name), secrets_content)
 
-    result = await execute_on_all_servers(session, [_SYNC_SCRIPT])
+    result = await execute_on_all_servers(session, [_SYNC_SCRIPT, _LOAD_ALL])
 
     logger.info("ipsec_rename_complete", old_name=old_name, new_name=tunnel.name)
     return result
