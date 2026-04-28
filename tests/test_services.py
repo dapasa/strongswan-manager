@@ -363,7 +363,7 @@ class TestIPSecConfigGenerator:
         content = render_secrets_file(tunnel, "MySecretPSK")
         assert '203.0.113.1 10.0.0.0 : PSK "MySecretPSK"' in content
 
-    @patch("app.services.ipsec_config.execute_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.ipsec_config.sftp_push_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.ipsec_config.s3.upload_file", new_callable=AsyncMock)
     async def test_sync_tunnel_config(self, mock_upload, mock_fan_out):
         from app.services.ipsec_config import sync_tunnel_config
@@ -399,7 +399,7 @@ class TestIPSecConfigGenerator:
         assert conf_call[0][0] == "connections/test-tunnel.conf"
         assert secrets_call[0][0] == "secrets/test-tunnel.secrets"
 
-    @patch("app.services.ipsec_config.execute_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.ipsec_config.sftp_delete_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.ipsec_config.s3.delete_file", new_callable=AsyncMock)
     async def test_remove_tunnel_config(self, mock_delete, mock_fan_out):
         from app.services.ipsec_config import remove_tunnel_config

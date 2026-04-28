@@ -75,6 +75,16 @@ class Settings(BaseSettings):
         "Generate with: python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'",
     )
 
+    # VPN Server Remote Paths
+    vpn_conf_dir: str = Field(
+        default="/opt/strongswan/config/connections",
+        description="Remote path to StrongSwan connection config directory on VPN servers",
+    )
+    vpn_secrets_dir: str = Field(
+        default="/opt/strongswan/config/secrets",
+        description="Remote path to StrongSwan secrets directory on VPN servers",
+    )
+
     # CORS
     cors_origins: list[str] = Field(default=["http://localhost:3000"])
 

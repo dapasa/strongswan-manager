@@ -207,7 +207,7 @@ class TestTunnelServiceCreate:
 
 class TestTunnelServiceRetry:
     @patch("app.services.tunnel_service.audit.log_action", new_callable=AsyncMock)
-    @patch("app.services.tunnel_service.execute_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.s3.upload_file", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.ipsec_config.render_connection_conf", return_value="conn test\n")
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)

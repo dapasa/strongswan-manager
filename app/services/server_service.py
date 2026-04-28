@@ -24,6 +24,19 @@ logger = get_logger(__name__)
 # SSH connection timeout in seconds
 SSH_CONNECT_TIMEOUT = 10
 
+# swanctl command to reload all connections after config push / delete
+_LOAD_ALL = "sudo /usr/sbin/swanctl --load-all"
+
+
+def _remote_conf_path(name: str) -> str:
+    """Remote path for a tunnel's .conf file on VPN servers."""
+    return f"{get_settings().vpn_conf_dir}/{name}.conf"
+
+
+def _remote_secrets_path(name: str) -> str:
+    """Remote path for a tunnel's .secrets file on VPN servers."""
+    return f"{get_settings().vpn_secrets_dir}/{name}.secrets"
+
 
 async def _connect_ssh(server: Server) -> asyncssh.SSHClientConnection:
     """Create an asyncssh connection to a server.
@@ -208,6 +221,591 @@ async def execute_on_all_servers(
 
     logger.info(
         "server_execute_on_all_servers",
+        total=len(servers),
+        succeeded=succeeded,
+        failed=failed,
+    )
+
+    return FanOutResult(
+        total=len(servers),
+        succeeded=succeeded,
+        failed=failed,
+        servers=server_results,
+    )
+
+
+async def sftp_push_tunnel_config(
+    server: Server,
+    name: str,
+    conf_content: str,
+    secrets_content: str | None,
+    *,
+    timeout: int | None = None,
+) -> ServerResult:
+    """Open SSH+SFTP to server, write .conf (and optionally .secrets), run swanctl --load-all.
+
+    Args:
+        server: Target Server instance.
+        name: Tunnel connection name (used to derive remote file paths).
+        conf_content: Content to write to the .conf file.
+        secrets_content: Content for the .secrets file, or None to skip writing it.
+        timeout: Operation timeout in seconds. Defaults to ssh_command_timeout from settings.
+
+    Returns:
+        ServerResult with success=True on success, or success=False with error message.
+    """
+    effective_timeout = timeout if timeout is not None else get_settings().ssh_command_timeout
+    conf_path = _remote_conf_path(name)
+    secrets_path = _remote_secrets_path(name)
+    conf_dir = get_settings().vpn_conf_dir
+    secrets_dir = get_settings().vpn_secrets_dir
+
+    async def _run() -> ServerResult:
+        async with await _connect_ssh(server) as conn:
+            async with await conn.start_sftp_client() as sftp:
+                await sftp.makedirs(conf_dir, exist_ok=True)
+                async with await sftp.open(conf_path, "w") as f:
+                    await f.write(conf_content)
+                await sftp.chmod(conf_path, 0o644)
+
+                if secrets_content is not None:
+                    await sftp.makedirs(secrets_dir, exist_ok=True)
+                    async with await sftp.open(secrets_path, "w") as f:
+                        await f.write(secrets_content)
+                    await sftp.chmod(secrets_path, 0o640)
+
+            result = await conn.run(_LOAD_ALL)
+
+        if result.exit_status != 0:
+            stderr = result.stderr or ""
+            stdout = result.stdout or ""
+            detail = (stderr or stdout).strip() or f"exit {result.exit_status}"
+            logger.warning(
+                "server_sftp_push_swanctl_nonzero",
+                server_id=server.id,
+                name=server.name,
+                tunnel=name,
+                exit_status=result.exit_status,
+            )
+            return ServerResult(
+                server_id=server.id,
+                server_name=server.name,
+                success=False,
+                error=f"swanctl --load-all exited with status {result.exit_status}: {detail}",
+            )
+
+        logger.info("server_sftp_push_success", server_id=server.id, name=server.name, tunnel=name)
+        return ServerResult(server_id=server.id, server_name=server.name, success=True)
+
+    try:
+        return await asyncio.wait_for(_run(), timeout=effective_timeout)
+    except asyncio.TimeoutError:
+        logger.warning("server_sftp_push_timeout", server_id=server.id, name=server.name, tunnel=name)
+        return ServerResult(
+            server_id=server.id,
+            server_name=server.name,
+            success=False,
+            error="Command timed out",
+        )
+    except asyncssh.SFTPError as exc:
+        logger.warning(
+            "server_sftp_push_sftp_error",
+            server_id=server.id,
+            name=server.name,
+            tunnel=name,
+            error=str(exc),
+        )
+        return ServerResult(
+            server_id=server.id,
+            server_name=server.name,
+            success=False,
+            error=f"SFTP error: {exc}",
+        )
+    except asyncssh.Error as exc:
+        logger.warning(
+            "server_sftp_push_ssh_error",
+            server_id=server.id,
+            name=server.name,
+            tunnel=name,
+            error=str(exc),
+        )
+        return ServerResult(
+            server_id=server.id,
+            server_name=server.name,
+            success=False,
+            error=f"SSH error: {exc}",
+        )
+    except OSError as exc:
+        logger.error(
+            "server_sftp_push_os_error",
+            server_id=server.id,
+            name=server.name,
+            tunnel=name,
+            error=str(exc),
+        )
+        return ServerResult(
+            server_id=server.id,
+            server_name=server.name,
+            success=False,
+            error=f"Connection failed: {exc}",
+        )
+
+
+async def sftp_delete_tunnel_config(
+    server: Server,
+    name: str,
+    *,
+    timeout: int | None = None,
+) -> ServerResult:
+    """Open SSH+SFTP to server, remove .conf and .secrets (SFTPNoSuchFile tolerated), run swanctl --load-all.
+
+    Args:
+        server: Target Server instance.
+        name: Tunnel connection name.
+        timeout: Operation timeout in seconds. Defaults to ssh_command_timeout from settings.
+
+    Returns:
+        ServerResult with success=True on success (including file-not-found), or success=False with error.
+    """
+    effective_timeout = timeout if timeout is not None else get_settings().ssh_command_timeout
+    conf_path = _remote_conf_path(name)
+    secrets_path = _remote_secrets_path(name)
+
+    async def _run() -> ServerResult:
+        async with await _connect_ssh(server) as conn:
+            async with await conn.start_sftp_client() as sftp:
+                for path in (conf_path, secrets_path):
+                    try:
+                        await sftp.remove(path)
+                    except asyncssh.SFTPNoSuchFile:
+                        logger.debug(
+                            "server_sftp_delete_file_not_found",
+                            server_id=server.id,
+                            name=server.name,
+                            path=path,
+                        )
+
+            result = await conn.run(_LOAD_ALL)
+
+        if result.exit_status != 0:
+            stderr = result.stderr or ""
+            stdout = result.stdout or ""
+            detail = (stderr or stdout).strip() or f"exit {result.exit_status}"
+            logger.warning(
+                "server_sftp_delete_swanctl_nonzero",
+                server_id=server.id,
+                name=server.name,
+                tunnel=name,
+                exit_status=result.exit_status,
+            )
+            return ServerResult(
+                server_id=server.id,
+                server_name=server.name,
+                success=False,
+                error=f"swanctl --load-all exited with status {result.exit_status}: {detail}",
+            )
+
+        logger.info("server_sftp_delete_success", server_id=server.id, name=server.name, tunnel=name)
+        return ServerResult(server_id=server.id, server_name=server.name, success=True)
+
+    try:
+        return await asyncio.wait_for(_run(), timeout=effective_timeout)
+    except asyncio.TimeoutError:
+        logger.warning("server_sftp_delete_timeout", server_id=server.id, name=server.name, tunnel=name)
+        return ServerResult(
+            server_id=server.id,
+            server_name=server.name,
+            success=False,
+            error="Command timed out",
+        )
+    except asyncssh.SFTPError as exc:
+        logger.warning(
+            "server_sftp_delete_sftp_error",
+            server_id=server.id,
+            name=server.name,
+            tunnel=name,
+            error=str(exc),
+        )
+        return ServerResult(
+            server_id=server.id,
+            server_name=server.name,
+            success=False,
+            error=f"SFTP error: {exc}",
+        )
+    except asyncssh.Error as exc:
+        logger.warning(
+            "server_sftp_delete_ssh_error",
+            server_id=server.id,
+            name=server.name,
+            tunnel=name,
+            error=str(exc),
+        )
+        return ServerResult(
+            server_id=server.id,
+            server_name=server.name,
+            success=False,
+            error=f"SSH error: {exc}",
+        )
+    except OSError as exc:
+        logger.error(
+            "server_sftp_delete_os_error",
+            server_id=server.id,
+            name=server.name,
+            tunnel=name,
+            error=str(exc),
+        )
+        return ServerResult(
+            server_id=server.id,
+            server_name=server.name,
+            success=False,
+            error=f"Connection failed: {exc}",
+        )
+
+
+async def _sftp_rename_on_server(
+    server: Server,
+    old_name: str,
+    new_name: str,
+    conf_content: str,
+    secrets_content: str,
+    *,
+    timeout: int | None = None,
+) -> ServerResult:
+    """Delete old config files and push new ones in a single SSH connection.
+
+    Args:
+        server: Target Server instance.
+        old_name: Previous tunnel name (files to delete).
+        new_name: New tunnel name (files to write).
+        conf_content: Content for the new .conf file.
+        secrets_content: Content for the new .secrets file.
+        timeout: Operation timeout in seconds. Defaults to ssh_command_timeout from settings.
+
+    Returns:
+        ServerResult with success=True on success, or success=False with error.
+    """
+    effective_timeout = timeout if timeout is not None else get_settings().ssh_command_timeout
+    old_conf = _remote_conf_path(old_name)
+    old_secrets = _remote_secrets_path(old_name)
+    new_conf = _remote_conf_path(new_name)
+    new_secrets = _remote_secrets_path(new_name)
+    conf_dir = get_settings().vpn_conf_dir
+    secrets_dir = get_settings().vpn_secrets_dir
+
+    async def _run() -> ServerResult:
+        async with await _connect_ssh(server) as conn:
+            async with await conn.start_sftp_client() as sftp:
+                # Delete old files (idempotent)
+                for path in (old_conf, old_secrets):
+                    try:
+                        await sftp.remove(path)
+                    except asyncssh.SFTPNoSuchFile:
+                        logger.debug(
+                            "server_sftp_rename_old_not_found",
+                            server_id=server.id,
+                            name=server.name,
+                            path=path,
+                        )
+
+                # Write new files
+                await sftp.makedirs(conf_dir, exist_ok=True)
+                async with await sftp.open(new_conf, "w") as f:
+                    await f.write(conf_content)
+                await sftp.chmod(new_conf, 0o644)
+
+                await sftp.makedirs(secrets_dir, exist_ok=True)
+                async with await sftp.open(new_secrets, "w") as f:
+                    await f.write(secrets_content)
+                await sftp.chmod(new_secrets, 0o640)
+
+            result = await conn.run(_LOAD_ALL)
+
+        if result.exit_status != 0:
+            stderr = result.stderr or ""
+            stdout = result.stdout or ""
+            detail = (stderr or stdout).strip() or f"exit {result.exit_status}"
+            logger.warning(
+                "server_sftp_rename_swanctl_nonzero",
+                server_id=server.id,
+                name=server.name,
+                old_tunnel=old_name,
+                new_tunnel=new_name,
+                exit_status=result.exit_status,
+            )
+            return ServerResult(
+                server_id=server.id,
+                server_name=server.name,
+                success=False,
+                error=f"swanctl --load-all exited with status {result.exit_status}: {detail}",
+            )
+
+        logger.info(
+            "server_sftp_rename_success",
+            server_id=server.id,
+            name=server.name,
+            old_tunnel=old_name,
+            new_tunnel=new_name,
+        )
+        return ServerResult(server_id=server.id, server_name=server.name, success=True)
+
+    try:
+        return await asyncio.wait_for(_run(), timeout=effective_timeout)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "server_sftp_rename_timeout",
+            server_id=server.id,
+            name=server.name,
+            old_tunnel=old_name,
+            new_tunnel=new_name,
+        )
+        return ServerResult(
+            server_id=server.id,
+            server_name=server.name,
+            success=False,
+            error="Command timed out",
+        )
+    except asyncssh.SFTPError as exc:
+        logger.warning(
+            "server_sftp_rename_sftp_error",
+            server_id=server.id,
+            name=server.name,
+            old_tunnel=old_name,
+            new_tunnel=new_name,
+            error=str(exc),
+        )
+        return ServerResult(
+            server_id=server.id,
+            server_name=server.name,
+            success=False,
+            error=f"SFTP error: {exc}",
+        )
+    except asyncssh.Error as exc:
+        logger.warning(
+            "server_sftp_rename_ssh_error",
+            server_id=server.id,
+            name=server.name,
+            old_tunnel=old_name,
+            new_tunnel=new_name,
+            error=str(exc),
+        )
+        return ServerResult(
+            server_id=server.id,
+            server_name=server.name,
+            success=False,
+            error=f"SSH error: {exc}",
+        )
+    except OSError as exc:
+        logger.error(
+            "server_sftp_rename_os_error",
+            server_id=server.id,
+            name=server.name,
+            old_tunnel=old_name,
+            new_tunnel=new_name,
+            error=str(exc),
+        )
+        return ServerResult(
+            server_id=server.id,
+            server_name=server.name,
+            success=False,
+            error=f"Connection failed: {exc}",
+        )
+
+
+async def sftp_push_on_all_servers(
+    session: AsyncSession,
+    name: str,
+    conf_content: str,
+    secrets_content: str | None,
+    *,
+    timeout: int | None = None,
+) -> FanOutResult:
+    """Fan-out sftp_push_tunnel_config to all active servers concurrently.
+
+    Args:
+        session: DB session for server discovery.
+        name: Tunnel connection name.
+        conf_content: Content for the .conf file.
+        secrets_content: Content for the .secrets file, or None to push conf only.
+        timeout: Per-server timeout in seconds.
+
+    Returns:
+        FanOutResult with per-server outcomes.
+
+    Raises:
+        InfrastructureError: If no active servers are registered.
+    """
+    stmt = select(Server).where(Server.is_active.is_(True), Server.deleted_at.is_(None))
+    result = await session.execute(stmt)
+    servers = list(result.scalars().all())
+
+    if not servers:
+        raise InfrastructureError(
+            service="SSH",
+            message="No active servers registered — cannot push tunnel config",
+        )
+
+    tasks = [
+        sftp_push_tunnel_config(s, name, conf_content, secrets_content, timeout=timeout)
+        for s in servers
+    ]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+    server_results: list[ServerResult] = []
+    for i, outcome in enumerate(gathered):
+        if isinstance(outcome, Exception):
+            server_results.append(
+                ServerResult(
+                    server_id=servers[i].id,
+                    server_name=servers[i].name,
+                    success=False,
+                    error=f"Unexpected error: {outcome}",
+                )
+            )
+        else:
+            server_results.append(outcome)
+
+    succeeded = sum(1 for r in server_results if r.success)
+    failed = len(server_results) - succeeded
+
+    logger.info(
+        "server_sftp_push_on_all_servers",
+        total=len(servers),
+        succeeded=succeeded,
+        failed=failed,
+    )
+
+    return FanOutResult(
+        total=len(servers),
+        succeeded=succeeded,
+        failed=failed,
+        servers=server_results,
+    )
+
+
+async def sftp_delete_on_all_servers(
+    session: AsyncSession,
+    name: str,
+    *,
+    timeout: int | None = None,
+) -> FanOutResult:
+    """Fan-out sftp_delete_tunnel_config to all active servers concurrently.
+
+    Args:
+        session: DB session for server discovery.
+        name: Tunnel connection name.
+        timeout: Per-server timeout in seconds.
+
+    Returns:
+        FanOutResult with per-server outcomes.
+
+    Raises:
+        InfrastructureError: If no active servers are registered.
+    """
+    stmt = select(Server).where(Server.is_active.is_(True), Server.deleted_at.is_(None))
+    result = await session.execute(stmt)
+    servers = list(result.scalars().all())
+
+    if not servers:
+        raise InfrastructureError(
+            service="SSH",
+            message="No active servers registered — cannot delete tunnel config",
+        )
+
+    tasks = [sftp_delete_tunnel_config(s, name, timeout=timeout) for s in servers]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+    server_results: list[ServerResult] = []
+    for i, outcome in enumerate(gathered):
+        if isinstance(outcome, Exception):
+            server_results.append(
+                ServerResult(
+                    server_id=servers[i].id,
+                    server_name=servers[i].name,
+                    success=False,
+                    error=f"Unexpected error: {outcome}",
+                )
+            )
+        else:
+            server_results.append(outcome)
+
+    succeeded = sum(1 for r in server_results if r.success)
+    failed = len(server_results) - succeeded
+
+    logger.info(
+        "server_sftp_delete_on_all_servers",
+        total=len(servers),
+        succeeded=succeeded,
+        failed=failed,
+    )
+
+    return FanOutResult(
+        total=len(servers),
+        succeeded=succeeded,
+        failed=failed,
+        servers=server_results,
+    )
+
+
+async def sftp_rename_on_all_servers(
+    session: AsyncSession,
+    old_name: str,
+    new_name: str,
+    conf_content: str,
+    secrets_content: str,
+    *,
+    timeout: int | None = None,
+) -> FanOutResult:
+    """Fan-out delete-old + push-new in a single SSH connection per server.
+
+    Args:
+        session: DB session for server discovery.
+        old_name: Previous tunnel name (files to remove).
+        new_name: New tunnel name (files to write).
+        conf_content: Content for the new .conf file.
+        secrets_content: Content for the new .secrets file.
+        timeout: Per-server timeout in seconds.
+
+    Returns:
+        FanOutResult with per-server outcomes.
+
+    Raises:
+        InfrastructureError: If no active servers are registered.
+    """
+    stmt = select(Server).where(Server.is_active.is_(True), Server.deleted_at.is_(None))
+    result = await session.execute(stmt)
+    servers = list(result.scalars().all())
+
+    if not servers:
+        raise InfrastructureError(
+            service="SSH",
+            message="No active servers registered — cannot rename tunnel config",
+        )
+
+    tasks = [
+        _sftp_rename_on_server(s, old_name, new_name, conf_content, secrets_content, timeout=timeout)
+        for s in servers
+    ]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+    server_results: list[ServerResult] = []
+    for i, outcome in enumerate(gathered):
+        if isinstance(outcome, Exception):
+            server_results.append(
+                ServerResult(
+                    server_id=servers[i].id,
+                    server_name=servers[i].name,
+                    success=False,
+                    error=f"Unexpected error: {outcome}",
+                )
+            )
+        else:
+            server_results.append(outcome)
+
+    succeeded = sum(1 for r in server_results if r.success)
+    failed = len(server_results) - succeeded
+
+    logger.info(
+        "server_sftp_rename_on_all_servers",
         total=len(servers),
         succeeded=succeeded,
         failed=failed,

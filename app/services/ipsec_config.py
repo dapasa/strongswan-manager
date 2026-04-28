@@ -16,13 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Tunnel
 from app.logging_config import get_logger
 from app.services import s3
-from app.services.server_service import execute_on_all_servers
+from app.services.server_service import (
+    sftp_delete_on_all_servers,
+    sftp_push_on_all_servers,
+    sftp_rename_on_all_servers,
+)
 from app.utils.fan_out import FanOutResult
 
 logger = get_logger(__name__)
-
-_SYNC_SCRIPT = "sudo /opt/strongswan/scripts/sync_config.sh"
-_LOAD_ALL = "sudo /usr/sbin/swanctl --load-all"
 
 
 def render_connection_conf(tunnel: Tunnel) -> str:
@@ -134,7 +135,7 @@ async def sync_tunnel_config(tunnel: Tunnel, psk: str, session: AsyncSession) ->
     await s3.upload_file(_conf_key(tunnel.name), conf_content)
     await s3.upload_file(_secrets_key(tunnel.name), secrets_content)
 
-    result = await execute_on_all_servers(session, [_SYNC_SCRIPT, _LOAD_ALL])
+    result = await sftp_push_on_all_servers(session, tunnel.name, conf_content, secrets_content)
 
     logger.info("ipsec_sync_complete", tunnel=tunnel.name)
     return result
@@ -161,7 +162,7 @@ async def remove_tunnel_config(name: str, session: AsyncSession) -> FanOutResult
     await s3.delete_file(_conf_key(name))
     await s3.delete_file(_secrets_key(name))
 
-    result = await execute_on_all_servers(session, [_SYNC_SCRIPT, _LOAD_ALL])
+    result = await sftp_delete_on_all_servers(session, name)
 
     logger.info("ipsec_remove_complete", tunnel=name)
     return result
@@ -197,7 +198,7 @@ async def rename_tunnel_config(
     await s3.upload_file(_conf_key(tunnel.name), conf_content)
     await s3.upload_file(_secrets_key(tunnel.name), secrets_content)
 
-    result = await execute_on_all_servers(session, [_SYNC_SCRIPT, _LOAD_ALL])
+    result = await sftp_rename_on_all_servers(session, old_name, tunnel.name, conf_content, secrets_content)
 
     logger.info("ipsec_rename_complete", old_name=old_name, new_name=tunnel.name)
     return result

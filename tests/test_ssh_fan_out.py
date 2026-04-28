@@ -480,7 +480,7 @@ class TestDeleteTunnelBlocking:
 class TestRetryTunnelSync:
     """Tests for retry_tunnel_sync() status guard."""
 
-    @patch("app.services.tunnel_service.execute_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.s3.upload_file", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.audit.log_action", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
@@ -513,7 +513,7 @@ class TestRetryTunnelSync:
         result = await retry_tunnel_sync(session, 1, user=user)
         assert result.sync_status == "synced"
 
-    @patch("app.services.tunnel_service.execute_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.s3.upload_file", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.audit.log_action", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)

@@ -17,7 +17,7 @@ from app.services import audit, ipsec_config
 from app.services import ssm  # SSM retained for iptables cascade — migrate with iptables-ssh-migration
 from app.services.iptables_service import build_iptables_command
 from app.services.locks import LOCK_IPSEC_CONFIG, require_lock
-from app.services.server_service import execute_on_all_servers
+from app.services.server_service import execute_on_all_servers, sftp_push_on_all_servers
 from app.utils.fan_out import FanOutResult
 
 logger = get_logger(__name__)
@@ -335,8 +335,8 @@ async def update_tunnel(
                 from app.services import s3
                 conf_content = ipsec_config.render_connection_conf(tunnel)
                 await s3.upload_file(f"connections/{tunnel.name}.conf", conf_content)
-                fan_out_result = await execute_on_all_servers(
-                    session, ["sudo /opt/strongswan/scripts/sync_config.sh", "sudo /usr/sbin/swanctl --load-all"]
+                fan_out_result = await sftp_push_on_all_servers(
+                    session, tunnel.name, conf_content, secrets_content=None
                 )
                 _apply_fan_out_result(tunnel, fan_out_result)
 
@@ -447,7 +447,7 @@ async def delete_tunnel(
     3. Clean up iptables rules via SSM (extracted helper).
     4. Soft-delete active routes.
     5. Remove .conf and .secrets from S3.
-    6. SSH fan-out: run sync_config.sh on all servers.
+    6. SFTP fan-out: push config files and run swanctl --load-all on all servers.
     7. If any server fails: raise InfrastructureError — do NOT soft-delete.
     8. Soft-delete tunnel, create audit log, commit.
 
@@ -539,7 +539,7 @@ async def retry_tunnel_sync(
     """Retry a failed or partial tunnel sync operation.
 
     Accepts sync_status of 'failed' or 'partial'. Re-uploads the .conf from
-    current DB state and runs SSH fan-out sync_config.sh on all servers.
+    current DB state and pushes it via SFTP fan-out to all servers.
 
     Args:
         session: Active database session.
@@ -568,12 +568,12 @@ async def retry_tunnel_sync(
 
     tunnel.sync_status = "pending"
     try:
-        # Re-upload .conf from current DB state; .secrets already exists in S3
+        # Re-upload .conf from current DB state; .secrets already exists in S3 and on servers
         from app.services import s3
         conf_content = ipsec_config.render_connection_conf(tunnel)
         await s3.upload_file(f"connections/{tunnel.name}.conf", conf_content)
-        fan_out_result = await execute_on_all_servers(
-            session, ["sudo /opt/strongswan/scripts/sync_config.sh", "sudo /usr/sbin/swanctl --load-all"]
+        fan_out_result = await sftp_push_on_all_servers(
+            session, tunnel.name, conf_content, secrets_content=None
         )
         _apply_fan_out_result(tunnel, fan_out_result)
         logger.info(
