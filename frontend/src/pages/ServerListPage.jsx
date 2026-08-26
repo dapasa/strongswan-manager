@@ -101,7 +101,7 @@ export default function ServerListPage() {
         <div>
           <h1 className="text-2xl font-bold">Servers</h1>
           <p className="text-sm text-muted-foreground">
-            Manage SSH server connections.
+            Manage server connections (SSH and SSM).
           </p>
         </div>
         <RoleGuard requiredRole="admin">
@@ -154,7 +154,7 @@ export default function ServerListPage() {
         <EmptyState
           icon={Server}
           title="No servers configured yet"
-          description="Add your first SSH server to get started."
+          description="Add your first server to get started."
           action={
             <RoleGuard requiredRole="admin">
               <Button asChild variant="outline">
@@ -173,9 +173,8 @@ export default function ServerListPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>Name</TableHead>
-                <TableHead>Hostname</TableHead>
-                <TableHead>Port</TableHead>
-                <TableHead>User</TableHead>
+                <TableHead>Type</TableHead>
+                <TableHead>Connection</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Active</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
@@ -193,9 +192,23 @@ export default function ServerListPage() {
                   }}
                 >
                   <TableCell className="font-medium">{server.name}</TableCell>
-                  <TableCell className="font-mono text-sm">{server.hostname}</TableCell>
-                  <TableCell className="text-sm">{server.ssh_port}</TableCell>
-                  <TableCell className="text-sm">{server.ssh_user}</TableCell>
+                  <TableCell>
+                    <Badge
+                      variant="outline"
+                      className={
+                        server.connection_type === 'ssm'
+                          ? 'border-blue-500/50 text-blue-500'
+                          : 'border-violet-500/50 text-violet-500'
+                      }
+                    >
+                      {server.connection_type?.toUpperCase() ?? 'SSH'}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="font-mono text-sm text-muted-foreground">
+                    {server.connection_type === 'ssm'
+                      ? server.ec2_instance_id ?? '—'
+                      : server.hostname ?? '—'}
+                  </TableCell>
                   <TableCell>
                     <StatusBadge status={server.last_check_status} />
                   </TableCell>
