@@ -1,8 +1,15 @@
-"""SSM service — execute commands on VPN instances via AWS Systems Manager."""
+"""SSM service — execute commands on VPN instances via AWS Systems Manager.
+
+Global helpers (execute_command, resolve_instance_id, run_on_instances) operate
+on the two fixed VPN instances defined in settings.  Per-server SSM execution
+is handled by app.services.transport.ssm_transport.SsmTransport, which uses
+per-server role assumption via app.services.aws_client.get_client_for_server.
+"""
 
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 from botocore.exceptions import ClientError
 
@@ -10,6 +17,9 @@ from app.config import get_settings
 from app.exceptions import InfrastructureError
 from app.logging_config import get_logger
 from app.services.aws_session import get_client
+
+if TYPE_CHECKING:
+    from app.db.models import Server
 
 logger = get_logger(__name__)
 
@@ -239,12 +249,17 @@ async def reload_ipsec() -> None:
 async def run_on_instances(
     commands: list[str],
     target: str,
+    server: Server | None = None,
 ) -> None:
     """Run shell commands on one or both VPN instances.
 
     Args:
         commands: Shell commands to execute.
-        target: ``'primary'``, ``'secondary'``, or ``'both'``.
+        target:   ``'primary'``, ``'secondary'``, or ``'both'``.
+        server:   Reserved for future migration — when provided, callers intend
+                  per-server execution via the transport abstraction. Currently
+                  ignored; per-server SSM is handled by SsmTransport directly.
+                  Pass None (default) to use the global settings-based clients.
 
     Raises:
         InfrastructureError: On command or resolution failure.

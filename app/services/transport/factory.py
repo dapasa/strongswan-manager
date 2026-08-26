@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from .base import NodeTransport
 from .ssh_transport import SshTransport
+from .ssm_transport import SsmTransport
 
 if TYPE_CHECKING:
     from app.db.models import Server
@@ -21,14 +22,11 @@ def get_transport(server: Server) -> NodeTransport:
         A NodeTransport implementation ready to use.
 
     Raises:
-        NotImplementedError: If connection_type is "ssm" (Phase 3, not yet implemented).
-        TransportError:      If the server's SSH fields are missing (raised by SshTransport).
+        TransportError: If required transport fields are missing.
+        ValueError:     If connection_type is not a recognised value.
     """
     if server.connection_type == "ssm":
-        raise NotImplementedError(
-            f"SSM transport is not yet implemented (Phase 3) — "
-            f"server {server.name!r} uses connection_type='ssm'"
-        )
+        return SsmTransport(server)
 
     # Default / "ssh"
     return SshTransport(server)
