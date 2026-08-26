@@ -50,6 +50,7 @@ async def _get_client(user: MagicMock | None = None) -> httpx.AsyncClient:
 def _make_mock_server(
     id: int = 1,
     name: str = "vpn-primary",
+    connection_type: str = "ssh",
     hostname: str = "10.0.1.50",
     ssh_port: int = 22,
     ssh_user: str = "admin",
@@ -57,12 +58,16 @@ def _make_mock_server(
     is_active: bool = True,
     last_check_at: datetime | None = None,
     last_check_status: str | None = None,
+    ec2_instance_id: str | None = None,
+    aws_role_arn: str | None = None,
+    aws_region_override: str | None = None,
 ) -> MagicMock:
     """Create a mock Server model instance."""
     now = datetime.now(timezone.utc)
     server = MagicMock()
     server.id = id
     server.name = name
+    server.connection_type = connection_type
     server.hostname = hostname
     server.ssh_port = ssh_port
     server.ssh_user = ssh_user
@@ -71,6 +76,9 @@ def _make_mock_server(
     server.last_check_at = last_check_at
     server.last_check_status = last_check_status
     server.ssh_private_key_encrypted = "ENCRYPTED_KEY_DATA"
+    server.ec2_instance_id = ec2_instance_id
+    server.aws_role_arn = aws_role_arn
+    server.aws_region_override = aws_region_override
     server.created_at = now
     server.updated_at = now
     server.deleted_at = None
@@ -739,3 +747,165 @@ class TestServerServiceSSH:
         assert result["message"] == "Connection test failed unexpectedly"
         # Internal error details should NOT be in the message
         assert "sensitive info" not in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# Conditional transport validation — ServerCreate schema (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+class TestServerCreateTransportValidation:
+    """Schema-level validation for dual-transport ServerCreate."""
+
+    def test_ssh_without_private_key_fails(self):
+        """SSH server missing ssh_private_key must raise ValidationError."""
+        from pydantic import ValidationError
+
+        from app.schemas.server import ServerCreate
+
+        with pytest.raises(ValidationError) as exc_info:
+            ServerCreate(
+                name="vpn-test",
+                connection_type="ssh",
+                hostname="10.0.0.1",
+                # ssh_private_key intentionally omitted
+            )
+        errors = exc_info.value.errors()
+        assert any("SSH server requires" in str(e["msg"]) for e in errors)
+
+    def test_ssh_without_hostname_fails(self):
+        """SSH server missing hostname must raise ValidationError."""
+        from pydantic import ValidationError
+
+        from app.schemas.server import ServerCreate
+
+        with pytest.raises(ValidationError) as exc_info:
+            ServerCreate(
+                name="vpn-test",
+                connection_type="ssh",
+                ssh_private_key="-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+                # hostname intentionally omitted
+            )
+        errors = exc_info.value.errors()
+        assert any("SSH server requires" in str(e["msg"]) for e in errors)
+
+    def test_ssm_without_instance_id_fails(self):
+        """SSM server missing ec2_instance_id must raise ValidationError."""
+        from pydantic import ValidationError
+
+        from app.schemas.server import ServerCreate
+
+        with pytest.raises(ValidationError) as exc_info:
+            ServerCreate(
+                name="vpn-test",
+                connection_type="ssm",
+                # ec2_instance_id intentionally omitted
+            )
+        errors = exc_info.value.errors()
+        assert any("ec2_instance_id" in str(e["msg"]) for e in errors)
+
+    def test_ssm_with_bad_instance_id_format_fails(self):
+        """SSM server with malformed ec2_instance_id must raise ValidationError."""
+        from pydantic import ValidationError
+
+        from app.schemas.server import ServerCreate
+
+        with pytest.raises(ValidationError) as exc_info:
+            ServerCreate(
+                name="vpn-test",
+                connection_type="ssm",
+                ec2_instance_id="i-TOOSHORT",
+            )
+        errors = exc_info.value.errors()
+        assert any("17 hex" in str(e["msg"]) for e in errors)
+
+    def test_ssh_valid_passes(self):
+        """SSH server with all required fields passes validation."""
+        from app.schemas.server import ServerCreate
+
+        server = ServerCreate(
+            name="vpn-ssh",
+            connection_type="ssh",
+            hostname="10.0.0.1",
+            ssh_private_key="-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+        )
+        assert server.connection_type == "ssh"
+        assert server.hostname == "10.0.0.1"
+
+    def test_ssm_valid_passes(self):
+        """SSM server with correct instance id passes validation."""
+        from app.schemas.server import ServerCreate
+
+        server = ServerCreate(
+            name="vpn-ssm",
+            connection_type="ssm",
+            ec2_instance_id="i-0e8545d009894bb9d",
+        )
+        assert server.connection_type == "ssm"
+        assert server.ec2_instance_id == "i-0e8545d009894bb9d"
+
+    def test_default_connection_type_is_ssh(self):
+        """Omitting connection_type defaults to 'ssh'."""
+        from app.schemas.server import ServerCreate
+
+        server = ServerCreate(
+            name="vpn-default",
+            hostname="10.0.0.1",
+            ssh_private_key="-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+        )
+        assert server.connection_type == "ssh"
+
+    def test_ssh_key_not_in_summary_or_detail(self):
+        """ServerSummary and ServerDetail never contain ssh_private_key."""
+        from app.schemas.server import ServerDetail, ServerSummary
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        mock = _make_mock_server()
+        summary = ServerSummary.model_validate(mock)
+        detail = ServerDetail.model_validate(mock)
+
+        summary_dict = summary.model_dump()
+        detail_dict = detail.model_dump()
+        assert "ssh_private_key" not in summary_dict
+        assert "ssh_private_key_encrypted" not in summary_dict
+        assert "ssh_private_key" not in detail_dict
+        assert "ssh_private_key_encrypted" not in detail_dict
+
+    def test_ssm_fields_exposed_in_read_schema(self):
+        """ServerSummary includes SSM fields when connection_type is ssm."""
+        from app.schemas.server import ServerSummary
+
+        mock = _make_mock_server(
+            connection_type="ssm",
+            hostname=None,
+            ssh_port=None,
+            ssh_user=None,
+            ec2_instance_id="i-0e8545d009894bb9d",
+            aws_role_arn="arn:aws:iam::123456789012:role/VPNRole",
+            aws_region_override="us-east-1",
+        )
+        summary = ServerSummary.model_validate(mock)
+        assert summary.connection_type == "ssm"
+        assert summary.ec2_instance_id == "i-0e8545d009894bb9d"
+        assert summary.aws_role_arn == "arn:aws:iam::123456789012:role/VPNRole"
+        assert summary.aws_region_override == "us-east-1"
+        assert summary.hostname is None
+
+    def test_server_update_ec2_bad_format_fails(self):
+        """ServerUpdate with malformed ec2_instance_id must raise ValidationError."""
+        from pydantic import ValidationError
+
+        from app.schemas.server import ServerUpdate
+
+        with pytest.raises(ValidationError) as exc_info:
+            ServerUpdate(ec2_instance_id="i-bad-format")
+        errors = exc_info.value.errors()
+        assert any("17 hex" in str(e["msg"]) for e in errors)
+
+    def test_server_update_connection_type_editable(self):
+        """ServerUpdate allows changing connection_type."""
+        from app.schemas.server import ServerUpdate
+
+        update = ServerUpdate(connection_type="ssm", ec2_instance_id=None)
+        assert update.connection_type == "ssm"

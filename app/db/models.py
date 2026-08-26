@@ -195,16 +195,24 @@ class IPTablesRule(TimestampMixin, SoftDeleteMixin, Base):
 
 
 class Server(TimestampMixin, SoftDeleteMixin, Base):
-    """VPN server with encrypted SSH key storage for connectivity testing."""
+    """VPN server supporting SSH or SSM transport for connectivity and config push."""
 
     __tablename__ = "servers"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(Text, nullable=False)
-    hostname: Mapped[str] = mapped_column(Text, nullable=False)
-    ssh_port: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("22"))
-    ssh_user: Mapped[str] = mapped_column(Text, nullable=False, server_default="admin")
-    ssh_private_key_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    # Transport selector — editable after creation
+    connection_type: Mapped[str] = mapped_column(Text, nullable=False, server_default="ssh")
+    # SSH transport fields (nullable for SSM servers)
+    hostname: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ssh_port: Mapped[int | None] = mapped_column(Integer, nullable=True, server_default=text("22"))
+    ssh_user: Mapped[str | None] = mapped_column(Text, nullable=True, server_default="admin")
+    ssh_private_key_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # SSM transport fields
+    ec2_instance_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    aws_role_arn: Mapped[str | None] = mapped_column(Text, nullable=True)       # NULL → use global
+    aws_region_override: Mapped[str | None] = mapped_column(Text, nullable=True)  # NULL → use global
+    # Common fields
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -216,7 +224,24 @@ class Server(TimestampMixin, SoftDeleteMixin, Base):
             "last_check_status IN ('reachable', 'unreachable')",
             name="ck_servers_check_status",
         ),
-        CheckConstraint("ssh_port BETWEEN 1 AND 65535", name="ck_servers_ssh_port"),
+        CheckConstraint(
+            "ssh_port IS NULL OR ssh_port BETWEEN 1 AND 65535",
+            name="ck_servers_ssh_port",
+        ),
+        CheckConstraint(
+            "connection_type IN ('ssh', 'ssm')",
+            name="ck_servers_connection_type",
+        ),
+        CheckConstraint(
+            "ec2_instance_id IS NULL OR ec2_instance_id ~ '^i-[0-9a-f]{17}$'",
+            name="ck_servers_ec2_instance_id_fmt",
+        ),
+        CheckConstraint(
+            "(connection_type = 'ssh' AND ssh_private_key_encrypted IS NOT NULL"
+            " AND ssh_user IS NOT NULL AND hostname IS NOT NULL)"
+            " OR (connection_type = 'ssm' AND ec2_instance_id IS NOT NULL)",
+            name="ck_servers_transport_fields",
+        ),
         Index(
             "idx_servers_name_active",
             "name",
