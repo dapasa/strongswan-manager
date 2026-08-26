@@ -785,7 +785,7 @@ def _parse_tunnel_state(tunnel_name: str, ipsec_output: str) -> str:
             if "established" in line or "installed" in line:
                 return "UP"
 
-    return "DOWN" if found_connection else "UNKNOWN"
+    return "DOWN"
 
 
 def _aggregate_tunnel_states(states: list[str]) -> str:

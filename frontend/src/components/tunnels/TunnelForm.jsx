@@ -23,34 +23,104 @@ const DPD_ACTIONS = ['none', 'clear', 'restart']
 const ipv4Regex = /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$/
 const cidrRegex = /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\/(?:3[0-2]|[12]?\d)$/
 
+/**
+ * Validates that a CIDR string is a valid IPv4 network with no host bits set.
+ * Python's IPv4Network(strict=True) rejects CIDRs like 10.0.0.1/24 because
+ * the host bits are non-zero. This mirrors that behaviour on the client so
+ * errors are caught before the request is ever sent.
+ */
+function isStrictIpv4Network(cidr) {
+  if (!cidrRegex.test(cidr)) return false
+  const [ip, prefixStr] = cidr.split('/')
+  const prefix = parseInt(prefixStr, 10)
+  const octets = ip.split('.').map(Number)
+  const ipInt =
+    (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
+  // For prefix /p, the host mask is (2^(32-p) - 1). Host bits must all be 0.
+  const hostBits = 32 - prefix
+  const hostMask = hostBits === 32 ? 0xffffffff : (1 << hostBits) - 1
+  return (ipInt & hostMask) === 0
+}
+
 const cidrEntry = z.object({
-  value: z.string().regex(cidrRegex, 'Must be a valid CIDR (e.g. 10.0.0.0/24)'),
+  value: z
+    .string()
+    .regex(cidrRegex, 'Must be a valid CIDR (e.g. 10.0.0.0/24)')
+    .refine(isStrictIpv4Network, 'Host bits must be zero (e.g. use 10.0.0.0/24, not 10.0.0.1/24)'),
 })
 
+// Peer IP must be a plain IPv4 address — no CIDR prefix, no leading zeros trick.
+// 0.0.0.0 and loopback (127.x.x.x) are accepted by the backend (IPv4Address type)
+// so we intentionally do NOT block them here.
+function isNotCidr(value) {
+  return !value.includes('/')
+}
+
 function buildSchema(mode) {
-  return z.object({
+  const baseSchema = z.object({
     name: z.string().min(1, 'Name is required').max(255, 'Name must be 255 characters or less'),
     description: z.string().optional().default(''),
-    peer_ip: z.string().regex(ipv4Regex, 'Must be a valid IPv4 address'),
-    local_cidrs: z.array(cidrEntry).min(1, 'At least one local CIDR is required'),
-    remote_cidrs: z.array(cidrEntry).min(1, 'At least one remote CIDR is required'),
+    peer_ip: z
+      .string()
+      .min(1, 'Peer IP is required')
+      .refine(isNotCidr, 'Enter an IP address, not a CIDR (remove the /prefix)')
+      .regex(ipv4Regex, 'Must be a valid IPv4 address'),
+    local_cidrs: z
+      .array(cidrEntry)
+      .min(1, 'At least one local CIDR is required')
+      .max(64, 'Cannot exceed 64 local CIDRs'),
+    remote_cidrs: z
+      .array(cidrEntry)
+      .min(1, 'At least one remote CIDR is required')
+      .max(64, 'Cannot exceed 64 remote CIDRs'),
     ike_version: z.enum(['1', '2']),
-    psk: mode === 'create'
-      ? z.string().min(1, 'Pre-shared key is required')
-      : z.string().optional().default(''),
+    // Create: required, min 1 char (matches backend min_length=1).
+    // Edit: optional — empty string means "keep existing key". If the user
+    // types something it must be at least 1 char (backend TunnelUpdate.psk
+    // has min_length=1). We apply a 2048-char cap as a sanity guard.
+    psk:
+      mode === 'create'
+        ? z
+            .string()
+            .min(1, 'Pre-shared key is required')
+            .max(2048, 'Pre-shared key must be 2048 characters or less')
+        : z
+            .string()
+            .max(2048, 'Pre-shared key must be 2048 characters or less')
+            .refine(
+              (v) => v === '' || v.length >= 1,
+              'If changing the key, it must not be empty',
+            )
+            .optional()
+            .default(''),
     ike_proposals: z.string().optional().default(''),
     esp_proposals: z.string().optional().default(''),
     dpd_action: z.enum(['none', 'clear', 'restart']).optional().default('restart'),
     dpd_delay: z
       .string()
       .transform((v) => (v === '' ? null : Number(v)))
-      .pipe(z.number().int().min(1, 'Must be at least 1 second').nullable())
+      .pipe(z.number().int().min(1, 'Must be at least 1 second').max(3600, 'Must be 3600 seconds or less').nullable())
       .optional(),
     dpd_timeout: z
       .string()
       .transform((v) => (v === '' ? null : Number(v)))
-      .pipe(z.number().int().min(1, 'Must be at least 1 second').nullable())
+      .pipe(z.number().int().min(1, 'Must be at least 1 second').max(86400, 'Must be 86400 seconds or less').nullable())
       .optional(),
+  })
+
+  // Cross-field: dpd_timeout must be strictly greater than dpd_delay when
+  // both are non-null integers. StrongSwan will misbehave if the timeout fires
+  // at the same moment as (or before) the keepalive delay.
+  return baseSchema.superRefine((data, ctx) => {
+    const delay = data.dpd_delay
+    const timeout = data.dpd_timeout
+    if (delay != null && timeout != null && timeout <= delay) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `DPD Timeout (${timeout}s) must be greater than DPD Delay (${delay}s)`,
+        path: ['dpd_timeout'],
+      })
+    }
   })
 }
 
@@ -119,12 +189,17 @@ export default function TunnelForm({ mode = 'create', tunnel }) {
       payload.psk = values.psk
     }
 
-    if (isEdit) {
-      await mutation.mutateAsync({ id: tunnel.id, data: payload })
-      navigate(`/tunnels/${tunnel.id}`)
-    } else {
-      const created = await mutation.mutateAsync(payload)
-      navigate(`/tunnels/${created.id}`)
+    try {
+      if (isEdit) {
+        await mutation.mutateAsync({ id: tunnel.id, data: payload })
+        navigate(`/tunnels/${tunnel.id}`)
+      } else {
+        const created = await mutation.mutateAsync(payload)
+        navigate(`/tunnels/${created.id}`)
+      }
+    } catch {
+      // mutation.onError already shows a toast; stay on the form so the
+      // user can correct their input without losing what they typed.
     }
   }
 

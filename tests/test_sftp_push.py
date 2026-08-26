@@ -1,16 +1,18 @@
-"""Tests for SFTP-based tunnel config push/delete/rename functions.
+"""Tests for SSH-based tunnel config push/delete/rename functions.
 
 Covers:
-    sftp_push_tunnel_config — success, secrets=None, SFTPError, swanctl non-zero
-    sftp_delete_tunnel_config — success, SFTPNoSuchFile is idempotent
+    sftp_push_tunnel_config — success, secrets=None, SSH command failure, swanctl non-zero
+    sftp_delete_tunnel_config — success, file-not-found is idempotent (rm -f)
     sftp_push_on_all_servers — all succeed, partial failure
     sftp_delete_on_all_servers — all succeed
     sftp_rename_on_all_servers — success (delete old + push new)
+
+All file writes use sudo tee via conn.run() — no SFTP client is used.
 """
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -43,52 +45,30 @@ def _make_run_result(exit_status: int = 0, stdout: str = "", stderr: str = "") -
     return r
 
 
-def _build_sftp_conn_mocks(
-    run_result: MagicMock | None = None,
-    sftp_open_side_effect=None,
-    sftp_remove_side_effect=None,
-):
-    """Build nested async context manager mocks for SSH + SFTP.
+def _build_conn_mock(run_side_effect=None, run_return_value=None):
+    """Build SSH connection context manager mock.
+
+    All file operations and swanctl go through conn.run().
+
+    Args:
+        run_side_effect: If provided, used as side_effect for conn.run (list of results or exception).
+        run_return_value: If provided (and no side_effect), returned for every conn.run call.
 
     Returns:
-        (mock_connect_cm, mock_conn, mock_sftp)
+        (mock_conn_cm, mock_conn)
     """
-    if run_result is None:
-        run_result = _make_run_result()
-
-    # Mock file handle returned by sftp.open(...)
-    mock_file = MagicMock()
-    mock_file.write = AsyncMock()
-    mock_file_cm = MagicMock()
-    mock_file_cm.__aenter__ = AsyncMock(return_value=mock_file)
-    mock_file_cm.__aexit__ = AsyncMock(return_value=False)
-
-    # Mock SFTP client
-    mock_sftp = MagicMock()
-    mock_sftp.makedirs = AsyncMock()
-    mock_sftp.chmod = AsyncMock()
-    mock_sftp.remove = AsyncMock()
-    if sftp_open_side_effect is not None:
-        mock_sftp.open = AsyncMock(side_effect=sftp_open_side_effect)
-    else:
-        mock_sftp.open = AsyncMock(return_value=mock_file_cm)
-    if sftp_remove_side_effect is not None:
-        mock_sftp.remove = AsyncMock(side_effect=sftp_remove_side_effect)
-
-    mock_sftp_cm = MagicMock()
-    mock_sftp_cm.__aenter__ = AsyncMock(return_value=mock_sftp)
-    mock_sftp_cm.__aexit__ = AsyncMock(return_value=False)
-
-    # Mock SSH connection
     mock_conn = MagicMock()
-    mock_conn.run = AsyncMock(return_value=run_result)
-    mock_conn.start_sftp_client = AsyncMock(return_value=mock_sftp_cm)
+    if run_side_effect is not None:
+        mock_conn.run = AsyncMock(side_effect=run_side_effect)
+    else:
+        result = run_return_value if run_return_value is not None else _make_run_result()
+        mock_conn.run = AsyncMock(return_value=result)
 
     mock_conn_cm = MagicMock()
     mock_conn_cm.__aenter__ = AsyncMock(return_value=mock_conn)
     mock_conn_cm.__aexit__ = AsyncMock(return_value=False)
 
-    return mock_conn_cm, mock_conn, mock_sftp
+    return mock_conn_cm, mock_conn
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +85,7 @@ class TestSftpPushTunnelConfig:
     async def test_success_writes_conf_and_secrets(
         self, mock_settings, mock_decrypt, mock_import_key
     ):
-        """Success path: makedirs, open+write for conf, open+write for secrets, chmod, swanctl."""
+        """Success path: mkdir, tee, chmod for conf + secrets, then swanctl."""
         from app.services.server_service import sftp_push_tunnel_config
 
         mock_settings.return_value = MagicMock(
@@ -117,7 +97,11 @@ class TestSftpPushTunnelConfig:
         mock_import_key.return_value = MagicMock()
 
         server = _make_server()
-        mock_conn_cm, mock_conn, mock_sftp = _build_sftp_conn_mocks()
+        # With secrets: mkdir conf, tee conf, chmod conf, mkdir secrets, tee secrets, chmod secrets, swanctl
+        ok = _make_run_result()
+        mock_conn_cm, mock_conn = _build_conn_mock(
+            run_side_effect=[ok, ok, ok, ok, ok, ok, ok]
+        )
 
         with patch("app.services.server_service.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_push_tunnel_config(
@@ -130,27 +114,23 @@ class TestSftpPushTunnelConfig:
         assert result.success is True
         assert result.server_id == 1
         assert result.server_name == "vpn-1"
+        assert mock_conn.run.call_count == 7
 
-        # makedirs called for both conf and secrets dirs
-        assert mock_sftp.makedirs.call_count == 2
-        mock_sftp.makedirs.assert_any_call(
-            "/opt/strongswan/config/connections", exist_ok=True
-        )
-        mock_sftp.makedirs.assert_any_call(
-            "/opt/strongswan/config/secrets", exist_ok=True
-        )
+        # Verify the exact commands sent (order matters)
+        calls = [c.args[0] for c in mock_conn.run.call_args_list]
+        assert calls[0] == "sudo mkdir -p /opt/strongswan/config/connections"
+        assert calls[1] == "sudo tee /opt/strongswan/config/connections/my-tunnel.conf"
+        assert calls[2] == "sudo chmod 644 /opt/strongswan/config/connections/my-tunnel.conf"
+        assert calls[3] == "sudo mkdir -p /opt/strongswan/config/secrets"
+        assert calls[4] == "sudo tee /opt/strongswan/config/secrets/my-tunnel.secrets"
+        assert calls[5] == "sudo chmod 640 /opt/strongswan/config/secrets/my-tunnel.secrets"
+        assert calls[6] == "sudo /usr/sbin/swanctl --load-all"
 
-        # chmod called for both files
-        assert mock_sftp.chmod.call_count == 2
-        mock_sftp.chmod.assert_any_call(
-            "/opt/strongswan/config/connections/my-tunnel.conf", 0o644
-        )
-        mock_sftp.chmod.assert_any_call(
-            "/opt/strongswan/config/secrets/my-tunnel.secrets", 0o640
-        )
-
-        # swanctl --load-all was called
-        mock_conn.run.assert_called_once_with("sudo /usr/sbin/swanctl --load-all")
+        # Verify file content was piped via input=
+        tee_conf_call = mock_conn.run.call_args_list[1]
+        assert tee_conf_call.kwargs.get("input") == "conn my-tunnel\n"
+        tee_secrets_call = mock_conn.run.call_args_list[4]
+        assert tee_secrets_call.kwargs.get("input") == "10.0.0.1 : PSK secret\n"
 
     @patch("app.services.server_service.asyncssh.import_private_key")
     @patch("app.services.server_service.decrypt_ssh_key")
@@ -158,7 +138,7 @@ class TestSftpPushTunnelConfig:
     async def test_secrets_none_skips_secrets_write(
         self, mock_settings, mock_decrypt, mock_import_key
     ):
-        """secrets_content=None: only conf is written, secrets dir and chmod skipped."""
+        """secrets_content=None: only conf is written (mkdir + tee + chmod), then swanctl."""
         from app.services.server_service import sftp_push_tunnel_config
 
         mock_settings.return_value = MagicMock(
@@ -170,7 +150,11 @@ class TestSftpPushTunnelConfig:
         mock_import_key.return_value = MagicMock()
 
         server = _make_server()
-        mock_conn_cm, mock_conn, mock_sftp = _build_sftp_conn_mocks()
+        # Without secrets: mkdir conf, tee conf, chmod conf, swanctl
+        ok = _make_run_result()
+        mock_conn_cm, mock_conn = _build_conn_mock(
+            run_side_effect=[ok, ok, ok, ok]
+        )
 
         with patch("app.services.server_service.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_push_tunnel_config(
@@ -181,29 +165,24 @@ class TestSftpPushTunnelConfig:
             )
 
         assert result.success is True
+        assert mock_conn.run.call_count == 4
 
-        # makedirs only called once — for conf dir only
-        mock_sftp.makedirs.assert_called_once_with(
-            "/opt/strongswan/config/connections", exist_ok=True
-        )
+        calls = [c.args[0] for c in mock_conn.run.call_args_list]
+        assert calls[0] == "sudo mkdir -p /opt/strongswan/config/connections"
+        assert calls[1] == "sudo tee /opt/strongswan/config/connections/my-tunnel.conf"
+        assert calls[2] == "sudo chmod 644 /opt/strongswan/config/connections/my-tunnel.conf"
+        assert calls[3] == "sudo /usr/sbin/swanctl --load-all"
 
-        # chmod only called once — for conf file only
-        mock_sftp.chmod.assert_called_once_with(
-            "/opt/strongswan/config/connections/my-tunnel.conf", 0o644
-        )
-
-        # swanctl still executed
-        mock_conn.run.assert_called_once_with("sudo /usr/sbin/swanctl --load-all")
+        # No secrets-related commands
+        assert not any("secrets" in c for c in calls)
 
     @patch("app.services.server_service.asyncssh.import_private_key")
     @patch("app.services.server_service.decrypt_ssh_key")
     @patch("app.services.server_service.get_settings")
-    async def test_sftp_error_on_write_returns_failure(
+    async def test_tee_failure_returns_failure(
         self, mock_settings, mock_decrypt, mock_import_key
     ):
-        """SFTPError during file write returns ServerResult(success=False)."""
-        import asyncssh
-
+        """If tee (sudo write) fails with non-zero exit, return ServerResult(success=False)."""
         from app.services.server_service import sftp_push_tunnel_config
 
         mock_settings.return_value = MagicMock(
@@ -215,11 +194,10 @@ class TestSftpPushTunnelConfig:
         mock_import_key.return_value = MagicMock()
 
         server = _make_server()
-
-        # open() raises SFTPError
-        mock_conn_cm, mock_conn, mock_sftp = _build_sftp_conn_mocks(
-            sftp_open_side_effect=asyncssh.SFTPError(asyncssh.FX_FAILURE, "Permission denied")
-        )
+        ok = _make_run_result()
+        fail = _make_run_result(exit_status=1, stderr="Permission denied")
+        # mkdir ok, tee fails
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, fail])
 
         with patch("app.services.server_service.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_push_tunnel_config(
@@ -230,7 +208,8 @@ class TestSftpPushTunnelConfig:
             )
 
         assert result.success is False
-        assert "SFTP error" in result.error
+        assert "tee conf file failed" in result.error
+        assert "Permission denied" in result.error
 
     @patch("app.services.server_service.asyncssh.import_private_key")
     @patch("app.services.server_service.decrypt_ssh_key")
@@ -250,8 +229,12 @@ class TestSftpPushTunnelConfig:
         mock_import_key.return_value = MagicMock()
 
         server = _make_server()
-        run_result = _make_run_result(exit_status=1, stderr="swanctl failed")
-        mock_conn_cm, mock_conn, mock_sftp = _build_sftp_conn_mocks(run_result=run_result)
+        ok = _make_run_result()
+        swanctl_fail = _make_run_result(exit_status=1, stderr="swanctl failed")
+        # mkdir, tee, chmod, mkdir, tee, chmod all ok — swanctl fails
+        mock_conn_cm, mock_conn = _build_conn_mock(
+            run_side_effect=[ok, ok, ok, ok, ok, ok, swanctl_fail]
+        )
 
         with patch("app.services.server_service.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_push_tunnel_config(
@@ -280,7 +263,7 @@ class TestSftpDeleteTunnelConfig:
     async def test_success_removes_both_files_and_reloads(
         self, mock_settings, mock_decrypt, mock_import_key
     ):
-        """Success: removes .conf and .secrets, runs swanctl --load-all."""
+        """Success: rm -f .conf, rm -f .secrets, then swanctl --load-all."""
         from app.services.server_service import sftp_delete_tunnel_config
 
         mock_settings.return_value = MagicMock(
@@ -292,7 +275,8 @@ class TestSftpDeleteTunnelConfig:
         mock_import_key.return_value = MagicMock()
 
         server = _make_server()
-        mock_conn_cm, mock_conn, mock_sftp = _build_sftp_conn_mocks()
+        ok = _make_run_result()
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok])
 
         with patch("app.services.server_service.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_delete_tunnel_config(server, name="my-tunnel")
@@ -300,27 +284,20 @@ class TestSftpDeleteTunnelConfig:
         assert result.success is True
         assert result.server_id == 1
         assert result.server_name == "vpn-1"
+        assert mock_conn.run.call_count == 3
 
-        # Both files removed
-        assert mock_sftp.remove.call_count == 2
-        mock_sftp.remove.assert_any_call(
-            "/opt/strongswan/config/connections/my-tunnel.conf"
-        )
-        mock_sftp.remove.assert_any_call(
-            "/opt/strongswan/config/secrets/my-tunnel.secrets"
-        )
-
-        mock_conn.run.assert_called_once_with("sudo /usr/sbin/swanctl --load-all")
+        calls = [c.args[0] for c in mock_conn.run.call_args_list]
+        assert calls[0] == "sudo rm -f /opt/strongswan/config/connections/my-tunnel.conf"
+        assert calls[1] == "sudo rm -f /opt/strongswan/config/secrets/my-tunnel.secrets"
+        assert calls[2] == "sudo /usr/sbin/swanctl --load-all"
 
     @patch("app.services.server_service.asyncssh.import_private_key")
     @patch("app.services.server_service.decrypt_ssh_key")
     @patch("app.services.server_service.get_settings")
-    async def test_sftp_no_such_file_treated_as_success(
+    async def test_rm_f_is_idempotent_when_file_missing(
         self, mock_settings, mock_decrypt, mock_import_key
     ):
-        """SFTPNoSuchFile during remove is swallowed — result is still success."""
-        import asyncssh
-
+        """sudo rm -f always exits 0 even when files don't exist — result is still success."""
         from app.services.server_service import sftp_delete_tunnel_config
 
         mock_settings.return_value = MagicMock(
@@ -332,16 +309,17 @@ class TestSftpDeleteTunnelConfig:
         mock_import_key.return_value = MagicMock()
 
         server = _make_server()
-        mock_conn_cm, mock_conn, mock_sftp = _build_sftp_conn_mocks(
-            sftp_remove_side_effect=asyncssh.SFTPNoSuchFile("No such file")
-        )
+        # rm -f exits 0 even when file doesn't exist — same mock as success
+        ok = _make_run_result(exit_status=0)
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok])
 
         with patch("app.services.server_service.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_delete_tunnel_config(server, name="my-tunnel")
 
         assert result.success is True
         # swanctl still ran
-        mock_conn.run.assert_called_once_with("sudo /usr/sbin/swanctl --load-all")
+        calls = [c.args[0] for c in mock_conn.run.call_args_list]
+        assert calls[-1] == "sudo /usr/sbin/swanctl --load-all"
 
 
 # ---------------------------------------------------------------------------

@@ -242,7 +242,10 @@ async def sftp_push_tunnel_config(
     *,
     timeout: int | None = None,
 ) -> ServerResult:
-    """Open SSH+SFTP to server, write .conf (and optionally .secrets), run swanctl --load-all.
+    """Open SSH to server, write .conf (and optionally .secrets) via sudo tee, run swanctl --load-all.
+
+    Uses sudo tee instead of SFTP so that the SSH user does not need direct write access
+    to the config directories — only sudo privileges for tee, chmod, and mkdir.
 
     Args:
         server: Target Server instance.
@@ -262,17 +265,70 @@ async def sftp_push_tunnel_config(
 
     async def _run() -> ServerResult:
         async with await _connect_ssh(server) as conn:
-            async with await conn.start_sftp_client() as sftp:
-                await sftp.makedirs(conf_dir, exist_ok=True)
-                async with await sftp.open(conf_path, "w") as f:
-                    await f.write(conf_content)
-                await sftp.chmod(conf_path, 0o644)
+            # Ensure conf directory exists
+            r = await conn.run(f"sudo mkdir -p {conf_dir}")
+            if r.exit_status != 0:
+                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
+                return ServerResult(
+                    server_id=server.id,
+                    server_name=server.name,
+                    success=False,
+                    error=f"mkdir conf dir failed: {detail}",
+                )
 
-                if secrets_content is not None:
-                    await sftp.makedirs(secrets_dir, exist_ok=True)
-                    async with await sftp.open(secrets_path, "w") as f:
-                        await f.write(secrets_content)
-                    await sftp.chmod(secrets_path, 0o640)
+            # Write conf file via sudo tee
+            r = await conn.run(f"sudo tee {conf_path}", input=conf_content)
+            if r.exit_status != 0:
+                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
+                return ServerResult(
+                    server_id=server.id,
+                    server_name=server.name,
+                    success=False,
+                    error=f"tee conf file failed: {detail}",
+                )
+
+            r = await conn.run(f"sudo chmod 644 {conf_path}")
+            if r.exit_status != 0:
+                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
+                return ServerResult(
+                    server_id=server.id,
+                    server_name=server.name,
+                    success=False,
+                    error=f"chmod conf file failed: {detail}",
+                )
+
+            if secrets_content is not None:
+                # Ensure secrets directory exists
+                r = await conn.run(f"sudo mkdir -p {secrets_dir}")
+                if r.exit_status != 0:
+                    detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
+                    return ServerResult(
+                        server_id=server.id,
+                        server_name=server.name,
+                        success=False,
+                        error=f"mkdir secrets dir failed: {detail}",
+                    )
+
+                # Write secrets file via sudo tee
+                r = await conn.run(f"sudo tee {secrets_path}", input=secrets_content)
+                if r.exit_status != 0:
+                    detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
+                    return ServerResult(
+                        server_id=server.id,
+                        server_name=server.name,
+                        success=False,
+                        error=f"tee secrets file failed: {detail}",
+                    )
+
+                r = await conn.run(f"sudo chmod 640 {secrets_path}")
+                if r.exit_status != 0:
+                    detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
+                    return ServerResult(
+                        server_id=server.id,
+                        server_name=server.name,
+                        success=False,
+                        error=f"chmod secrets file failed: {detail}",
+                    )
 
             result = await conn.run(_LOAD_ALL)
 
@@ -306,20 +362,6 @@ async def sftp_push_tunnel_config(
             server_name=server.name,
             success=False,
             error="Command timed out",
-        )
-    except asyncssh.SFTPError as exc:
-        logger.warning(
-            "server_sftp_push_sftp_error",
-            server_id=server.id,
-            name=server.name,
-            tunnel=name,
-            error=str(exc),
-        )
-        return ServerResult(
-            server_id=server.id,
-            server_name=server.name,
-            success=False,
-            error=f"SFTP error: {exc}",
         )
     except asyncssh.Error as exc:
         logger.warning(
@@ -357,7 +399,7 @@ async def sftp_delete_tunnel_config(
     *,
     timeout: int | None = None,
 ) -> ServerResult:
-    """Open SSH+SFTP to server, remove .conf and .secrets (SFTPNoSuchFile tolerated), run swanctl --load-all.
+    """Open SSH to server, remove .conf and .secrets via sudo rm -f (idempotent), run swanctl --load-all.
 
     Args:
         server: Target Server instance.
@@ -373,17 +415,17 @@ async def sftp_delete_tunnel_config(
 
     async def _run() -> ServerResult:
         async with await _connect_ssh(server) as conn:
-            async with await conn.start_sftp_client() as sftp:
-                for path in (conf_path, secrets_path):
-                    try:
-                        await sftp.remove(path)
-                    except asyncssh.SFTPNoSuchFile:
-                        logger.debug(
-                            "server_sftp_delete_file_not_found",
-                            server_id=server.id,
-                            name=server.name,
-                            path=path,
-                        )
+            # sudo rm -f is idempotent — exits 0 even when the file doesn't exist
+            for path in (conf_path, secrets_path):
+                r = await conn.run(f"sudo rm -f {path}")
+                if r.exit_status != 0:
+                    detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
+                    return ServerResult(
+                        server_id=server.id,
+                        server_name=server.name,
+                        success=False,
+                        error=f"rm failed for {path}: {detail}",
+                    )
 
             result = await conn.run(_LOAD_ALL)
 
@@ -417,20 +459,6 @@ async def sftp_delete_tunnel_config(
             server_name=server.name,
             success=False,
             error="Command timed out",
-        )
-    except asyncssh.SFTPError as exc:
-        logger.warning(
-            "server_sftp_delete_sftp_error",
-            server_id=server.id,
-            name=server.name,
-            tunnel=name,
-            error=str(exc),
-        )
-        return ServerResult(
-            server_id=server.id,
-            server_name=server.name,
-            success=False,
-            error=f"SFTP error: {exc}",
         )
     except asyncssh.Error as exc:
         logger.warning(
@@ -471,7 +499,10 @@ async def _sftp_rename_on_server(
     *,
     timeout: int | None = None,
 ) -> ServerResult:
-    """Delete old config files and push new ones in a single SSH connection.
+    """Delete old config files and push new ones in a single SSH connection via sudo.
+
+    Uses sudo rm -f (idempotent) to delete old files and sudo tee + chmod to write new
+    ones, so no direct filesystem access is required from the SSH user.
 
     Args:
         server: Target Server instance.
@@ -494,29 +525,79 @@ async def _sftp_rename_on_server(
 
     async def _run() -> ServerResult:
         async with await _connect_ssh(server) as conn:
-            async with await conn.start_sftp_client() as sftp:
-                # Delete old files (idempotent)
-                for path in (old_conf, old_secrets):
-                    try:
-                        await sftp.remove(path)
-                    except asyncssh.SFTPNoSuchFile:
-                        logger.debug(
-                            "server_sftp_rename_old_not_found",
-                            server_id=server.id,
-                            name=server.name,
-                            path=path,
-                        )
+            # Delete old files (idempotent — rm -f exits 0 even when file absent)
+            for path in (old_conf, old_secrets):
+                r = await conn.run(f"sudo rm -f {path}")
+                if r.exit_status != 0:
+                    detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
+                    return ServerResult(
+                        server_id=server.id,
+                        server_name=server.name,
+                        success=False,
+                        error=f"rm failed for {path}: {detail}",
+                    )
 
-                # Write new files
-                await sftp.makedirs(conf_dir, exist_ok=True)
-                async with await sftp.open(new_conf, "w") as f:
-                    await f.write(conf_content)
-                await sftp.chmod(new_conf, 0o644)
+            # Write new conf file
+            r = await conn.run(f"sudo mkdir -p {conf_dir}")
+            if r.exit_status != 0:
+                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
+                return ServerResult(
+                    server_id=server.id,
+                    server_name=server.name,
+                    success=False,
+                    error=f"mkdir conf dir failed: {detail}",
+                )
 
-                await sftp.makedirs(secrets_dir, exist_ok=True)
-                async with await sftp.open(new_secrets, "w") as f:
-                    await f.write(secrets_content)
-                await sftp.chmod(new_secrets, 0o640)
+            r = await conn.run(f"sudo tee {new_conf}", input=conf_content)
+            if r.exit_status != 0:
+                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
+                return ServerResult(
+                    server_id=server.id,
+                    server_name=server.name,
+                    success=False,
+                    error=f"tee conf file failed: {detail}",
+                )
+
+            r = await conn.run(f"sudo chmod 644 {new_conf}")
+            if r.exit_status != 0:
+                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
+                return ServerResult(
+                    server_id=server.id,
+                    server_name=server.name,
+                    success=False,
+                    error=f"chmod conf file failed: {detail}",
+                )
+
+            # Write new secrets file
+            r = await conn.run(f"sudo mkdir -p {secrets_dir}")
+            if r.exit_status != 0:
+                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
+                return ServerResult(
+                    server_id=server.id,
+                    server_name=server.name,
+                    success=False,
+                    error=f"mkdir secrets dir failed: {detail}",
+                )
+
+            r = await conn.run(f"sudo tee {new_secrets}", input=secrets_content)
+            if r.exit_status != 0:
+                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
+                return ServerResult(
+                    server_id=server.id,
+                    server_name=server.name,
+                    success=False,
+                    error=f"tee secrets file failed: {detail}",
+                )
+
+            r = await conn.run(f"sudo chmod 640 {new_secrets}")
+            if r.exit_status != 0:
+                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
+                return ServerResult(
+                    server_id=server.id,
+                    server_name=server.name,
+                    success=False,
+                    error=f"chmod secrets file failed: {detail}",
+                )
 
             result = await conn.run(_LOAD_ALL)
 
@@ -563,21 +644,6 @@ async def _sftp_rename_on_server(
             server_name=server.name,
             success=False,
             error="Command timed out",
-        )
-    except asyncssh.SFTPError as exc:
-        logger.warning(
-            "server_sftp_rename_sftp_error",
-            server_id=server.id,
-            name=server.name,
-            old_tunnel=old_name,
-            new_tunnel=new_name,
-            error=str(exc),
-        )
-        return ServerResult(
-            server_id=server.id,
-            server_name=server.name,
-            success=False,
-            error=f"SFTP error: {exc}",
         )
     except asyncssh.Error as exc:
         logger.warning(
