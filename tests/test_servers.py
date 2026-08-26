@@ -590,8 +590,8 @@ class TestServerServiceSSH:
     """Unit tests for server_service.test_connection and check_status
     with asyncssh.connect mocked to avoid real SSH connections."""
 
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_server", new_callable=AsyncMock)
     async def test_test_connection_success_path(
         self, mock_get_server, mock_decrypt, mock_import_key,
@@ -611,7 +611,7 @@ class TestServerServiceSSH:
         mock_cm.__aenter__ = AsyncMock(return_value=mock_conn)
         mock_cm.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("app.services.server_service.asyncssh.connect", return_value=mock_cm) as mock_connect:
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_cm) as mock_connect:
             session = AsyncMock()
             result = await test_connection(session, server_id=1)
 
@@ -620,8 +620,8 @@ class TestServerServiceSSH:
         assert result["server_id"] == 1
         mock_connect.assert_called_once()
 
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_server", new_callable=AsyncMock)
     async def test_test_connection_refused(
         self, mock_get_server, mock_decrypt, mock_import_key,
@@ -635,7 +635,7 @@ class TestServerServiceSSH:
         mock_import_key.return_value = MagicMock()
 
         with patch(
-            "app.services.server_service.asyncssh.connect",
+            "app.services.transport.ssh_transport.asyncssh.connect",
             side_effect=OSError("Connection refused"),
         ):
             session = AsyncMock()
@@ -644,9 +644,9 @@ class TestServerServiceSSH:
         assert result["success"] is False
         assert "Connection refused" in result["message"]
 
-    @patch("app.services.server_service.asyncssh.connect", new_callable=AsyncMock)
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.connect", new_callable=AsyncMock)
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_server", new_callable=AsyncMock)
     async def test_test_connection_auth_failure(
         self, mock_get_server, mock_decrypt, mock_import_key, mock_connect,
@@ -668,8 +668,8 @@ class TestServerServiceSSH:
         assert result["success"] is False
         assert "failed" in result["message"].lower()
 
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_server", new_callable=AsyncMock)
     async def test_check_status_success_persists(
         self, mock_get_server, mock_decrypt, mock_import_key,
@@ -687,7 +687,7 @@ class TestServerServiceSSH:
         mock_cm.__aenter__ = AsyncMock(return_value=mock_conn)
         mock_cm.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("app.services.server_service.asyncssh.connect", return_value=mock_cm):
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_cm):
             session = AsyncMock()
             result = await check_status(session, server_id=1)
 
@@ -698,9 +698,9 @@ class TestServerServiceSSH:
         assert server.last_check_at is not None
         session.commit.assert_called_once()
 
-    @patch("app.services.server_service.asyncssh.connect", new_callable=AsyncMock)
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.connect", new_callable=AsyncMock)
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_server", new_callable=AsyncMock)
     async def test_check_status_failure_persists(
         self, mock_get_server, mock_decrypt, mock_import_key, mock_connect,
@@ -724,9 +724,9 @@ class TestServerServiceSSH:
         assert server.last_check_at is not None
         session.commit.assert_called_once()
 
-    @patch("app.services.server_service.asyncssh.connect", new_callable=AsyncMock)
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.connect", new_callable=AsyncMock)
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_server", new_callable=AsyncMock)
     async def test_test_connection_unexpected_error_safe(
         self, mock_get_server, mock_decrypt, mock_import_key, mock_connect,

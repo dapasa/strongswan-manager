@@ -57,8 +57,8 @@ def _make_fan_out(total: int, succeeded: int) -> FanOutResult:
 class TestExecuteCommand:
     """Unit tests for server_service.execute_command()."""
 
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_server", new_callable=AsyncMock)
     @patch("app.services.server_service.get_settings")
     async def test_success(self, mock_settings, mock_get_server, mock_decrypt, mock_import_key):
@@ -82,7 +82,7 @@ class TestExecuteCommand:
         mock_cm.__aenter__ = AsyncMock(return_value=mock_conn)
         mock_cm.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("app.services.server_service.asyncssh.connect", return_value=mock_cm):
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_cm):
             session = AsyncMock()
             result = await execute_command(session, server_id=1, commands=["echo ok"])
 
@@ -92,8 +92,8 @@ class TestExecuteCommand:
         assert result.server_name == "vpn-1"
         assert result.error == ""
 
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_server", new_callable=AsyncMock)
     @patch("app.services.server_service.get_settings")
     async def test_ssh_connection_error(self, mock_settings, mock_get_server, mock_decrypt, mock_import_key):
@@ -109,7 +109,7 @@ class TestExecuteCommand:
         mock_import_key.return_value = MagicMock()
 
         with patch(
-            "app.services.server_service.asyncssh.connect",
+            "app.services.transport.ssh_transport.asyncssh.connect",
             side_effect=asyncssh.ConnectionLost("Connection lost"),
         ):
             session = AsyncMock()
@@ -119,8 +119,8 @@ class TestExecuteCommand:
         assert "SSH error" in result.error
         assert result.server_id == 1
 
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_server", new_callable=AsyncMock)
     @patch("app.services.server_service.get_settings")
     async def test_nonzero_exit_status(self, mock_settings, mock_get_server, mock_decrypt, mock_import_key):
@@ -144,7 +144,7 @@ class TestExecuteCommand:
         mock_cm.__aenter__ = AsyncMock(return_value=mock_conn)
         mock_cm.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("app.services.server_service.asyncssh.connect", return_value=mock_cm):
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_cm):
             session = AsyncMock()
             result = await execute_command(session, server_id=1, commands=["bad-command"])
 
@@ -152,8 +152,8 @@ class TestExecuteCommand:
         assert "status 1" in result.error
         assert "command failed" in result.error
 
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_server", new_callable=AsyncMock)
     @patch("app.services.server_service.get_settings")
     async def test_command_timeout(self, mock_settings, mock_get_server, mock_decrypt, mock_import_key):
@@ -172,7 +172,7 @@ class TestExecuteCommand:
         mock_cm.__aenter__ = AsyncMock(return_value=mock_conn)
         mock_cm.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("app.services.server_service.asyncssh.connect", return_value=mock_cm):
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_cm):
             with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError()):
                 session = AsyncMock()
                 result = await execute_command(session, server_id=1, commands=["sleep 60"])

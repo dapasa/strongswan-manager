@@ -79,8 +79,8 @@ def _build_conn_mock(run_side_effect=None, run_return_value=None):
 class TestSftpPushTunnelConfig:
     """Unit tests for server_service.sftp_push_tunnel_config()."""
 
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_settings")
     async def test_success_writes_conf_and_secrets(
         self, mock_settings, mock_decrypt, mock_import_key
@@ -103,7 +103,7 @@ class TestSftpPushTunnelConfig:
             run_side_effect=[ok, ok, ok, ok, ok, ok, ok]
         )
 
-        with patch("app.services.server_service.asyncssh.connect", return_value=mock_conn_cm):
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_push_tunnel_config(
                 server,
                 name="my-tunnel",
@@ -132,8 +132,8 @@ class TestSftpPushTunnelConfig:
         tee_secrets_call = mock_conn.run.call_args_list[4]
         assert tee_secrets_call.kwargs.get("input") == "10.0.0.1 : PSK secret\n"
 
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_settings")
     async def test_secrets_none_skips_secrets_write(
         self, mock_settings, mock_decrypt, mock_import_key
@@ -156,7 +156,7 @@ class TestSftpPushTunnelConfig:
             run_side_effect=[ok, ok, ok, ok]
         )
 
-        with patch("app.services.server_service.asyncssh.connect", return_value=mock_conn_cm):
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_push_tunnel_config(
                 server,
                 name="my-tunnel",
@@ -176,8 +176,8 @@ class TestSftpPushTunnelConfig:
         # No secrets-related commands
         assert not any("secrets" in c for c in calls)
 
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_settings")
     async def test_tee_failure_returns_failure(
         self, mock_settings, mock_decrypt, mock_import_key
@@ -199,7 +199,7 @@ class TestSftpPushTunnelConfig:
         # mkdir ok, tee fails
         mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, fail])
 
-        with patch("app.services.server_service.asyncssh.connect", return_value=mock_conn_cm):
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_push_tunnel_config(
                 server,
                 name="my-tunnel",
@@ -208,11 +208,11 @@ class TestSftpPushTunnelConfig:
             )
 
         assert result.success is False
-        assert "tee conf file failed" in result.error
+        assert "tee" in result.error  # transport layer uses path-based message
         assert "Permission denied" in result.error
 
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_settings")
     async def test_swanctl_nonzero_exit_returns_failure(
         self, mock_settings, mock_decrypt, mock_import_key
@@ -236,7 +236,7 @@ class TestSftpPushTunnelConfig:
             run_side_effect=[ok, ok, ok, ok, ok, ok, swanctl_fail]
         )
 
-        with patch("app.services.server_service.asyncssh.connect", return_value=mock_conn_cm):
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_push_tunnel_config(
                 server,
                 name="my-tunnel",
@@ -257,8 +257,8 @@ class TestSftpPushTunnelConfig:
 class TestSftpDeleteTunnelConfig:
     """Unit tests for server_service.sftp_delete_tunnel_config()."""
 
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_settings")
     async def test_success_removes_both_files_and_reloads(
         self, mock_settings, mock_decrypt, mock_import_key
@@ -278,7 +278,7 @@ class TestSftpDeleteTunnelConfig:
         ok = _make_run_result()
         mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok])
 
-        with patch("app.services.server_service.asyncssh.connect", return_value=mock_conn_cm):
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_delete_tunnel_config(server, name="my-tunnel")
 
         assert result.success is True
@@ -291,8 +291,8 @@ class TestSftpDeleteTunnelConfig:
         assert calls[1] == "sudo rm -f /opt/strongswan/config/secrets/my-tunnel.secrets"
         assert calls[2] == "sudo /usr/sbin/swanctl --load-all"
 
-    @patch("app.services.server_service.asyncssh.import_private_key")
-    @patch("app.services.server_service.decrypt_ssh_key")
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
     @patch("app.services.server_service.get_settings")
     async def test_rm_f_is_idempotent_when_file_missing(
         self, mock_settings, mock_decrypt, mock_import_key
@@ -313,7 +313,7 @@ class TestSftpDeleteTunnelConfig:
         ok = _make_run_result(exit_status=0)
         mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok])
 
-        with patch("app.services.server_service.asyncssh.connect", return_value=mock_conn_cm):
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_delete_tunnel_config(server, name="my-tunnel")
 
         assert result.success is True

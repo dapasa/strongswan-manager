@@ -6,7 +6,6 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
-import asyncssh
 from fastapi import Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,12 +15,14 @@ from app.db.models import Server, User
 from app.exceptions import ConflictError, InfrastructureError, NotFoundError
 from app.logging_config import get_logger
 from app.services import audit
-from app.utils.crypto import decrypt_ssh_key, encrypt_ssh_key, validate_ssh_private_key
+from app.services.transport.base import TransportError
+from app.services.transport.factory import get_transport
+from app.utils.crypto import encrypt_ssh_key, validate_ssh_private_key
 from app.utils.fan_out import FanOutResult, ServerResult
 
 logger = get_logger(__name__)
 
-# SSH connection timeout in seconds
+# SSH connection timeout in seconds (used for check_reachable)
 SSH_CONNECT_TIMEOUT = 10
 
 # swanctl command to reload all connections after config push / delete
@@ -36,29 +37,6 @@ def _remote_conf_path(name: str) -> str:
 def _remote_secrets_path(name: str) -> str:
     """Remote path for a tunnel's .secrets file on VPN servers."""
     return f"{get_settings().vpn_secrets_dir}/{name}.secrets"
-
-
-async def _connect_ssh(server: Server) -> asyncssh.SSHClientConnection:
-    """Create an asyncssh connection to a server.
-
-    Decrypts the stored SSH key and connects using the server's hostname,
-    port, and user. Returns the connection — caller must use as context manager.
-
-    Raises:
-        asyncssh.Error: On SSH connection failure.
-        OSError: On network-level failure.
-        EncryptionError: If the stored SSH key cannot be decrypted.
-    """
-    raw_key = decrypt_ssh_key(server.ssh_private_key_encrypted)
-    key = asyncssh.import_private_key(raw_key)
-    return asyncssh.connect(
-        server.hostname,
-        port=server.ssh_port,
-        username=server.ssh_user,
-        client_keys=[key],
-        known_hosts=None,
-        connect_timeout=SSH_CONNECT_TIMEOUT,
-    )
 
 
 async def execute_command(
@@ -81,40 +59,19 @@ async def execute_command(
     """
     server = await get_server(session, server_id)
     effective_timeout = timeout if timeout is not None else get_settings().ssh_command_timeout
-    command = " && ".join(commands)
 
     try:
-        async with await _connect_ssh(server) as conn:
-            result = await asyncio.wait_for(
-                conn.run(command),
-                timeout=effective_timeout,
-            )
-
-        if result.exit_status != 0:
-            stderr = result.stderr or ""
-            stdout = result.stdout or ""
-            logger.warning(
-                "server_execute_command_nonzero",
-                server_id=server.id,
-                name=server.name,
-                exit_status=result.exit_status,
-                stdout=stdout,
-                stderr=stderr,
-            )
-            detail = (stderr or stdout).strip() or f"exit {result.exit_status}"
-            return ServerResult(
-                server_id=server.id,
-                server_name=server.name,
-                success=False,
-                error=f"Command exited with status {result.exit_status}: {detail}",
-            )
+        result = await asyncio.wait_for(
+            get_transport(server).execute(commands),
+            timeout=effective_timeout,
+        )
 
         logger.info("server_execute_command_success", server_id=server.id, name=server.name)
         return ServerResult(
             server_id=server.id,
             server_name=server.name,
             success=True,
-            output=result.stdout or "",
+            output=result.stdout,
         )
 
     except asyncio.TimeoutError:
@@ -125,7 +82,7 @@ async def execute_command(
             success=False,
             error="Command timed out",
         )
-    except asyncssh.Error as exc:
+    except TransportError as exc:
         logger.warning(
             "server_execute_command_ssh_error",
             server_id=server.id,
@@ -137,19 +94,6 @@ async def execute_command(
             server_name=server.name,
             success=False,
             error=f"SSH error: {exc}",
-        )
-    except OSError as exc:
-        logger.error(
-            "server_execute_command_os_error",
-            server_id=server.id,
-            name=server.name,
-            error=str(exc),
-        )
-        return ServerResult(
-            server_id=server.id,
-            server_name=server.name,
-            success=False,
-            error=f"Connection failed: {exc}",
         )
     except Exception as exc:
         logger.error(
@@ -260,95 +204,15 @@ async def sftp_push_tunnel_config(
     effective_timeout = timeout if timeout is not None else get_settings().ssh_command_timeout
     conf_path = _remote_conf_path(name)
     secrets_path = _remote_secrets_path(name)
-    conf_dir = get_settings().vpn_conf_dir
-    secrets_dir = get_settings().vpn_secrets_dir
+    transport = get_transport(server)
 
     async def _run() -> ServerResult:
-        async with await _connect_ssh(server) as conn:
-            # Ensure conf directory exists
-            r = await conn.run(f"sudo mkdir -p {conf_dir}")
-            if r.exit_status != 0:
-                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
-                return ServerResult(
-                    server_id=server.id,
-                    server_name=server.name,
-                    success=False,
-                    error=f"mkdir conf dir failed: {detail}",
-                )
+        await transport.write_file(conf_path, conf_content, mode="644", make_dirs=True)
 
-            # Write conf file via sudo tee
-            r = await conn.run(f"sudo tee {conf_path}", input=conf_content)
-            if r.exit_status != 0:
-                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
-                return ServerResult(
-                    server_id=server.id,
-                    server_name=server.name,
-                    success=False,
-                    error=f"tee conf file failed: {detail}",
-                )
+        if secrets_content is not None:
+            await transport.write_file(secrets_path, secrets_content, mode="640", make_dirs=True)
 
-            r = await conn.run(f"sudo chmod 644 {conf_path}")
-            if r.exit_status != 0:
-                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
-                return ServerResult(
-                    server_id=server.id,
-                    server_name=server.name,
-                    success=False,
-                    error=f"chmod conf file failed: {detail}",
-                )
-
-            if secrets_content is not None:
-                # Ensure secrets directory exists
-                r = await conn.run(f"sudo mkdir -p {secrets_dir}")
-                if r.exit_status != 0:
-                    detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
-                    return ServerResult(
-                        server_id=server.id,
-                        server_name=server.name,
-                        success=False,
-                        error=f"mkdir secrets dir failed: {detail}",
-                    )
-
-                # Write secrets file via sudo tee
-                r = await conn.run(f"sudo tee {secrets_path}", input=secrets_content)
-                if r.exit_status != 0:
-                    detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
-                    return ServerResult(
-                        server_id=server.id,
-                        server_name=server.name,
-                        success=False,
-                        error=f"tee secrets file failed: {detail}",
-                    )
-
-                r = await conn.run(f"sudo chmod 640 {secrets_path}")
-                if r.exit_status != 0:
-                    detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
-                    return ServerResult(
-                        server_id=server.id,
-                        server_name=server.name,
-                        success=False,
-                        error=f"chmod secrets file failed: {detail}",
-                    )
-
-            result = await conn.run(_LOAD_ALL)
-
-        if result.exit_status != 0:
-            stderr = result.stderr or ""
-            stdout = result.stdout or ""
-            detail = (stderr or stdout).strip() or f"exit {result.exit_status}"
-            logger.warning(
-                "server_sftp_push_swanctl_nonzero",
-                server_id=server.id,
-                name=server.name,
-                tunnel=name,
-                exit_status=result.exit_status,
-            )
-            return ServerResult(
-                server_id=server.id,
-                server_name=server.name,
-                success=False,
-                error=f"swanctl --load-all exited with status {result.exit_status}: {detail}",
-            )
+        await transport.execute([_LOAD_ALL])
 
         logger.info("server_sftp_push_success", server_id=server.id, name=server.name, tunnel=name)
         return ServerResult(server_id=server.id, server_name=server.name, success=True)
@@ -363,9 +227,9 @@ async def sftp_push_tunnel_config(
             success=False,
             error="Command timed out",
         )
-    except asyncssh.Error as exc:
+    except TransportError as exc:
         logger.warning(
-            "server_sftp_push_ssh_error",
+            "server_sftp_push_error",
             server_id=server.id,
             name=server.name,
             tunnel=name,
@@ -375,11 +239,11 @@ async def sftp_push_tunnel_config(
             server_id=server.id,
             server_name=server.name,
             success=False,
-            error=f"SSH error: {exc}",
+            error=str(exc),
         )
-    except OSError as exc:
+    except Exception as exc:
         logger.error(
-            "server_sftp_push_os_error",
+            "server_sftp_push_unexpected",
             server_id=server.id,
             name=server.name,
             tunnel=name,
@@ -389,7 +253,7 @@ async def sftp_push_tunnel_config(
             server_id=server.id,
             server_name=server.name,
             success=False,
-            error=f"Connection failed: {exc}",
+            error=f"Unexpected error: {exc}",
         )
 
 
@@ -412,40 +276,12 @@ async def sftp_delete_tunnel_config(
     effective_timeout = timeout if timeout is not None else get_settings().ssh_command_timeout
     conf_path = _remote_conf_path(name)
     secrets_path = _remote_secrets_path(name)
+    transport = get_transport(server)
 
     async def _run() -> ServerResult:
-        async with await _connect_ssh(server) as conn:
-            # sudo rm -f is idempotent — exits 0 even when the file doesn't exist
-            for path in (conf_path, secrets_path):
-                r = await conn.run(f"sudo rm -f {path}")
-                if r.exit_status != 0:
-                    detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
-                    return ServerResult(
-                        server_id=server.id,
-                        server_name=server.name,
-                        success=False,
-                        error=f"rm failed for {path}: {detail}",
-                    )
-
-            result = await conn.run(_LOAD_ALL)
-
-        if result.exit_status != 0:
-            stderr = result.stderr or ""
-            stdout = result.stdout or ""
-            detail = (stderr or stdout).strip() or f"exit {result.exit_status}"
-            logger.warning(
-                "server_sftp_delete_swanctl_nonzero",
-                server_id=server.id,
-                name=server.name,
-                tunnel=name,
-                exit_status=result.exit_status,
-            )
-            return ServerResult(
-                server_id=server.id,
-                server_name=server.name,
-                success=False,
-                error=f"swanctl --load-all exited with status {result.exit_status}: {detail}",
-            )
+        await transport.delete_file(conf_path)
+        await transport.delete_file(secrets_path)
+        await transport.execute([_LOAD_ALL])
 
         logger.info("server_sftp_delete_success", server_id=server.id, name=server.name, tunnel=name)
         return ServerResult(server_id=server.id, server_name=server.name, success=True)
@@ -460,9 +296,9 @@ async def sftp_delete_tunnel_config(
             success=False,
             error="Command timed out",
         )
-    except asyncssh.Error as exc:
+    except TransportError as exc:
         logger.warning(
-            "server_sftp_delete_ssh_error",
+            "server_sftp_delete_error",
             server_id=server.id,
             name=server.name,
             tunnel=name,
@@ -472,11 +308,11 @@ async def sftp_delete_tunnel_config(
             server_id=server.id,
             server_name=server.name,
             success=False,
-            error=f"SSH error: {exc}",
+            error=str(exc),
         )
-    except OSError as exc:
+    except Exception as exc:
         logger.error(
-            "server_sftp_delete_os_error",
+            "server_sftp_delete_unexpected",
             server_id=server.id,
             name=server.name,
             tunnel=name,
@@ -486,7 +322,7 @@ async def sftp_delete_tunnel_config(
             server_id=server.id,
             server_name=server.name,
             success=False,
-            error=f"Connection failed: {exc}",
+            error=f"Unexpected error: {exc}",
         )
 
 
@@ -499,10 +335,10 @@ async def _sftp_rename_on_server(
     *,
     timeout: int | None = None,
 ) -> ServerResult:
-    """Delete old config files and push new ones in a single SSH connection via sudo.
+    """Delete old config files and push new ones via the transport layer.
 
-    Uses sudo rm -f (idempotent) to delete old files and sudo tee + chmod to write new
-    ones, so no direct filesystem access is required from the SSH user.
+    Uses delete_file (idempotent) + write_file for the rename-and-rewrite
+    pattern required when a tunnel connection name changes.
 
     Args:
         server: Target Server instance.
@@ -520,105 +356,14 @@ async def _sftp_rename_on_server(
     old_secrets = _remote_secrets_path(old_name)
     new_conf = _remote_conf_path(new_name)
     new_secrets = _remote_secrets_path(new_name)
-    conf_dir = get_settings().vpn_conf_dir
-    secrets_dir = get_settings().vpn_secrets_dir
+    transport = get_transport(server)
 
     async def _run() -> ServerResult:
-        async with await _connect_ssh(server) as conn:
-            # Delete old files (idempotent — rm -f exits 0 even when file absent)
-            for path in (old_conf, old_secrets):
-                r = await conn.run(f"sudo rm -f {path}")
-                if r.exit_status != 0:
-                    detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
-                    return ServerResult(
-                        server_id=server.id,
-                        server_name=server.name,
-                        success=False,
-                        error=f"rm failed for {path}: {detail}",
-                    )
-
-            # Write new conf file
-            r = await conn.run(f"sudo mkdir -p {conf_dir}")
-            if r.exit_status != 0:
-                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
-                return ServerResult(
-                    server_id=server.id,
-                    server_name=server.name,
-                    success=False,
-                    error=f"mkdir conf dir failed: {detail}",
-                )
-
-            r = await conn.run(f"sudo tee {new_conf}", input=conf_content)
-            if r.exit_status != 0:
-                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
-                return ServerResult(
-                    server_id=server.id,
-                    server_name=server.name,
-                    success=False,
-                    error=f"tee conf file failed: {detail}",
-                )
-
-            r = await conn.run(f"sudo chmod 644 {new_conf}")
-            if r.exit_status != 0:
-                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
-                return ServerResult(
-                    server_id=server.id,
-                    server_name=server.name,
-                    success=False,
-                    error=f"chmod conf file failed: {detail}",
-                )
-
-            # Write new secrets file
-            r = await conn.run(f"sudo mkdir -p {secrets_dir}")
-            if r.exit_status != 0:
-                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
-                return ServerResult(
-                    server_id=server.id,
-                    server_name=server.name,
-                    success=False,
-                    error=f"mkdir secrets dir failed: {detail}",
-                )
-
-            r = await conn.run(f"sudo tee {new_secrets}", input=secrets_content)
-            if r.exit_status != 0:
-                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
-                return ServerResult(
-                    server_id=server.id,
-                    server_name=server.name,
-                    success=False,
-                    error=f"tee secrets file failed: {detail}",
-                )
-
-            r = await conn.run(f"sudo chmod 640 {new_secrets}")
-            if r.exit_status != 0:
-                detail = (r.stderr or r.stdout or "").strip() or f"exit {r.exit_status}"
-                return ServerResult(
-                    server_id=server.id,
-                    server_name=server.name,
-                    success=False,
-                    error=f"chmod secrets file failed: {detail}",
-                )
-
-            result = await conn.run(_LOAD_ALL)
-
-        if result.exit_status != 0:
-            stderr = result.stderr or ""
-            stdout = result.stdout or ""
-            detail = (stderr or stdout).strip() or f"exit {result.exit_status}"
-            logger.warning(
-                "server_sftp_rename_swanctl_nonzero",
-                server_id=server.id,
-                name=server.name,
-                old_tunnel=old_name,
-                new_tunnel=new_name,
-                exit_status=result.exit_status,
-            )
-            return ServerResult(
-                server_id=server.id,
-                server_name=server.name,
-                success=False,
-                error=f"swanctl --load-all exited with status {result.exit_status}: {detail}",
-            )
+        await transport.delete_file(old_conf)
+        await transport.delete_file(old_secrets)
+        await transport.write_file(new_conf, conf_content, mode="644", make_dirs=True)
+        await transport.write_file(new_secrets, secrets_content, mode="640", make_dirs=True)
+        await transport.execute([_LOAD_ALL])
 
         logger.info(
             "server_sftp_rename_success",
@@ -645,9 +390,9 @@ async def _sftp_rename_on_server(
             success=False,
             error="Command timed out",
         )
-    except asyncssh.Error as exc:
+    except TransportError as exc:
         logger.warning(
-            "server_sftp_rename_ssh_error",
+            "server_sftp_rename_error",
             server_id=server.id,
             name=server.name,
             old_tunnel=old_name,
@@ -658,11 +403,11 @@ async def _sftp_rename_on_server(
             server_id=server.id,
             server_name=server.name,
             success=False,
-            error=f"SSH error: {exc}",
+            error=str(exc),
         )
-    except OSError as exc:
+    except Exception as exc:
         logger.error(
-            "server_sftp_rename_os_error",
+            "server_sftp_rename_unexpected",
             server_id=server.id,
             name=server.name,
             old_tunnel=old_name,
@@ -673,7 +418,7 @@ async def _sftp_rename_on_server(
             server_id=server.id,
             server_name=server.name,
             success=False,
-            error=f"Connection failed: {exc}",
+            error=f"Unexpected error: {exc}",
         )
 
 
@@ -1172,8 +917,8 @@ async def delete_server(
 async def test_connection(session: AsyncSession, server_id: int) -> dict[str, Any]:
     """Test SSH connectivity to a server without persisting the result.
 
-    1. Retrieve server and decrypt SSH key.
-    2. Attempt asyncssh.connect with timeout.
+    1. Retrieve server.
+    2. Attempt transport.check_reachable with timeout.
     3. Return success/failure with descriptive message.
 
     Args:
@@ -1190,8 +935,7 @@ async def test_connection(session: AsyncSession, server_id: int) -> dict[str, An
     tested_at = datetime.now(timezone.utc)
 
     try:
-        async with await _connect_ssh(server):
-            pass  # Connection succeeded, just close it
+        await get_transport(server).check_reachable(timeout=SSH_CONNECT_TIMEOUT)
 
         server.last_check_at = tested_at
         server.last_check_status = "reachable"
@@ -1205,7 +949,7 @@ async def test_connection(session: AsyncSession, server_id: int) -> dict[str, An
             "message": "SSH connection successful",
             "tested_at": tested_at,
         }
-    except asyncssh.Error as exc:
+    except TransportError as exc:
         logger.warning(
             "server_test_connection_failed",
             server_id=server.id,
@@ -1221,24 +965,6 @@ async def test_connection(session: AsyncSession, server_id: int) -> dict[str, An
             "server_name": server.name,
             "success": False,
             "message": f"SSH connection failed: {exc}",
-            "tested_at": tested_at,
-        }
-    except OSError as exc:
-        logger.error(
-            "server_test_connection_os_error",
-            server_id=server.id,
-            name=server.name,
-            error=str(exc),
-        )
-        server.last_check_at = tested_at
-        server.last_check_status = "unreachable"
-        await session.commit()
-
-        return {
-            "server_id": server.id,
-            "server_name": server.name,
-            "success": False,
-            "message": f"Connection failed: {exc}",
             "tested_at": tested_at,
         }
     except Exception as exc:
@@ -1281,30 +1007,18 @@ async def check_status(session: AsyncSession, server_id: int) -> dict[str, Any]:
     checked_at = datetime.now(timezone.utc)
 
     try:
-        async with await _connect_ssh(server):
-            pass  # Connection succeeded
-
+        await get_transport(server).check_reachable(timeout=SSH_CONNECT_TIMEOUT)
         status = "reachable"
         message = "SSH connection successful"
         success = True
         logger.info("server_check_status_reachable", server_id=server.id, name=server.name)
 
-    except asyncssh.Error as exc:
+    except TransportError as exc:
         status = "unreachable"
         message = f"SSH connection failed: {exc}"
         success = False
         logger.warning(
             "server_check_status_unreachable",
-            server_id=server.id,
-            name=server.name,
-            error=str(exc),
-        )
-    except OSError as exc:
-        status = "unreachable"
-        message = f"Connection failed: {exc}"
-        success = False
-        logger.error(
-            "server_check_status_os_error",
             server_id=server.id,
             name=server.name,
             error=str(exc),
