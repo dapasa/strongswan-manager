@@ -1,4 +1,4 @@
-"""Server management service — CRUD operations and SSH connectivity testing."""
+"""Server management service — CRUD operations and transport connectivity testing."""
 
 from __future__ import annotations
 
@@ -84,7 +84,7 @@ async def execute_command(
         )
     except TransportError as exc:
         logger.warning(
-            "server_execute_command_ssh_error",
+            "server_execute_command_transport_error",
             server_id=server.id,
             name=server.name,
             error=str(exc),
@@ -93,7 +93,7 @@ async def execute_command(
             server_id=server.id,
             server_name=server.name,
             success=False,
-            error=f"SSH error: {exc}",
+            error=f"Transport error: {exc}",
         )
     except Exception as exc:
         logger.error(
@@ -139,7 +139,7 @@ async def execute_on_all_servers(
 
     if not servers:
         raise InfrastructureError(
-            service="SSH",
+            service="servers",
             message="No active servers registered — cannot execute commands",
         )
 
@@ -451,7 +451,7 @@ async def sftp_push_on_all_servers(
 
     if not servers:
         raise InfrastructureError(
-            service="SSH",
+            service="servers",
             message="No active servers registered — cannot push tunnel config",
         )
 
@@ -518,7 +518,7 @@ async def sftp_delete_on_all_servers(
 
     if not servers:
         raise InfrastructureError(
-            service="SSH",
+            service="servers",
             message="No active servers registered — cannot delete tunnel config",
         )
 
@@ -588,7 +588,7 @@ async def sftp_rename_on_all_servers(
 
     if not servers:
         raise InfrastructureError(
-            service="SSH",
+            service="servers",
             message="No active servers registered — cannot rename tunnel config",
         )
 
@@ -638,9 +638,15 @@ def _server_to_dict(server: Server) -> dict[str, Any]:
     return {
         "id": server.id,
         "name": server.name,
+        "connection_type": server.connection_type,
+        # SSH fields (None for SSM servers)
         "hostname": server.hostname,
         "ssh_port": server.ssh_port,
         "ssh_user": server.ssh_user,
+        # SSM fields (None for SSH servers)
+        "ec2_instance_id": server.ec2_instance_id,
+        "aws_role_arn": server.aws_role_arn,
+        "aws_region_override": server.aws_region_override,
         "description": server.description,
         "is_active": server.is_active,
         "last_check_at": server.last_check_at.isoformat() if server.last_check_at else None,
@@ -677,7 +683,9 @@ async def list_servers(
     if search is not None:
         search_pattern = f"%{search}%"
         base_where.append(
-            Server.name.ilike(search_pattern) | Server.hostname.ilike(search_pattern),
+            Server.name.ilike(search_pattern)
+            | Server.hostname.ilike(search_pattern)
+            | Server.ec2_instance_id.ilike(search_pattern),
         )
 
     # Count query
@@ -730,14 +738,18 @@ async def create_server(
     user: User,
     request: Request | None = None,
 ) -> Server:
-    """Create a new server with encrypted SSH key storage.
+    """Create a new server (SSH or SSM transport).
 
-    1. Validate SSH private key format.
-    2. Validate name uniqueness among active servers.
-    3. Encrypt SSH key with Fernet.
-    4. Insert server record.
-    5. Create audit log entry.
-    6. Commit transaction.
+    For SSH servers:
+      1. Validate SSH private key format.
+      2. Encrypt SSH key with Fernet.
+    For SSM servers:
+      1. No key needed — ec2_instance_id is the identity.
+    Common:
+      1. Validate name uniqueness among active servers.
+      2. Insert server record.
+      3. Create audit log entry.
+      4. Commit transaction.
 
     Args:
         session: Active database session.
@@ -750,12 +762,9 @@ async def create_server(
 
     Raises:
         ConflictError: If a server with the same name already exists.
-        ValueError: If the SSH key is invalid.
-        EncryptionError: If the encryption key is not configured.
+        ValueError: If the SSH key is invalid (SSH servers only).
+        EncryptionError: If the encryption key is not configured (SSH servers only).
     """
-    # Validate SSH key format
-    validate_ssh_private_key(data.ssh_private_key)
-
     # Validate name uniqueness
     existing = await session.execute(
         select(Server.id).where(
@@ -766,20 +775,35 @@ async def create_server(
     if existing.scalar_one_or_none() is not None:
         raise ConflictError(f"Server name already exists")
 
-    # Encrypt the SSH key
-    encrypted_key = encrypt_ssh_key(data.ssh_private_key)
+    connection_type = getattr(data, "connection_type", "ssh") or "ssh"
 
-    # Insert server
-    server = Server(
-        name=data.name,
-        hostname=data.hostname,
-        ssh_port=data.ssh_port,
-        ssh_user=data.ssh_user,
-        ssh_private_key_encrypted=encrypted_key,
-        description=data.description,
-        is_active=True,
-        created_by=user.id,
-    )
+    if connection_type == "ssm":
+        server = Server(
+            name=data.name,
+            connection_type="ssm",
+            ec2_instance_id=data.ec2_instance_id,
+            aws_role_arn=getattr(data, "aws_role_arn", None),
+            aws_region_override=getattr(data, "aws_region_override", None),
+            description=data.description,
+            is_active=True,
+            created_by=user.id,
+        )
+    else:
+        # SSH server — validate and encrypt the private key
+        validate_ssh_private_key(data.ssh_private_key)
+        encrypted_key = encrypt_ssh_key(data.ssh_private_key)
+        server = Server(
+            name=data.name,
+            connection_type="ssh",
+            hostname=data.hostname,
+            ssh_port=data.ssh_port,
+            ssh_user=data.ssh_user,
+            ssh_private_key_encrypted=encrypted_key,
+            description=data.description,
+            is_active=True,
+            created_by=user.id,
+        )
+
     session.add(server)
     await session.flush()
 
@@ -915,7 +939,7 @@ async def delete_server(
 
 
 async def test_connection(session: AsyncSession, server_id: int) -> dict[str, Any]:
-    """Test SSH connectivity to a server without persisting the result.
+    """Test transport connectivity to a server without persisting the result.
 
     1. Retrieve server.
     2. Attempt transport.check_reachable with timeout.
@@ -934,6 +958,7 @@ async def test_connection(session: AsyncSession, server_id: int) -> dict[str, An
     server = await get_server(session, server_id)
     tested_at = datetime.now(timezone.utc)
 
+    transport_label = "SSM" if server.connection_type == "ssm" else "SSH"
     try:
         await get_transport(server).check_reachable(timeout=SSH_CONNECT_TIMEOUT)
 
@@ -946,7 +971,7 @@ async def test_connection(session: AsyncSession, server_id: int) -> dict[str, An
             "server_id": server.id,
             "server_name": server.name,
             "success": True,
-            "message": "SSH connection successful",
+            "message": f"{transport_label} connection successful",
             "tested_at": tested_at,
         }
     except TransportError as exc:
@@ -964,7 +989,7 @@ async def test_connection(session: AsyncSession, server_id: int) -> dict[str, An
             "server_id": server.id,
             "server_name": server.name,
             "success": False,
-            "message": f"SSH connection failed: {exc}",
+            "message": f"{transport_label} connection failed: {exc}",
             "tested_at": tested_at,
         }
     except Exception as exc:
@@ -988,7 +1013,7 @@ async def test_connection(session: AsyncSession, server_id: int) -> dict[str, An
 
 
 async def check_status(session: AsyncSession, server_id: int) -> dict[str, Any]:
-    """Check SSH connectivity and persist the result to the database.
+    """Check transport connectivity and persist the result to the database.
 
     Same as test_connection but additionally updates last_check_at and
     last_check_status on the server record.
@@ -1006,16 +1031,17 @@ async def check_status(session: AsyncSession, server_id: int) -> dict[str, Any]:
     server = await get_server(session, server_id)
     checked_at = datetime.now(timezone.utc)
 
+    transport_label = "SSM" if server.connection_type == "ssm" else "SSH"
     try:
         await get_transport(server).check_reachable(timeout=SSH_CONNECT_TIMEOUT)
         status = "reachable"
-        message = "SSH connection successful"
+        message = f"{transport_label} connection successful"
         success = True
         logger.info("server_check_status_reachable", server_id=server.id, name=server.name)
 
     except TransportError as exc:
         status = "unreachable"
-        message = f"SSH connection failed: {exc}"
+        message = f"{transport_label} connection failed: {exc}"
         success = False
         logger.warning(
             "server_check_status_unreachable",

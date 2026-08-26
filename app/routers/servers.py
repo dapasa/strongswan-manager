@@ -140,14 +140,14 @@ async def delete_server(
 @router.post(
     "/{server_id}/test",
     response_model=ServerTestResult,
-    summary="Test SSH connection",
+    summary="Test server connection",
 )
 async def test_server_connection(
     server_id: int,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_operator),
 ) -> ServerTestResult:
-    """Test SSH connectivity to a server. Does not persist the result."""
+    """Test transport connectivity to a server (SSH or SSM). Does not persist the result."""
     result = await server_service.test_connection(db, server_id)
     return ServerTestResult(**result)
 
@@ -162,6 +162,6 @@ async def check_server_status(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_operator),
 ) -> ServerStatusResult:
-    """Check SSH connectivity and persist the result to the database."""
+    """Check transport connectivity (SSH or SSM) and persist the result to the database."""
     result = await server_service.check_status(db, server_id)
     return ServerStatusResult(**result)

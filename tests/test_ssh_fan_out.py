@@ -116,7 +116,7 @@ class TestExecuteCommand:
             result = await execute_command(session, server_id=1, commands=["echo ok"])
 
         assert result.success is False
-        assert "SSH error" in result.error
+        assert "Transport error" in result.error
         assert result.server_id == 1
 
     @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
