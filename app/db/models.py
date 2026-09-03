@@ -23,7 +23,12 @@ from app.db.base import Base, SoftDeleteMixin, TimestampMixin
 
 
 class User(TimestampMixin, Base):
-    """OIDC-authenticated user with RBAC role."""
+    """Authenticated user with RBAC role.
+
+    In local auth mode (AUTH_MODE=local), ``sub`` is set to ``"local:<email>"``
+    and ``password_hash`` stores the bcrypt hash.  In OIDC mode, ``sub`` comes
+    from the IdP and ``password_hash`` is NULL.
+    """
 
     __tablename__ = "users"
 
@@ -34,6 +39,7 @@ class User(TimestampMixin, Base):
     role: Mapped[str] = mapped_column(Text, nullable=False, server_default="viewer")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Relationships
     tunnels: Mapped[list[Tunnel]] = relationship(back_populates="creator", lazy="noload")

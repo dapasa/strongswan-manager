@@ -31,9 +31,6 @@ services:
   frontend:
     build:
       context: ./frontend
-      args:
-        VITE_OIDC_AUTHORITY: ${VITE_OIDC_AUTHORITY}
-        VITE_OIDC_CLIENT_ID: ${VITE_OIDC_CLIENT_ID}
     depends_on:
       - app
     ports:

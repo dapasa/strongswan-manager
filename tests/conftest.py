@@ -6,6 +6,17 @@ INET, CIDR, ARRAY, JSONB). Schema tests are pure Pydantic and need no DB.
 
 from __future__ import annotations
 
+# Load test-specific environment variables BEFORE any app module imports so
+# that pydantic-settings picks them up when get_settings() is first called.
+import os
+from pathlib import Path
+
+_env_test = Path(__file__).parent.parent / ".env.test"
+if _env_test.exists():
+    from dotenv import dotenv_values
+    for _k, _v in dotenv_values(str(_env_test)).items():
+        os.environ.setdefault(_k, _v)
+
 from collections.abc import AsyncGenerator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
