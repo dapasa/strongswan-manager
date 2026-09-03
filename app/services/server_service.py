@@ -819,6 +819,11 @@ async def create_server(
     )
 
     await session.commit()
+    # Refresh to load server-generated columns (created_at, updated_at) that
+    # were set via server_default/onupdate SQL expressions. Without this,
+    # accessing those attributes after commit triggers a lazy-load in async
+    # context and raises MissingGreenlet.
+    await session.refresh(server)
     logger.info("server_created", server_id=server.id, name=server.name)
     return server
 
@@ -896,6 +901,11 @@ async def update_server(
     )
 
     await session.commit()
+    # Refresh to eagerly load updated_at after the UPDATE statement.
+    # onupdate=func.now() marks the column as expired post-flush; without this
+    # refresh Pydantic's model_validate triggers a lazy-load that raises
+    # MissingGreenlet in the async context.
+    await session.refresh(server)
     logger.info("server_updated", server_id=server.id, name=server.name)
     return server
 
