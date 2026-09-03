@@ -325,7 +325,7 @@ class SsmTransport(NodeTransport):
                 loop.run_in_executor(
                     None,
                     lambda: ssm.describe_instance_information(
-                        Filters=[{"Key": "InstanceIds", "ValueSet": [instance_id]}]
+                        Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
                     ),
                 ),
                 timeout=timeout,
