@@ -39,6 +39,44 @@ def _remote_secrets_path(name: str) -> str:
     return f"{get_settings().vpn_secrets_dir}/{name}.secrets"
 
 
+def _classify_unexpected_error(exc: Exception) -> str:
+    """Map an unexpected exception to a user-facing error family message.
+
+    The goal is that whoever reads the message knows *who to call*, not the
+    technical root cause.  Internal details stay in the structured log.
+
+    Families:
+    - credentials/IAM   → infra/ops team
+    - permissions       → infra/ops team
+    - timeout           → network or security-group rules
+    - unreachable       → server availability or network
+    - fallback          → check server logs (developer)
+    """
+    type_name = type(exc).__qualname__
+    msg = str(exc).lower()
+
+    # boto3/botocore credential errors — e.g. NoCredentialsError, CredentialRetrievalError,
+    # "Unable to locate credentials" message from the metadata endpoint.
+    credential_types = ("NoCredentialsError", "CredentialRetrievalError", "NoRegionError")
+    if any(t in type_name for t in credential_types) or "unable to locate credentials" in msg:
+        return "AWS credentials unavailable — check the IAM role or instance profile"
+
+    # AWS authorization errors surfaced via ClientError
+    if "accessdenied" in msg or "not authorized" in msg or "unauthorizedoperation" in msg:
+        return "Permission denied — check the IAM policy attached to this server"
+
+    # Timeouts (asyncio, socket, or SSM)
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in msg:
+        return "Connection timed out — check network path or security-group rules"
+
+    # Unreachable / refused
+    if any(token in msg for token in ("refused", "unreachable", "no route", "network is")):
+        return "Host unreachable — check network path or server status"
+
+    # Anything else: direct to server logs without leaking internals
+    return "Unexpected internal error — check server logs for details"
+
+
 async def execute_command(
     session: AsyncSession,
     server_id: int,
@@ -100,7 +138,9 @@ async def execute_command(
             "server_execute_command_unexpected",
             server_id=server.id,
             name=server.name,
+            exc_type=type(exc).__name__,
             error=str(exc),
+            exc_info=True,
         )
         return ServerResult(
             server_id=server.id,
@@ -247,7 +287,9 @@ async def sftp_push_tunnel_config(
             server_id=server.id,
             name=server.name,
             tunnel=name,
+            exc_type=type(exc).__name__,
             error=str(exc),
+            exc_info=True,
         )
         return ServerResult(
             server_id=server.id,
@@ -316,7 +358,9 @@ async def sftp_delete_tunnel_config(
             server_id=server.id,
             name=server.name,
             tunnel=name,
+            exc_type=type(exc).__name__,
             error=str(exc),
+            exc_info=True,
         )
         return ServerResult(
             server_id=server.id,
@@ -412,7 +456,9 @@ async def _sftp_rename_on_server(
             name=server.name,
             old_tunnel=old_name,
             new_tunnel=new_name,
+            exc_type=type(exc).__name__,
             error=str(exc),
+            exc_info=True,
         )
         return ServerResult(
             server_id=server.id,
@@ -1003,11 +1049,15 @@ async def test_connection(session: AsyncSession, server_id: int) -> dict[str, An
             "tested_at": tested_at,
         }
     except Exception as exc:
+        user_message = _classify_unexpected_error(exc)
         logger.error(
             "server_test_connection_unexpected",
             server_id=server.id,
             name=server.name,
+            connection_type=server.connection_type,
+            exc_type=type(exc).__name__,
             error=str(exc),
+            exc_info=True,
         )
         server.last_check_at = tested_at
         server.last_check_status = "unreachable"
@@ -1017,7 +1067,7 @@ async def test_connection(session: AsyncSession, server_id: int) -> dict[str, An
             "server_id": server.id,
             "server_name": server.name,
             "success": False,
-            "message": "Connection test failed unexpectedly",
+            "message": user_message,
             "tested_at": tested_at,
         }
 
@@ -1061,13 +1111,16 @@ async def check_status(session: AsyncSession, server_id: int) -> dict[str, Any]:
         )
     except Exception as exc:
         status = "unreachable"
-        message = "Status check failed unexpectedly"
+        message = _classify_unexpected_error(exc)
         success = False
         logger.error(
             "server_check_status_unexpected",
             server_id=server.id,
             name=server.name,
+            connection_type=server.connection_type,
+            exc_type=type(exc).__name__,
             error=str(exc),
+            exc_info=True,
         )
 
     # Persist status to database
