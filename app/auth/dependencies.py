@@ -9,7 +9,6 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.oidc import validate_token
 from app.config import get_settings
 from app.db.models import User
 from app.db.session import get_db
@@ -19,8 +18,8 @@ from app.logging_config import get_logger
 logger = get_logger(__name__)
 
 # OAuth2 scheme extracts Bearer token from Authorization header.
-# tokenUrl is a placeholder — actual OIDC flow happens externally via the SPA.
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+# tokenUrl is the local login endpoint; overridden by OIDC in oidc mode.
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token")
 
 # Role hierarchy: admin > operator > viewer
 _ROLE_HIERARCHY: dict[str, int] = {
@@ -29,51 +28,33 @@ _ROLE_HIERARCHY: dict[str, int] = {
     "admin": 2,
 }
 
-_DEV_BYPASS_TOKEN = "dev-bypass-token"
+
+async def _resolve_user_local(token: str, db: AsyncSession) -> User:
+    """Validate a local HS256 JWT and resolve to a User model instance."""
+    from app.auth.local import decode_access_token
+
+    payload = decode_access_token(token)
+
+    # Use primary-key uid claim for fast lookup; fall back to sub
+    user_id: int | None = payload.get("uid")
+    sub: str = payload["sub"]
+
+    if user_id is not None:
+        result = await db.execute(select(User).where(User.id == user_id))
+        user = result.scalar_one_or_none()
+    else:
+        result = await db.execute(select(User).where(User.sub == sub))
+        user = result.scalar_one_or_none()
+
+    if user is None:
+        raise AuthenticationError("User not found — token may reference a deleted account")
+
+    return user
 
 
-class _DevUser:
-    """Lightweight mock user for dev bypass. Quacks like User model."""
-
-    def __init__(self):
-        self.id = None
-        self.sub = "dev-bypass"
-        self.email = "dev@localhost"
-        self.display_name = "Dev Admin"
-        self.role = "admin"
-        self.is_active = True
-        self.last_login_at = None
-        self.created_at = datetime.now(timezone.utc)
-        self.updated_at = datetime.now(timezone.utc)
-
-
-def _build_dev_user():
-    """Build a mock admin user for local development (DEBUG only)."""
-    return _DevUser()
-
-
-async def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    db: AsyncSession = Depends(get_db),
-) -> User:
-    """Validate Bearer token and resolve to a User model instance.
-
-    - Extracts and validates the JWT via OIDC provider.
-    - Looks up user by ``sub`` claim.
-    - Auto-creates on first login with role='viewer', is_active=True.
-    - Syncs email and display_name from token claims on every login.
-    - Raises AuthenticationError if token is invalid.
-    - Raises AuthorizationError if user account is deactivated.
-
-    When ``settings.debug`` is True and the token is ``dev-bypass-token``,
-    JWT validation is skipped and a mock admin user is returned.
-    This MUST NEVER be enabled in production (DEBUG=false).
-    """
-    # --- Dev auth bypass (DEBUG mode only) ---
-    settings = get_settings()
-    if settings.debug and token == _DEV_BYPASS_TOKEN:
-        logger.warning("Dev auth bypass active — returning mock admin user")
-        return _build_dev_user()
+async def _resolve_user_oidc(token: str, db: AsyncSession) -> User:
+    """Validate an OIDC JWT and resolve (or auto-create) a User model instance."""
+    from app.auth.oidc import validate_token
 
     claims = await validate_token(token)
 
@@ -81,12 +62,10 @@ async def get_current_user(
     email: str = claims.get("email", "")
     display_name: str | None = claims.get("name") or claims.get("display_name")
 
-    # Look up existing user by OIDC subject
     result = await db.execute(select(User).where(User.sub == sub))
     user = result.scalar_one_or_none()
 
     if user is None:
-        # Auto-create on first login
         user = User(
             sub=sub,
             email=email,
@@ -96,18 +75,43 @@ async def get_current_user(
         )
         db.add(user)
         await db.flush()
-        logger.info("Auto-created user on first login", sub=sub, email=email)
+        logger.info("Auto-created user on first OIDC login", sub=sub, email=email)
 
-    # Check active status before allowing access
-    if not user.is_active:
-        raise AuthorizationError("User account is deactivated")
-
-    # Sync metadata from IdP and update last_login_at on every login
+    # Sync metadata from IdP on every login
     user.email = email
     if display_name is not None:
         user.display_name = display_name
     user.last_login_at = func.now()
     await db.flush()
+
+    return user
+
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """Validate Bearer token and resolve to a User model instance.
+
+    Dispatches to the local or OIDC path depending on ``AUTH_MODE``:
+
+    * ``local`` (default) — validates a locally-issued HS256 JWT and looks
+      up the user by primary key.
+    * ``oidc`` — validates an RS256 JWT from the configured external IdP and
+      auto-creates users on first login.
+
+    Raises :exc:`~app.exceptions.AuthenticationError` if the token is invalid.
+    Raises :exc:`~app.exceptions.AuthorizationError` if the account is inactive.
+    """
+    settings = get_settings()
+
+    if settings.auth_mode == "local":
+        user = await _resolve_user_local(token, db)
+    else:
+        user = await _resolve_user_oidc(token, db)
+
+    if not user.is_active:
+        raise AuthorizationError("User account is deactivated")
 
     return user
 

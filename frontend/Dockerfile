@@ -4,8 +4,6 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
-ARG VITE_OIDC_AUTHORITY
-ARG VITE_OIDC_CLIENT_ID
 RUN npm run build
 
 # Stage 2: Serve

@@ -1,147 +1,117 @@
 import { createContext, useContext, useEffect, useState, useCallback, useMemo } from 'react'
-import { useAuth as useOidcAuth } from 'react-oidc-context'
 import api, { setTokenGetter } from '@/services/api'
 
 const AuthContext = createContext(null)
 
-const isBypass = import.meta.env.VITE_AUTH_BYPASS === 'true'
+const TOKEN_KEY = 'vpnmanager_token'
 
 /**
- * Bypass provider used when VITE_AUTH_BYPASS=true.
- * Auto-authenticates as admin with no OIDC interaction.
- */
-function BypassProvider({ children }) {
-  const profile = useMemo(
-    () => ({
-      id: 0,
-      email: 'dev@localhost',
-      display_name: 'Dev Bypass',
-      role: 'admin',
-      is_active: true,
-    }),
-    [],
-  )
-
-  useEffect(() => {
-    setTokenGetter(() => 'dev-bypass-token')
-  }, [])
-
-  const noop = useCallback(() => {}, [])
-
-  const value = useMemo(
-    () => ({
-      user: profile,
-      role: 'admin',
-      isAuthenticated: true,
-      isLoading: false,
-      profileError: null,
-      login: noop,
-      logout: noop,
-    }),
-    [profile, noop],
-  )
-
-  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
-}
-
-/**
- * Real OIDC-backed provider.
+ * Local authentication provider.
  *
- * Wraps react-oidc-context and enriches it with the user profile
- * from our backend (GET /auth/me) which includes the app-specific role.
+ * Stores the JWT in localStorage and validates it on mount by calling
+ * GET /auth/me. Provides login(username, password) and logout().
  */
-function OidcProvider({ children }) {
-  const oidc = useOidcAuth()
-  const [profile, setProfile] = useState(null)
-  const [profileLoading, setProfileLoading] = useState(false)
+function LocalAuthProvider({ children }) {
+  const [user, setUser] = useState(null)
+  const [isLoading, setIsLoading] = useState(true)
   const [profileError, setProfileError] = useState(null)
 
-  // Wire token getter into Axios so every request gets the Bearer header
+  // Wire the stored token into every Axios request
   useEffect(() => {
-    setTokenGetter(() => oidc.user?.access_token ?? null)
-  }, [oidc.user])
+    setTokenGetter(() => localStorage.getItem(TOKEN_KEY))
+  }, [])
 
-  // Listen for auth:expired events dispatched by the Axios 401 interceptor
+  // Listen for 401 events from the Axios interceptor — clear session
   useEffect(() => {
     function handleExpired() {
-      oidc.signinRedirect()
+      localStorage.removeItem(TOKEN_KEY)
+      setUser(null)
+      setProfileError(new Error('Session expired. Please log in again.'))
     }
-
     window.addEventListener('auth:expired', handleExpired)
     return () => window.removeEventListener('auth:expired', handleExpired)
-  }, [oidc])
+  }, [])
 
-  // Fetch user profile (including role) from backend after OIDC authentication
+  // On mount: validate any stored token by fetching /auth/me
   useEffect(() => {
-    if (!oidc.isAuthenticated || !oidc.user?.access_token) {
-      setProfile(null)
+    const storedToken = localStorage.getItem(TOKEN_KEY)
+    if (!storedToken) {
+      setIsLoading(false)
       return
     }
 
     let cancelled = false
-    setProfileLoading(true)
-    setProfileError(null)
+    setIsLoading(true)
 
     api
       .get('/auth/me')
       .then((res) => {
-        if (!cancelled) setProfile(res.data)
+        if (!cancelled) {
+          setUser(res.data)
+          setProfileError(null)
+        }
       })
-      .catch((err) => {
-        if (!cancelled) setProfileError(err)
+      .catch(() => {
+        if (!cancelled) {
+          localStorage.removeItem(TOKEN_KEY)
+          setUser(null)
+        }
       })
       .finally(() => {
-        if (!cancelled) setProfileLoading(false)
+        if (!cancelled) setIsLoading(false)
       })
 
     return () => {
       cancelled = true
     }
-  }, [oidc.isAuthenticated, oidc.user?.access_token])
+  }, [])
 
-  const isAuthenticated = oidc.isAuthenticated
-  const isLoading = oidc.isLoading || profileLoading
+  const login = useCallback(async (username, password) => {
+    setProfileError(null)
+    const res = await api.post('/auth/token', { username, password })
+    const token = res.data.access_token
+    localStorage.setItem(TOKEN_KEY, token)
+    setTokenGetter(() => localStorage.getItem(TOKEN_KEY))
 
-  const login = useCallback(() => {
-    oidc.signinRedirect()
-  }, [oidc])
+    // Fetch profile after storing the token
+    const profileRes = await api.get('/auth/me')
+    setUser(profileRes.data)
+  }, [])
 
   const logout = useCallback(() => {
-    oidc.signoutRedirect()
-  }, [oidc])
+    localStorage.removeItem(TOKEN_KEY)
+    setUser(null)
+    setProfileError(null)
+  }, [])
 
   const value = useMemo(
     () => ({
-      /** User profile from GET /auth/me (id, email, display_name, role, is_active) */
-      user: profile,
+      /** User profile from GET /auth/me */
+      user,
       /** Convenience: user's role string (admin | operator | viewer) */
-      role: profile?.role ?? null,
-      /** Whether the user is fully authenticated (OIDC + profile loaded) */
-      isAuthenticated: isAuthenticated && profile !== null,
-      /** True while OIDC or profile request is in-flight */
+      role: user?.role ?? null,
+      /** Whether the user has a validated profile */
+      isAuthenticated: user !== null,
+      /** True while initial token validation is in-flight */
       isLoading,
-      /** Error from profile fetch, if any */
+      /** Error from last login or profile fetch */
       profileError,
-      /** Trigger OIDC login redirect */
+      /** login(username, password) — returns a Promise */
       login,
-      /** Trigger OIDC logout redirect */
+      /** Clear session */
       logout,
     }),
-    [profile, isAuthenticated, isLoading, profileError, login, logout],
+    [user, isLoading, profileError, login, logout],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
 
 /**
- * Main auth context provider — selects bypass or OIDC based on env.
+ * Main auth context provider.
  */
 export function AuthContextProvider({ children }) {
-  if (isBypass) {
-    return <BypassProvider>{children}</BypassProvider>
-  }
-
-  return <OidcProvider>{children}</OidcProvider>
+  return <LocalAuthProvider>{children}</LocalAuthProvider>
 }
 
 /**

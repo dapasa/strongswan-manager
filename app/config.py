@@ -23,9 +23,36 @@ class Settings(BaseSettings):
     db_pool_size: int = Field(default=5, ge=1, le=50)
     db_max_overflow: int = Field(default=10, ge=0, le=50)
 
-    # OIDC / Auth
-    oidc_issuer_url: str = Field(..., description="OIDC issuer URL (e.g., AWS IAM Identity Center)")
-    oidc_audience: str = Field(..., description="OIDC audience claim to validate")
+    # Auth mode
+    auth_mode: str = Field(
+        default="local",
+        description="Authentication mode: 'local' (username/password JWT) or 'oidc' (external IdP). "
+        "Default is 'local'. Set to 'oidc' when an external provider is configured.",
+    )
+
+    # Local JWT auth (required when auth_mode=local)
+    jwt_secret_key: str = Field(
+        default="",
+        description="Secret key for signing local JWTs. "
+        "REQUIRED when auth_mode=local — generate with: openssl rand -hex 32. "
+        "The app will refuse to start if this is empty and auth_mode=local.",
+    )
+    jwt_expire_minutes: int = Field(
+        default=480,
+        ge=5,
+        le=43200,
+        description="Local JWT lifetime in minutes (default 480 = 8 hours).",
+    )
+
+    # OIDC / Auth (required only when auth_mode=oidc)
+    oidc_issuer_url: str | None = Field(
+        default=None,
+        description="OIDC issuer URL (e.g., AWS IAM Identity Center). Required when auth_mode=oidc.",
+    )
+    oidc_audience: str | None = Field(
+        default=None,
+        description="OIDC audience claim to validate. Required when auth_mode=oidc.",
+    )
 
     # AWS / S3
     s3_bucket: str = Field(..., description="S3 bucket for StrongSwan config files")
@@ -103,6 +130,25 @@ class Settings(BaseSettings):
         if upper not in allowed:
             raise ValueError(f"log_level must be one of {allowed}")
         return upper
+
+    @field_validator("auth_mode")
+    @classmethod
+    def validate_auth_mode(cls, v: str) -> str:
+        allowed = {"local", "oidc"}
+        lower = v.lower()
+        if lower not in allowed:
+            raise ValueError(f"auth_mode must be one of {allowed}")
+        return lower
+
+    def __init__(self, **values):  # type: ignore[no-untyped-def]
+        super().__init__(**values)
+        if self.auth_mode == "local" and not self.jwt_secret_key:
+            raise ValueError(
+                "JWT_SECRET_KEY is required when AUTH_MODE=local. "
+                "Generate one with: openssl rand -hex 32"
+            )
+        if self.auth_mode == "oidc" and not self.oidc_issuer_url:
+            raise ValueError("OIDC_ISSUER_URL is required when AUTH_MODE=oidc")
 
     model_config = {
         "env_file": ".env",
