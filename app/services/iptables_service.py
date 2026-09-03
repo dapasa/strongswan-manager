@@ -232,6 +232,10 @@ async def create_rule(
     )
 
     await session.commit()
+    # Refresh to load server-generated columns (created_at, updated_at) that
+    # become expired after the flush. Without this the router's direct access
+    # to rule.updated_at raises MissingGreenlet in the async context.
+    await session.refresh(rule)
     return rule
 
 
@@ -345,6 +349,8 @@ async def update_rule(
     )
 
     await session.commit()
+    # Refresh to reload updated_at after onupdate=func.now() marks it expired.
+    await session.refresh(rule)
     return rule
 
 
@@ -418,6 +424,8 @@ async def retry_rule(
     )
 
     await session.commit()
+    # Refresh to reload updated_at after retry sets sync_status and commits.
+    await session.refresh(rule)
     return rule
 
 
