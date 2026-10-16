@@ -89,8 +89,18 @@ class TestRenderSwanctlConf:
         result = render_swanctl_conf(tunnel, "test-psk-value")
         assert "dpd_action = restart" in result
 
-    def test_no_stroke_leftsendcert(self, tunnel):
-        """leftsendcert has no swanctl equivalent — must not appear."""
+    def test_local_block_contains_send_cert_never(self, tunnel):
+        """leftsendcert=never maps to send_cert = never inside local { }."""
+        result = render_swanctl_conf(tunnel, "test-psk-value")
+        assert "send_cert = never" in result
+        # Verify it is inside the local { } block (appears after "local {" line)
+        local_pos = result.index("    local {")
+        local_close = result.index("    }", local_pos)
+        local_block = result[local_pos:local_close]
+        assert "send_cert = never" in local_block
+
+    def test_no_stroke_leftsendcert_literal(self, tunnel):
+        """The stroke attribute name leftsendcert must not appear verbatim."""
         result = render_swanctl_conf(tunnel, "test-psk-value")
         assert "leftsendcert" not in result
 

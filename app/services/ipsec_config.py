@@ -106,9 +106,11 @@ def render_swanctl_conf(tunnel: Tunnel, psk: str) -> str:
     up everything from a single file.
 
     Unmapped stroke fields (intentionally omitted):
-    - ``leftsendcert=never`` — no direct swanctl equivalent.
     - ``rekeymargin=3m`` — swanctl ``rand_rekey_time`` but not stored in the model.
     - ``dpdtimeout=150s`` — swanctl relies on IKEv2 retransmit; no direct mapping.
+
+    Mapped field note:
+    - ``leftsendcert=never`` maps to ``send_cert = never`` inside ``local { }``.  ✓
 
     Args:
         tunnel: The Tunnel model instance.
@@ -144,6 +146,7 @@ def render_swanctl_conf(tunnel: Tunnel, psk: str) -> str:
         "    local {",
         f"      id = {leftid}",
         "      auth = psk",
+        "      send_cert = never",
         "    }",
         "    remote {",
         "      id = %any",
