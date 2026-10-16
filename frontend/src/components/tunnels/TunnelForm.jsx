@@ -93,6 +93,12 @@ function buildSchema(mode) {
             )
             .optional()
             .default(''),
+    local_id: z.string().optional().default(''),
+    ike_lifetime: z
+      .string()
+      .transform((v) => (v === '' ? null : Number(v)))
+      .pipe(z.number().int().min(60, 'Must be at least 60 seconds').nullable())
+      .optional(),
     ike_proposals: z.string().optional().default(''),
     esp_proposals: z.string().optional().default(''),
     dpd_action: z.enum(['none', 'clear', 'restart']).optional().default('restart'),
@@ -156,6 +162,8 @@ export default function TunnelForm({ mode = 'create', tunnel }) {
       remote_cidrs: tunnel?.remote_cidrs?.map((c) => ({ value: c })) ?? [{ value: '' }],
       ike_version: tunnel?.ike_version ?? '2',
       psk: '',
+      local_id: tunnel?.local_id ?? '',
+      ike_lifetime: tunnel?.ike_lifetime != null ? String(tunnel.ike_lifetime) : '86400',
       ike_proposals: tunnel?.ike_proposals ?? '',
       esp_proposals: tunnel?.esp_proposals ?? '',
       dpd_action: tunnel?.dpd_action ?? 'restart',
@@ -177,6 +185,8 @@ export default function TunnelForm({ mode = 'create', tunnel }) {
       local_cidrs: values.local_cidrs.map((c) => c.value),
       remote_cidrs: values.remote_cidrs.map((c) => c.value),
       ike_version: values.ike_version,
+      local_id: values.local_id || null,
+      ike_lifetime: values.ike_lifetime ?? 86400,
       ike_proposals: values.ike_proposals || null,
       esp_proposals: values.esp_proposals || null,
       dpd_action: values.dpd_action,
@@ -390,6 +400,37 @@ export default function TunnelForm({ mode = 'create', tunnel }) {
         </CardHeader>
         {advancedOpen && (
           <CardContent className="space-y-4">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="local_id">Local Identity (optional)</Label>
+                <Input
+                  id="local_id"
+                  placeholder="e.g. 44.215.155.152"
+                  {...register('local_id')}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {"Node's public IP or FQDN used as IKE identity. Leave blank to let strongSwan use the source IP."}
+                </p>
+                {errors.local_id && (
+                  <p className="text-sm text-destructive">{errors.local_id.message}</p>
+                )}
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="ike_lifetime">IKE Lifetime (seconds)</Label>
+                <Input
+                  id="ike_lifetime"
+                  type="number"
+                  min={60}
+                  placeholder="86400"
+                  {...register('ike_lifetime')}
+                />
+                {errors.ike_lifetime && (
+                  <p className="text-sm text-destructive">{errors.ike_lifetime.message}</p>
+                )}
+              </div>
+            </div>
+
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div className="space-y-2">
                 <Label htmlFor="ike_proposals">IKE Proposals</Label>

@@ -26,6 +26,8 @@ class TunnelCreate(BaseModel):
     dpd_action: Literal["none", "clear", "restart"] = Field(default="restart", description="DPD action on timeout")
     dpd_delay: int = Field(default=30, ge=1, description="DPD delay in seconds")
     dpd_timeout: int = Field(default=150, ge=1, description="DPD timeout in seconds")
+    local_id: str | None = Field(None, description="Local IKE identity (e.g. node's EIP). Omit to let strongSwan use the source IP.")
+    ike_lifetime: int = Field(default=86400, ge=60, description="IKE SA lifetime in seconds")
 
 
 class TunnelUpdate(BaseModel):
@@ -44,6 +46,8 @@ class TunnelUpdate(BaseModel):
     dpd_delay: int | None = Field(None, ge=1)
     dpd_timeout: int | None = Field(None, ge=1)
     status: Literal["active", "inactive"] | None = None
+    local_id: str | None = None
+    ike_lifetime: int | None = Field(None, ge=60, description="IKE SA lifetime in seconds")
 
 
 class TunnelSummary(BaseModel):
@@ -77,6 +81,8 @@ class TunnelDetail(BaseModel):
     dpd_action: str
     dpd_delay: int
     dpd_timeout: int
+    local_id: str | None = None
+    ike_lifetime: int
     status: str
     sync_status: str
     sync_error: str | None = None

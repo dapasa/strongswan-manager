@@ -38,8 +38,23 @@ def _remote_conf_path(name: str) -> str:
 
 
 def _remote_secrets_path(name: str) -> str:
-    """Remote path for a tunnel's .secrets file on VPN servers."""
+    """Remote path for a tunnel's .secrets file on VPN servers (vpn_secrets_dir).
+
+    TODO: this function is no longer called by the active stroke path (which
+    now uses _remote_stroke_secrets_path) and can be removed in a cleanup pass.
+    It is kept here to avoid breaking any external callers that may reference it.
+    """
     return f"{get_settings().vpn_secrets_dir}/{name}.secrets"
+
+
+def _remote_stroke_secrets_path(name: str) -> str:
+    """Remote path for stroke tunnel secrets (included by /etc/ipsec.secrets).
+
+    Files live in vpn_stroke_secrets_dir (default /etc/ipsec.d/secrets/) and
+    are written with mode 0600.  The ipsec daemon's /etc/ipsec.secrets must
+    include this directory, e.g.: include /etc/ipsec.d/secrets/*.secrets
+    """
+    return f"{get_settings().vpn_stroke_secrets_dir}/{name}.secrets"
 
 
 def _classify_unexpected_error(exc: Exception) -> str:
@@ -254,7 +269,7 @@ async def sftp_push_tunnel_config(
     """
     effective_timeout = timeout if timeout is not None else get_settings().ssh_command_timeout
     conf_path = _remote_conf_path(name)
-    secrets_path = _remote_secrets_path(name)
+    stroke_secrets_path = _remote_stroke_secrets_path(name)
     transport = get_transport(server)
 
     async def _run() -> ServerResult:
@@ -263,10 +278,10 @@ async def sftp_push_tunnel_config(
             await transport.write_file(conf_path, swanctl_content, mode="600", make_dirs=True)
             await transport.execute([_LOAD_ALL])
         else:
-            # stroke: separate conf + secrets files
+            # stroke: separate conf + secrets files; secrets in /etc/ipsec.d/secrets/, mode 0600
             await transport.write_file(conf_path, conf_content, mode="644", make_dirs=True)
             if secrets_content is not None:
-                await transport.write_file(secrets_path, secrets_content, mode="640", make_dirs=True)
+                await transport.write_file(stroke_secrets_path, secrets_content, mode="600", make_dirs=True)
             await transport.execute([_IPSEC_RELOAD])
 
         logger.info("server_sftp_push_success", server_id=server.id, name=server.name, tunnel=name)
@@ -332,7 +347,7 @@ async def sftp_delete_tunnel_config(
     """
     effective_timeout = timeout if timeout is not None else get_settings().ssh_command_timeout
     conf_path = _remote_conf_path(name)
-    secrets_path = _remote_secrets_path(name)
+    stroke_secrets_path = _remote_stroke_secrets_path(name)
     transport = get_transport(server)
 
     async def _run() -> ServerResult:
@@ -343,7 +358,7 @@ async def sftp_delete_tunnel_config(
         else:
             # stroke: remove both conf and secrets files
             await transport.delete_file(conf_path)
-            await transport.delete_file(secrets_path)
+            await transport.delete_file(stroke_secrets_path)
             await transport.execute([_IPSEC_RELOAD])
 
         logger.info("server_sftp_delete_success", server_id=server.id, name=server.name, tunnel=name)
@@ -426,9 +441,9 @@ async def _sftp_rename_on_server(
     """
     effective_timeout = timeout if timeout is not None else get_settings().ssh_command_timeout
     old_conf = _remote_conf_path(old_name)
-    old_secrets = _remote_secrets_path(old_name)
+    old_stroke_secrets = _remote_stroke_secrets_path(old_name)
     new_conf = _remote_conf_path(new_name)
-    new_secrets = _remote_secrets_path(new_name)
+    new_stroke_secrets = _remote_stroke_secrets_path(new_name)
     transport = get_transport(server)
 
     async def _run() -> ServerResult:
@@ -438,9 +453,10 @@ async def _sftp_rename_on_server(
             await transport.execute([_LOAD_ALL])
         else:
             await transport.delete_file(old_conf)
-            await transport.delete_file(old_secrets)
+            await transport.delete_file(old_stroke_secrets)
             await transport.write_file(new_conf, conf_content, mode="644", make_dirs=True)
-            await transport.write_file(new_secrets, secrets_content, mode="640", make_dirs=True)
+            # stroke secrets in /etc/ipsec.d/secrets/, mode 0600
+            await transport.write_file(new_stroke_secrets, secrets_content, mode="600", make_dirs=True)
             await transport.execute([_IPSEC_RELOAD])
 
         logger.info(

@@ -41,10 +41,22 @@ def render_connection_conf(tunnel: Tunnel) -> str:
     local_cidrs = ",".join(str(c) for c in tunnel.local_cidrs)
     remote_cidrs = ",".join(str(c) for c in tunnel.remote_cidrs)
 
+    # Strict proposals: stroke requires '!' suffix to disable proposal negotiation.
+    # Strip any existing '!' first to avoid '!!'.
+    ike_strict = (tunnel.ike_proposals.rstrip("!") + "!") if tunnel.ike_proposals else None
+    esp_strict = (tunnel.esp_proposals.rstrip("!") + "!") if tunnel.esp_proposals else None
+
     lines = [
         f"conn {tunnel.name}",
         "    left=%any",
-        f"    leftid={str(tunnel.local_cidrs[0]).split('/')[0] if tunnel.local_cidrs else '%any'}",
+    ]
+
+    # leftid: use the explicit local identity if configured; omit otherwise so
+    # strongSwan defaults to the outgoing interface address.
+    if tunnel.local_id:
+        lines.append(f"    leftid={tunnel.local_id}")
+
+    lines.extend([
         f"    leftsubnet={local_cidrs}",
         "    leftauth=psk",
         "    leftsendcert=never",
@@ -52,13 +64,13 @@ def render_connection_conf(tunnel: Tunnel) -> str:
         "    rightid=%any",
         f"    rightsubnet={remote_cidrs}",
         "    rightauth=psk",
-    ]
+    ])
 
-    # IKE and ESP proposals
-    if tunnel.ike_proposals:
-        lines.append(f"    ike={tunnel.ike_proposals}")
-    if tunnel.esp_proposals:
-        lines.append(f"    esp={tunnel.esp_proposals}")
+    # IKE and ESP proposals (strict mode: '!' prevents fallback to other suites)
+    if ike_strict:
+        lines.append(f"    ike={ike_strict}")
+    if esp_strict:
+        lines.append(f"    esp={esp_strict}")
 
     lines.extend([
         "    authby=psk",
@@ -71,7 +83,7 @@ def render_connection_conf(tunnel: Tunnel) -> str:
         f"    dpdtimeout={tunnel.dpd_timeout}s",
         "    compress=no",
         f"    keyexchange=ikev{tunnel.ike_version}",
-        "    ikelifetime=86400s",
+        f"    ikelifetime={tunnel.ike_lifetime}s",
         "    keylife=3600s",
         "    rekeymargin=3m",
         "    keyingtries=%forever",
@@ -109,8 +121,12 @@ def render_swanctl_conf(tunnel: Tunnel, psk: str) -> str:
     - ``rekeymargin=3m`` — swanctl ``rand_rekey_time`` but not stored in the model.
     - ``dpdtimeout=150s`` — swanctl relies on IKEv2 retransmit; no direct mapping.
 
-    Mapped field note:
-    - ``leftsendcert=never`` maps to ``send_cert = never`` inside ``local { }``.  ✓
+    Mapped field notes:
+    - ``leftsendcert=never`` → ``send_cert = never`` inside ``local { }``.
+    - ``leftid`` → ``local { id = <local_id> }`` when local_id is set; omitted otherwise.
+    - ``ikelifetime`` → ``rekey_time`` on the IKE connection (swanctl controls IKE SA
+      lifetime via ``rekey_time`` at the connection level, not inside children).
+    - swanctl proposals are strict by default; no ``!`` suffix needed.
 
     Args:
         tunnel: The Tunnel model instance.
@@ -121,7 +137,6 @@ def render_swanctl_conf(tunnel: Tunnel, psk: str) -> str:
     """
     local_cidrs = ",".join(str(c) for c in tunnel.local_cidrs)
     remote_cidrs = ",".join(str(c) for c in tunnel.remote_cidrs)
-    leftid = str(tunnel.local_cidrs[0]).split("/")[0] if tunnel.local_cidrs else "%any"
 
     conn_lines = [
         "connections {",
@@ -132,23 +147,36 @@ def render_swanctl_conf(tunnel: Tunnel, psk: str) -> str:
         "    encap = yes",
         "    fragmentation = yes",
         "    mobike = no",
-        "    rekey_time = 86400s",
+        # swanctl: rekey_time on the IKE connection controls IKE SA lifetime
+        # (equivalent to stroke's ikelifetime)
+        f"    rekey_time = {tunnel.ike_lifetime}s",
         f"    dpd_delay = {tunnel.dpd_delay}s",
         "    rekey_attempts = 0",
         "    compress = no",
     ]
 
+    # swanctl proposals are strict by default; no '!' suffix needed
     if tunnel.ike_proposals:
         conn_lines.append(f"    proposals = {tunnel.ike_proposals}")
 
-    conn_lines.extend([
+    local_block = [
         "",
         "    local {",
-        f"      id = {leftid}",
+    ]
+    # local_id: use explicit identity when set; omit otherwise (strongSwan uses source IP)
+    if tunnel.local_id:
+        local_block.append(f"      id = {tunnel.local_id}")
+    local_block.extend([
         "      auth = psk",
         "      send_cert = never",
         "    }",
+    ])
+    conn_lines.extend(local_block)
+
+    conn_lines.extend([
         "    remote {",
+        # id = %any: wildcard selector — matches any IKE identity from the peer,
+        # which is correct for PSK matching where the remote identity is not fixed.
         "      id = %any",
         "      auth = psk",
         "    }",
