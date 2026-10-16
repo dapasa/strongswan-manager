@@ -22,6 +22,24 @@ from app.utils.fan_out import FanOutResult
 
 logger = get_logger(__name__)
 
+# Fields that affect the rendered IPsec config (both stroke and swanctl).
+# A PATCH touching any of these must trigger a full infrastructure sync.
+# Keep this in sync with render_connection_conf and render_swanctl_conf in ipsec_config.py.
+TUNNEL_RENDER_FIELDS: frozenset[str] = frozenset({
+    "name",
+    "peer_ip",
+    "local_cidrs",
+    "remote_cidrs",
+    "local_id",
+    "ike_version",
+    "ike_proposals",
+    "esp_proposals",
+    "dpd_action",
+    "dpd_delay",
+    "dpd_timeout",
+    "ike_lifetime",
+})
+
 
 def _tunnel_to_dict(tunnel: Tunnel) -> dict[str, Any]:
     """Serialize a Tunnel model to a dict suitable for audit JSONB storage."""
@@ -295,9 +313,7 @@ async def update_tunnel(
     old_name = tunnel.name
 
     # Determine if infra sync is needed
-    infra_fields = {"peer_ip", "local_cidrs", "remote_cidrs", "ike_version", "ike_proposals",
-                    "esp_proposals", "dpd_action", "dpd_delay", "dpd_timeout", "name"}
-    needs_sync = bool(infra_fields & set(update_data.keys())) or psk is not None
+    needs_sync = bool(TUNNEL_RENDER_FIELDS & set(update_data.keys())) or psk is not None
 
     # Apply updates to DB fields (excludes psk which is not in the model)
     for field, value in update_data.items():
