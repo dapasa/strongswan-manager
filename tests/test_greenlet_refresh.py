@@ -79,6 +79,7 @@ def _make_server_mock() -> MagicMock:
     s.created_by = 1
     s.created_at = _dt()
     s.updated_at = _dt()
+    s.ipsec_engine = "stroke"
     return s
 
 
@@ -505,6 +506,7 @@ class TestUpdateServerRouterResponse:
         server.created_by = 1
         server.created_at = now
         server.updated_at = now
+        server.ipsec_engine = "stroke"
 
         mock_user = MagicMock()
         mock_user.id = 1
@@ -567,6 +569,7 @@ class TestUpdateServerRouterResponse:
         server.created_by = 1
         server.created_at = now
         server.updated_at = now
+        server.ipsec_engine = "stroke"
 
         mock_user = MagicMock()
         mock_user.id = 1

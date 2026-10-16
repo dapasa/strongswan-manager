@@ -97,6 +97,89 @@ def render_secrets_file(tunnel: Tunnel, psk: str) -> str:
     return f'{tunnel.peer_ip} {left_ip} : PSK "{psk}"\n'
 
 
+def render_swanctl_conf(tunnel: Tunnel, psk: str) -> str:
+    """Render a swanctl conf.d file combining connections and secrets for one tunnel.
+
+    This produces a SINGLE file written to ``conf.d/<name>.conf`` with mode 0600.
+    The file contains both the ``connections { ... }`` block and the
+    ``secrets { ike-<name> { ... } }`` block so that ``swanctl --load-all`` picks
+    up everything from a single file.
+
+    Unmapped stroke fields (intentionally omitted):
+    - ``leftsendcert=never`` — no direct swanctl equivalent.
+    - ``rekeymargin=3m`` — swanctl ``rand_rekey_time`` but not stored in the model.
+    - ``dpdtimeout=150s`` — swanctl relies on IKEv2 retransmit; no direct mapping.
+
+    Args:
+        tunnel: The Tunnel model instance.
+        psk: The pre-shared key value.
+
+    Returns:
+        The rendered swanctl conf.d file content.
+    """
+    local_cidrs = ",".join(str(c) for c in tunnel.local_cidrs)
+    remote_cidrs = ",".join(str(c) for c in tunnel.remote_cidrs)
+    leftid = str(tunnel.local_cidrs[0]).split("/")[0] if tunnel.local_cidrs else "%any"
+
+    conn_lines = [
+        "connections {",
+        f"  {tunnel.name} {{",
+        f"    version = {tunnel.ike_version}",
+        "    local_addrs = %any",
+        f"    remote_addrs = {tunnel.peer_ip}",
+        "    encap = yes",
+        "    fragmentation = yes",
+        "    mobike = no",
+        "    rekey_time = 86400s",
+        f"    dpd_delay = {tunnel.dpd_delay}s",
+        "    rekey_attempts = 0",
+        "    compress = no",
+    ]
+
+    if tunnel.ike_proposals:
+        conn_lines.append(f"    proposals = {tunnel.ike_proposals}")
+
+    conn_lines.extend([
+        "",
+        "    local {",
+        f"      id = {leftid}",
+        "      auth = psk",
+        "    }",
+        "    remote {",
+        "      id = %any",
+        "      auth = psk",
+        "    }",
+        "    children {",
+        f"      {tunnel.name} {{",
+        f"        local_ts = {local_cidrs}",
+        f"        remote_ts = {remote_cidrs}",
+        f"        dpd_action = {tunnel.dpd_action}",
+        "        start_action = none",
+        "        rekey_time = 3600s",
+    ])
+
+    if tunnel.esp_proposals:
+        conn_lines.append(f"        esp_proposals = {tunnel.esp_proposals}")
+
+    conn_lines.extend([
+        "      }",
+        "    }",
+        "  }",
+        "}",
+    ])
+
+    secrets_lines = [
+        "secrets {",
+        f"  ike-{tunnel.name} {{",
+        "    id = %any",
+        f'    secret = "{psk}"',
+        "  }",
+        "}",
+    ]
+
+    return "\n".join(conn_lines + [""] + secrets_lines) + "\n"
+
+
 def _conf_key(name: str) -> str:
     """S3 key for a connection config file."""
     return f"connections/{name}.conf"
@@ -131,11 +214,15 @@ async def sync_tunnel_config(tunnel: Tunnel, psk: str, session: AsyncSession) ->
 
     conf_content = render_connection_conf(tunnel)
     secrets_content = render_secrets_file(tunnel, psk)
+    swanctl_content = render_swanctl_conf(tunnel, psk)
 
+    # S3 writes are unchanged (separate step).
     await s3.upload_file(_conf_key(tunnel.name), conf_content)
     await s3.upload_file(_secrets_key(tunnel.name), secrets_content)
 
-    result = await sftp_push_on_all_servers(session, tunnel.name, conf_content, secrets_content)
+    result = await sftp_push_on_all_servers(
+        session, tunnel.name, conf_content, secrets_content, swanctl_content=swanctl_content
+    )
 
     logger.info("ipsec_sync_complete", tunnel=tunnel.name)
     return result
@@ -195,10 +282,14 @@ async def rename_tunnel_config(
 
     conf_content = render_connection_conf(tunnel)
     secrets_content = render_secrets_file(tunnel, psk)
+    swanctl_content = render_swanctl_conf(tunnel, psk)
     await s3.upload_file(_conf_key(tunnel.name), conf_content)
     await s3.upload_file(_secrets_key(tunnel.name), secrets_content)
 
-    result = await sftp_rename_on_all_servers(session, old_name, tunnel.name, conf_content, secrets_content)
+    result = await sftp_rename_on_all_servers(
+        session, old_name, tunnel.name, conf_content, secrets_content,
+        swanctl_content=swanctl_content
+    )
 
     logger.info("ipsec_rename_complete", old_name=old_name, new_name=tunnel.name)
     return result

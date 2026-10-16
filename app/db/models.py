@@ -209,6 +209,8 @@ class Server(TimestampMixin, SoftDeleteMixin, Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     # Transport selector — editable after creation
     connection_type: Mapped[str] = mapped_column(Text, nullable=False, server_default="ssh")
+    # IPsec engine: 'stroke' (legacy ipsec daemon) or 'swanctl' (vici-based)
+    ipsec_engine: Mapped[str] = mapped_column(Text, nullable=False, server_default="stroke")
     # SSH transport fields (nullable for SSM servers)
     hostname: Mapped[str | None] = mapped_column(Text, nullable=True)
     ssh_port: Mapped[int | None] = mapped_column(Integer, nullable=True, server_default=text("22"))
@@ -237,6 +239,10 @@ class Server(TimestampMixin, SoftDeleteMixin, Base):
         CheckConstraint(
             "connection_type IN ('ssh', 'ssm')",
             name="ck_servers_connection_type",
+        ),
+        CheckConstraint(
+            "ipsec_engine IN ('swanctl', 'stroke')",
+            name="ck_servers_ipsec_engine",
         ),
         CheckConstraint(
             "ec2_instance_id IS NULL OR ec2_instance_id ~ '^i-[0-9a-f]{17}$'",

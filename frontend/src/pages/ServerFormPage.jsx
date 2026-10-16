@@ -25,6 +25,7 @@ function buildSchema(mode, editingKey) {
   return z
     .object({
       connection_type: z.enum(['ssh', 'ssm']),
+      ipsec_engine: z.enum(['stroke', 'swanctl']),
       name: z.string().min(1, 'Name is required').max(255, 'Name must be 255 characters or less'),
       description: z.string().optional().default(''),
       // SSH fields
@@ -101,6 +102,7 @@ export default function ServerFormPage({ mode = 'create' }) {
     resolver: zodResolver(schema),
     defaultValues: {
       connection_type: 'ssh',
+      ipsec_engine: 'stroke',
       name: '',
       description: '',
       hostname: '',
@@ -113,6 +115,7 @@ export default function ServerFormPage({ mode = 'create' }) {
     },
     values: isEdit && server.data ? {
       connection_type: server.data.connection_type ?? 'ssh',
+      ipsec_engine: server.data.ipsec_engine ?? 'stroke',
       name: server.data.name ?? '',
       description: server.data.description ?? '',
       hostname: server.data.hostname ?? '',
@@ -142,6 +145,7 @@ export default function ServerFormPage({ mode = 'create' }) {
   async function onSubmit(values) {
     let payload = {
       connection_type: values.connection_type,
+      ipsec_engine: values.ipsec_engine,
       name: values.name,
       description: values.description || null,
     }
@@ -265,6 +269,29 @@ export default function ServerFormPage({ mode = 'create' }) {
                 />
                 {errors.connection_type && (
                   <p className="text-sm text-destructive">{errors.connection_type.message}</p>
+                )}
+              </div>
+
+              {/* IPsec engine selector */}
+              <div className="space-y-2">
+                <Label htmlFor="ipsec_engine">IPsec Engine *</Label>
+                <Controller
+                  name="ipsec_engine"
+                  control={control}
+                  render={({ field }) => (
+                    <Select value={field.value} onValueChange={field.onChange}>
+                      <SelectTrigger id="ipsec_engine">
+                        <SelectValue placeholder="Select IPsec engine" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="stroke">Stroke — legacy ipsec daemon</SelectItem>
+                        <SelectItem value="swanctl">Swanctl — vici-based daemon</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  )}
+                />
+                {errors.ipsec_engine && (
+                  <p className="text-sm text-destructive">{errors.ipsec_engine.message}</p>
                 )}
               </div>
 
