@@ -28,6 +28,9 @@ class ServerCreate(BaseModel):
     connection_type: Literal["ssh", "ssm"] = Field(
         default="ssh", description="Transport type: 'ssh' or 'ssm'"
     )
+    ipsec_engine: Literal["swanctl", "stroke"] = Field(
+        default="stroke", description="IPsec engine: 'swanctl' (vici-based) or 'stroke' (legacy)"
+    )
     description: str | None = None
 
     # SSH fields
@@ -68,6 +71,7 @@ class ServerUpdate(BaseModel):
 
     name: str | None = Field(None, min_length=1, max_length=255)
     connection_type: Literal["ssh", "ssm"] | None = None
+    ipsec_engine: Literal["swanctl", "stroke"] | None = None
     description: str | None = None
     is_active: bool | None = None
 
@@ -94,6 +98,7 @@ class ServerSummary(BaseModel):
     id: int
     name: str
     connection_type: str
+    ipsec_engine: str
     # SSH fields (present only for ssh servers)
     hostname: str | None = None
     ssh_port: int | None = None

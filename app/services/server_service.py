@@ -28,6 +28,9 @@ SSH_CONNECT_TIMEOUT = 10
 # swanctl command to reload all connections after config push / delete
 _LOAD_ALL = "sudo /usr/sbin/swanctl --load-all"
 
+# stroke command to reload ipsec after config push / delete
+_IPSEC_RELOAD = "sudo ipsec reload"
+
 
 def _remote_conf_path(name: str) -> str:
     """Remote path for a tunnel's .conf file on VPN servers."""
@@ -224,9 +227,16 @@ async def sftp_push_tunnel_config(
     conf_content: str,
     secrets_content: str | None,
     *,
+    swanctl_content: str | None = None,
     timeout: int | None = None,
 ) -> ServerResult:
-    """Open SSH to server, write .conf (and optionally .secrets) via sudo tee, run swanctl --load-all.
+    """Open SSH to server, write config file(s) via sudo tee, then reload the IPsec daemon.
+
+    For swanctl servers: writes a single combined file (connections + secrets) to the conf
+    dir with mode 0600 and runs ``swanctl --load-all``.
+
+    For stroke servers: writes the .conf file (mode 644) and optionally the .secrets file
+    (mode 640) then runs ``ipsec reload``.
 
     Uses sudo tee instead of SFTP so that the SSH user does not need direct write access
     to the config directories — only sudo privileges for tee, chmod, and mkdir.
@@ -234,8 +244,9 @@ async def sftp_push_tunnel_config(
     Args:
         server: Target Server instance.
         name: Tunnel connection name (used to derive remote file paths).
-        conf_content: Content to write to the .conf file.
-        secrets_content: Content for the .secrets file, or None to skip writing it.
+        conf_content: Stroke-format .conf content (used for stroke servers).
+        secrets_content: Stroke-format .secrets content, or None to skip (stroke only).
+        swanctl_content: Combined swanctl conf.d file content (used for swanctl servers).
         timeout: Operation timeout in seconds. Defaults to ssh_command_timeout from settings.
 
     Returns:
@@ -247,12 +258,16 @@ async def sftp_push_tunnel_config(
     transport = get_transport(server)
 
     async def _run() -> ServerResult:
-        await transport.write_file(conf_path, conf_content, mode="644", make_dirs=True)
-
-        if secrets_content is not None:
-            await transport.write_file(secrets_path, secrets_content, mode="640", make_dirs=True)
-
-        await transport.execute([_LOAD_ALL])
+        if server.ipsec_engine == "swanctl" and swanctl_content is not None:
+            # swanctl: one file in conf.d, mode 0600, no secrets dir write
+            await transport.write_file(conf_path, swanctl_content, mode="600", make_dirs=True)
+            await transport.execute([_LOAD_ALL])
+        else:
+            # stroke: separate conf + secrets files
+            await transport.write_file(conf_path, conf_content, mode="644", make_dirs=True)
+            if secrets_content is not None:
+                await transport.write_file(secrets_path, secrets_content, mode="640", make_dirs=True)
+            await transport.execute([_IPSEC_RELOAD])
 
         logger.info("server_sftp_push_success", server_id=server.id, name=server.name, tunnel=name)
         return ServerResult(server_id=server.id, server_name=server.name, success=True)
@@ -321,9 +336,15 @@ async def sftp_delete_tunnel_config(
     transport = get_transport(server)
 
     async def _run() -> ServerResult:
-        await transport.delete_file(conf_path)
-        await transport.delete_file(secrets_path)
-        await transport.execute([_LOAD_ALL])
+        if server.ipsec_engine == "swanctl":
+            # swanctl: single file — delete only conf, no secrets dir entry
+            await transport.delete_file(conf_path)
+            await transport.execute([_LOAD_ALL])
+        else:
+            # stroke: remove both conf and secrets files
+            await transport.delete_file(conf_path)
+            await transport.delete_file(secrets_path)
+            await transport.execute([_IPSEC_RELOAD])
 
         logger.info("server_sftp_delete_success", server_id=server.id, name=server.name, tunnel=name)
         return ServerResult(server_id=server.id, server_name=server.name, success=True)
@@ -377,6 +398,7 @@ async def _sftp_rename_on_server(
     conf_content: str,
     secrets_content: str,
     *,
+    swanctl_content: str | None = None,
     timeout: int | None = None,
 ) -> ServerResult:
     """Delete old config files and push new ones via the transport layer.
@@ -384,12 +406,19 @@ async def _sftp_rename_on_server(
     Uses delete_file (idempotent) + write_file for the rename-and-rewrite
     pattern required when a tunnel connection name changes.
 
+    For swanctl servers: deletes the old single conf file, writes the new combined file
+    with mode 0600, runs swanctl --load-all.
+
+    For stroke servers: deletes old conf + secrets, writes new conf (644) + secrets (640),
+    runs ipsec reload.
+
     Args:
         server: Target Server instance.
         old_name: Previous tunnel name (files to delete).
         new_name: New tunnel name (files to write).
-        conf_content: Content for the new .conf file.
-        secrets_content: Content for the new .secrets file.
+        conf_content: Stroke-format .conf content (used for stroke servers).
+        secrets_content: Stroke-format .secrets content (stroke only).
+        swanctl_content: Combined swanctl file content (used for swanctl servers).
         timeout: Operation timeout in seconds. Defaults to ssh_command_timeout from settings.
 
     Returns:
@@ -403,11 +432,16 @@ async def _sftp_rename_on_server(
     transport = get_transport(server)
 
     async def _run() -> ServerResult:
-        await transport.delete_file(old_conf)
-        await transport.delete_file(old_secrets)
-        await transport.write_file(new_conf, conf_content, mode="644", make_dirs=True)
-        await transport.write_file(new_secrets, secrets_content, mode="640", make_dirs=True)
-        await transport.execute([_LOAD_ALL])
+        if server.ipsec_engine == "swanctl" and swanctl_content is not None:
+            await transport.delete_file(old_conf)
+            await transport.write_file(new_conf, swanctl_content, mode="600", make_dirs=True)
+            await transport.execute([_LOAD_ALL])
+        else:
+            await transport.delete_file(old_conf)
+            await transport.delete_file(old_secrets)
+            await transport.write_file(new_conf, conf_content, mode="644", make_dirs=True)
+            await transport.write_file(new_secrets, secrets_content, mode="640", make_dirs=True)
+            await transport.execute([_IPSEC_RELOAD])
 
         logger.info(
             "server_sftp_rename_success",
@@ -474,6 +508,7 @@ async def sftp_push_on_all_servers(
     conf_content: str,
     secrets_content: str | None,
     *,
+    swanctl_content: str | None = None,
     timeout: int | None = None,
 ) -> FanOutResult:
     """Fan-out sftp_push_tunnel_config to all active servers concurrently.
@@ -481,8 +516,9 @@ async def sftp_push_on_all_servers(
     Args:
         session: DB session for server discovery.
         name: Tunnel connection name.
-        conf_content: Content for the .conf file.
-        secrets_content: Content for the .secrets file, or None to push conf only.
+        conf_content: Stroke-format .conf content.
+        secrets_content: Stroke-format .secrets content, or None to push conf only.
+        swanctl_content: Combined swanctl file content for swanctl-engine servers.
         timeout: Per-server timeout in seconds.
 
     Returns:
@@ -502,7 +538,9 @@ async def sftp_push_on_all_servers(
         )
 
     tasks = [
-        sftp_push_tunnel_config(s, name, conf_content, secrets_content, timeout=timeout)
+        sftp_push_tunnel_config(
+            s, name, conf_content, secrets_content, swanctl_content=swanctl_content, timeout=timeout
+        )
         for s in servers
     ]
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
@@ -610,6 +648,7 @@ async def sftp_rename_on_all_servers(
     conf_content: str,
     secrets_content: str,
     *,
+    swanctl_content: str | None = None,
     timeout: int | None = None,
 ) -> FanOutResult:
     """Fan-out delete-old + push-new in a single SSH connection per server.
@@ -618,8 +657,9 @@ async def sftp_rename_on_all_servers(
         session: DB session for server discovery.
         old_name: Previous tunnel name (files to remove).
         new_name: New tunnel name (files to write).
-        conf_content: Content for the new .conf file.
-        secrets_content: Content for the new .secrets file.
+        conf_content: Stroke-format .conf content.
+        secrets_content: Stroke-format .secrets content.
+        swanctl_content: Combined swanctl file content for swanctl-engine servers.
         timeout: Per-server timeout in seconds.
 
     Returns:
@@ -639,7 +679,10 @@ async def sftp_rename_on_all_servers(
         )
 
     tasks = [
-        _sftp_rename_on_server(s, old_name, new_name, conf_content, secrets_content, timeout=timeout)
+        _sftp_rename_on_server(
+            s, old_name, new_name, conf_content, secrets_content,
+            swanctl_content=swanctl_content, timeout=timeout
+        )
         for s in servers
     ]
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
@@ -685,6 +728,7 @@ def _server_to_dict(server: Server) -> dict[str, Any]:
         "id": server.id,
         "name": server.name,
         "connection_type": server.connection_type,
+        "ipsec_engine": server.ipsec_engine,
         # SSH fields (None for SSM servers)
         "hostname": server.hostname,
         "ssh_port": server.ssh_port,
@@ -823,10 +867,13 @@ async def create_server(
 
     connection_type = getattr(data, "connection_type", "ssh") or "ssh"
 
+    ipsec_engine = getattr(data, "ipsec_engine", "stroke") or "stroke"
+
     if connection_type == "ssm":
         server = Server(
             name=data.name,
             connection_type="ssm",
+            ipsec_engine=ipsec_engine,
             ec2_instance_id=data.ec2_instance_id,
             aws_role_arn=getattr(data, "aws_role_arn", None),
             aws_region_override=getattr(data, "aws_region_override", None),
@@ -841,6 +888,7 @@ async def create_server(
         server = Server(
             name=data.name,
             connection_type="ssh",
+            ipsec_engine=ipsec_engine,
             hostname=data.hostname,
             ssh_port=data.ssh_port,
             ssh_user=data.ssh_user,

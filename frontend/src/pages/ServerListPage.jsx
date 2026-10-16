@@ -174,6 +174,7 @@ export default function ServerListPage() {
               <TableRow>
                 <TableHead>Name</TableHead>
                 <TableHead>Type</TableHead>
+                <TableHead>Engine</TableHead>
                 <TableHead>Connection</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Active</TableHead>
@@ -202,6 +203,18 @@ export default function ServerListPage() {
                       }
                     >
                       {server.connection_type?.toUpperCase() ?? 'SSH'}
+                    </Badge>
+                  </TableCell>
+                  <TableCell>
+                    <Badge
+                      variant="outline"
+                      className={
+                        server.ipsec_engine === 'swanctl'
+                          ? 'border-emerald-500/50 text-emerald-500'
+                          : 'border-amber-500/50 text-amber-500'
+                      }
+                    >
+                      {server.ipsec_engine?.toUpperCase() ?? 'STROKE'}
                     </Badge>
                   </TableCell>
                   <TableCell className="font-mono text-sm text-muted-foreground">

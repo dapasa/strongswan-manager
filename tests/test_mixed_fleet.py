@@ -25,11 +25,12 @@ from app.utils.fan_out import FanOutResult, ServerResult
 # ---------------------------------------------------------------------------
 
 
-def _make_ssh_server(id: int = 1, name: str = "ssh-node") -> MagicMock:
+def _make_ssh_server(id: int = 1, name: str = "ssh-node", ipsec_engine: str = "stroke") -> MagicMock:
     srv = MagicMock()
     srv.id = id
     srv.name = name
     srv.connection_type = "ssh"
+    srv.ipsec_engine = ipsec_engine
     srv.hostname = "10.0.0.1"
     srv.ssh_port = 22
     srv.ssh_user = "admin"
@@ -42,11 +43,12 @@ def _make_ssh_server(id: int = 1, name: str = "ssh-node") -> MagicMock:
     return srv
 
 
-def _make_ssm_server(id: int = 2, name: str = "ssm-node") -> MagicMock:
+def _make_ssm_server(id: int = 2, name: str = "ssm-node", ipsec_engine: str = "stroke") -> MagicMock:
     srv = MagicMock()
     srv.id = id
     srv.name = name
     srv.connection_type = "ssm"
+    srv.ipsec_engine = ipsec_engine
     srv.hostname = None
     srv.ssh_port = None
     srv.ssh_user = None
@@ -475,3 +477,77 @@ class TestSSMServerConnectivity:
         assert result["success"] is True
         assert result["status"] == "reachable"
         assert "SSM" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# Mixed-engine fleet: one swanctl server + one stroke server
+# ---------------------------------------------------------------------------
+
+
+class TestMixedEngineFleet:
+    """sftp_push_on_all_servers with one swanctl server + one stroke server."""
+
+    @pytest.mark.asyncio
+    @patch("app.services.server_service.get_settings")
+    async def test_mixed_engine_fanout_swanctl_and_stroke(self, mock_settings):
+        """Swanctl server gets mode 600 + swanctl content; stroke server gets mode 644/640 + ipsec reload."""
+        from app.services.server_service import sftp_push_on_all_servers
+
+        mock_settings.return_value = MagicMock(
+            ssh_command_timeout=30,
+            vpn_conf_dir="/etc/swanctl/conf.d",
+            vpn_secrets_dir="/etc/swanctl/secrets",
+        )
+
+        swanctl_server = _make_ssh_server(id=1, name="swanctl-node", ipsec_engine="swanctl")
+        stroke_server = _make_ssm_server(id=2, name="stroke-node", ipsec_engine="stroke")
+
+        write_calls: dict[int, list] = {1: [], 2: []}
+        execute_calls: dict[int, list] = {1: [], 2: []}
+
+        def _fake_get_transport(server):
+            t = MagicMock()
+
+            async def _write_file(path, content, *, mode="644", make_dirs=True):
+                write_calls[server.id].append({"path": path, "mode": mode, "content": content})
+
+            async def _execute(commands):
+                execute_calls[server.id].extend(commands)
+                return _ok_cmd_result()
+
+            t.write_file = _write_file
+            t.execute = _execute
+            return t
+
+        mock_session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = [swanctl_server, stroke_server]
+        mock_session.execute = AsyncMock(return_value=mock_result)
+
+        with patch("app.services.server_service.get_transport", side_effect=_fake_get_transport):
+            result = await sftp_push_on_all_servers(
+                mock_session,
+                name="vpn-tunnel",
+                conf_content="conn vpn-tunnel\n",
+                secrets_content="psk line\n",
+                swanctl_content="connections {\n  vpn-tunnel { }\n}\nsecrets {\n  ike-vpn-tunnel { }\n}\n",
+            )
+
+        assert result.total == 2
+        assert result.succeeded == 2
+        assert result.failed == 0
+
+        # Swanctl server: one write call with mode 600, containing both blocks
+        assert len(write_calls[1]) == 1
+        swanctl_write = write_calls[1][0]
+        assert swanctl_write["mode"] == "600"
+        assert "connections {" in swanctl_write["content"]
+        assert "secrets {" in swanctl_write["content"]
+        assert execute_calls[1] == ["sudo /usr/sbin/swanctl --load-all"]
+
+        # Stroke server: two write calls — mode 644 conf + mode 640 secrets
+        assert len(write_calls[2]) == 2
+        modes = [w["mode"] for w in write_calls[2]]
+        assert "644" in modes
+        assert "640" in modes
+        assert execute_calls[2] == ["sudo ipsec reload"]

@@ -51,6 +51,7 @@ def _make_mock_server(
     id: int = 1,
     name: str = "vpn-primary",
     connection_type: str = "ssh",
+    ipsec_engine: str = "stroke",
     hostname: str = "10.0.1.50",
     ssh_port: int = 22,
     ssh_user: str = "admin",
@@ -68,6 +69,7 @@ def _make_mock_server(
     server.id = id
     server.name = name
     server.connection_type = connection_type
+    server.ipsec_engine = ipsec_engine
     server.hostname = hostname
     server.ssh_port = ssh_port
     server.ssh_user = ssh_user
