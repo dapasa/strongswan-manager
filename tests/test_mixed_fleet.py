@@ -497,6 +497,7 @@ class TestMixedEngineFleet:
             ssh_command_timeout=30,
             vpn_conf_dir="/etc/swanctl/conf.d",
             vpn_secrets_dir="/etc/swanctl/secrets",
+            vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
         )
 
         swanctl_server = _make_ssh_server(id=1, name="swanctl-node", ipsec_engine="swanctl")
@@ -545,9 +546,9 @@ class TestMixedEngineFleet:
         assert "secrets {" in swanctl_write["content"]
         assert execute_calls[1] == ["sudo /usr/sbin/swanctl --load-all"]
 
-        # Stroke server: two write calls — mode 644 conf + mode 640 secrets
+        # Stroke server: two write calls — mode 644 conf + mode 600 secrets
         assert len(write_calls[2]) == 2
         modes = [w["mode"] for w in write_calls[2]]
         assert "644" in modes
-        assert "640" in modes
+        assert "600" in modes
         assert execute_calls[2] == ["sudo ipsec reload"]

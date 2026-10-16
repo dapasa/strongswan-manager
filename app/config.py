@@ -111,6 +111,14 @@ class Settings(BaseSettings):
         default="/opt/strongswan/config/secrets",
         description="Remote path to StrongSwan secrets directory on VPN servers",
     )
+    vpn_stroke_secrets_dir: str = Field(
+        default="/etc/ipsec.d/secrets",
+        description=(
+            "Remote path for stroke secrets files on VPN servers. "
+            "Must be included by /etc/ipsec.secrets (e.g. 'include /etc/ipsec.d/secrets/*.secrets'). "
+            "Files are written with mode 0600."
+        ),
+    )
 
     # CORS
     cors_origins: list[str] = Field(default=["http://localhost:3000"])

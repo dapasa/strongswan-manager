@@ -73,6 +73,12 @@ class Tunnel(TimestampMixin, SoftDeleteMixin, Base):
     sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     sync_details: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     psk_secret_name: Mapped[str] = mapped_column(Text, nullable=False)
+    # IKE identity for the local side (e.g. the node's EIP). When null,
+    # strongSwan uses the source IP automatically. Renders as leftid (stroke)
+    # or local { id = ... } (swanctl) — omitted entirely when null.
+    local_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # IKE SA lifetime in seconds. Hardcoded as 86400 previously; now configurable.
+    ike_lifetime: Mapped[int] = mapped_column(Integer, server_default=text("86400"))
     created_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
 
     # Relationships

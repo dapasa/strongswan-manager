@@ -93,6 +93,7 @@ class TestSftpPushTunnelConfig:
             ssh_command_timeout=30,
             vpn_conf_dir="/opt/strongswan/config/connections",
             vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
         )
         mock_decrypt.return_value = "raw-key"
         mock_import_key.return_value = MagicMock()
@@ -122,9 +123,9 @@ class TestSftpPushTunnelConfig:
         assert calls[0] == "sudo mkdir -p /opt/strongswan/config/connections"
         assert calls[1] == "sudo tee /opt/strongswan/config/connections/my-tunnel.conf"
         assert calls[2] == "sudo chmod 644 /opt/strongswan/config/connections/my-tunnel.conf"
-        assert calls[3] == "sudo mkdir -p /opt/strongswan/config/secrets"
-        assert calls[4] == "sudo tee /opt/strongswan/config/secrets/my-tunnel.secrets"
-        assert calls[5] == "sudo chmod 640 /opt/strongswan/config/secrets/my-tunnel.secrets"
+        assert calls[3] == "sudo mkdir -p /etc/ipsec.d/secrets"
+        assert calls[4] == "sudo tee /etc/ipsec.d/secrets/my-tunnel.secrets"
+        assert calls[5] == "sudo chmod 600 /etc/ipsec.d/secrets/my-tunnel.secrets"
         assert calls[6] == "sudo ipsec reload"
 
         # Verify file content was piped via input=
@@ -146,6 +147,7 @@ class TestSftpPushTunnelConfig:
             ssh_command_timeout=30,
             vpn_conf_dir="/opt/strongswan/config/connections",
             vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
         )
         mock_decrypt.return_value = "raw-key"
         mock_import_key.return_value = MagicMock()
@@ -190,6 +192,7 @@ class TestSftpPushTunnelConfig:
             ssh_command_timeout=30,
             vpn_conf_dir="/opt/strongswan/config/connections",
             vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
         )
         mock_decrypt.return_value = "raw-key"
         mock_import_key.return_value = MagicMock()
@@ -225,6 +228,7 @@ class TestSftpPushTunnelConfig:
             ssh_command_timeout=30,
             vpn_conf_dir="/opt/strongswan/config/connections",
             vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
         )
         mock_decrypt.return_value = "raw-key"
         mock_import_key.return_value = MagicMock()
@@ -272,6 +276,7 @@ class TestSftpDeleteTunnelConfig:
             ssh_command_timeout=30,
             vpn_conf_dir="/opt/strongswan/config/connections",
             vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
         )
         mock_decrypt.return_value = "raw-key"
         mock_import_key.return_value = MagicMock()
@@ -290,7 +295,7 @@ class TestSftpDeleteTunnelConfig:
 
         calls = [c.args[0] for c in mock_conn.run.call_args_list]
         assert calls[0] == "sudo rm -f /opt/strongswan/config/connections/my-tunnel.conf"
-        assert calls[1] == "sudo rm -f /opt/strongswan/config/secrets/my-tunnel.secrets"
+        assert calls[1] == "sudo rm -f /etc/ipsec.d/secrets/my-tunnel.secrets"
         assert calls[2] == "sudo ipsec reload"
 
     @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
@@ -306,6 +311,7 @@ class TestSftpDeleteTunnelConfig:
             ssh_command_timeout=30,
             vpn_conf_dir="/opt/strongswan/config/connections",
             vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
         )
         mock_decrypt.return_value = "raw-key"
         mock_import_key.return_value = MagicMock()
@@ -533,20 +539,21 @@ class TestStrokeServerPush:
     async def test_stroke_server_writes_two_files_and_reloads_ipsec(
         self, mock_settings, mock_decrypt, mock_import_key
     ):
-        """Stroke server writes conf (mode 644) + secrets (mode 640), then ipsec reload."""
+        """Stroke server writes conf (mode 644) + secrets (mode 600), then ipsec reload."""
         from app.services.server_service import sftp_push_tunnel_config
 
         mock_settings.return_value = MagicMock(
             ssh_command_timeout=30,
             vpn_conf_dir="/etc/ipsec.d/connections",
-            vpn_secrets_dir="/etc/ipsec.d/secrets",
+            vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
         )
         mock_decrypt.return_value = "raw-key"
         mock_import_key.return_value = MagicMock()
 
         server = _make_server(ipsec_engine="stroke")
         ok = _make_run_result()
-        # mkdir conf, tee conf, chmod 644 conf, mkdir secrets, tee secrets, chmod 640 secrets, ipsec reload
+        # mkdir conf, tee conf, chmod 644 conf, mkdir secrets, tee secrets, chmod 600 secrets, ipsec reload
         mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok, ok, ok, ok])
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
@@ -562,7 +569,7 @@ class TestStrokeServerPush:
         assert mock_conn.run.call_count == 7
         calls = [c.args[0] for c in mock_conn.run.call_args_list]
         assert calls[2] == "sudo chmod 644 /etc/ipsec.d/connections/vpn-prod.conf"
-        assert calls[5] == "sudo chmod 640 /etc/ipsec.d/secrets/vpn-prod.secrets"
+        assert calls[5] == "sudo chmod 600 /etc/ipsec.d/secrets/vpn-prod.secrets"
         assert calls[6] == "sudo ipsec reload"
         # No swanctl command
         assert not any("swanctl" in c for c in calls)
@@ -711,6 +718,7 @@ class TestReloadCommandByEngine:
             ssh_command_timeout=30,
             vpn_conf_dir="/opt/strongswan/config/connections",
             vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
         )
         mock_decrypt.return_value = "raw-key"
         mock_import_key.return_value = MagicMock()
@@ -731,3 +739,112 @@ class TestReloadCommandByEngine:
         calls = [c.args[0] for c in mock_conn.run.call_args_list]
         assert calls[-1] == "sudo ipsec reload"
         assert not any("swanctl" in c for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# Stroke secrets path — vpn_stroke_secrets_dir + mode 0600
+# ---------------------------------------------------------------------------
+
+
+class TestStrokeSecretsPath:
+    """Verify stroke secrets use vpn_stroke_secrets_dir at mode 600."""
+
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
+    @patch("app.services.server_service.get_settings")
+    async def test_stroke_secrets_path_uses_stroke_secrets_dir(
+        self, mock_settings, mock_decrypt, mock_import_key
+    ):
+        """Stroke secrets go to vpn_stroke_secrets_dir, not vpn_secrets_dir."""
+        from app.services.server_service import sftp_push_tunnel_config
+
+        mock_settings.return_value = MagicMock(
+            ssh_command_timeout=30,
+            vpn_conf_dir="/etc/ipsec.d/conns",
+            vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
+        )
+        mock_decrypt.return_value = "raw-key"
+        mock_import_key.return_value = MagicMock()
+
+        server = _make_server(ipsec_engine="stroke")
+        ok = _make_run_result()
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok, ok, ok, ok])
+
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
+            await sftp_push_tunnel_config(
+                server,
+                name="my-tunnel",
+                conf_content="conn my-tunnel\n",
+                secrets_content="psk-line\n",
+            )
+
+        calls = [c.args[0] for c in mock_conn.run.call_args_list]
+        # Secrets must go to stroke dir, not legacy secrets dir
+        assert any("/etc/ipsec.d/secrets/my-tunnel.secrets" in c for c in calls)
+        assert not any("/opt/strongswan/config/secrets" in c for c in calls)
+
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
+    @patch("app.services.server_service.get_settings")
+    async def test_stroke_secrets_mode_is_600(
+        self, mock_settings, mock_decrypt, mock_import_key
+    ):
+        """Stroke secrets file is written with mode 600, not 640."""
+        from app.services.server_service import sftp_push_tunnel_config
+
+        mock_settings.return_value = MagicMock(
+            ssh_command_timeout=30,
+            vpn_conf_dir="/etc/ipsec.d/conns",
+            vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
+        )
+        mock_decrypt.return_value = "raw-key"
+        mock_import_key.return_value = MagicMock()
+
+        server = _make_server(ipsec_engine="stroke")
+        ok = _make_run_result()
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok, ok, ok, ok])
+
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
+            await sftp_push_tunnel_config(
+                server,
+                name="my-tunnel",
+                conf_content="conn my-tunnel\n",
+                secrets_content="psk-line\n",
+            )
+
+        calls = [c.args[0] for c in mock_conn.run.call_args_list]
+        chmod_secrets = next(c for c in calls if "chmod" in c and "secrets" in c)
+        assert "chmod 600" in chmod_secrets
+        assert "640" not in chmod_secrets
+
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
+    @patch("app.services.server_service.get_settings")
+    async def test_stroke_delete_uses_stroke_secrets_dir(
+        self, mock_settings, mock_decrypt, mock_import_key
+    ):
+        """Stroke delete removes secrets from vpn_stroke_secrets_dir."""
+        from app.services.server_service import sftp_delete_tunnel_config
+
+        mock_settings.return_value = MagicMock(
+            ssh_command_timeout=30,
+            vpn_conf_dir="/etc/ipsec.d/conns",
+            vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
+        )
+        mock_decrypt.return_value = "raw-key"
+        mock_import_key.return_value = MagicMock()
+
+        server = _make_server(ipsec_engine="stroke")
+        ok = _make_run_result()
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok])
+
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
+            await sftp_delete_tunnel_config(server, name="my-tunnel")
+
+        calls = [c.args[0] for c in mock_conn.run.call_args_list]
+        rm_secrets = next(c for c in calls if "rm -f" in c and "secrets" in c)
+        assert "/etc/ipsec.d/secrets/my-tunnel.secrets" in rm_secrets
+        assert "/opt/strongswan/config/secrets" not in rm_secrets
