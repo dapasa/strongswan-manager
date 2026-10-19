@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -11,10 +12,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.db.models import Server, User
+from app.db.models import Server, Tunnel, User
 from app.exceptions import ConflictError, InfrastructureError, NotFoundError
 from app.logging_config import get_logger
 from app.services import audit
+from app.services.locks import LOCK_IPSEC_CONFIG, require_lock
 from app.services.transport.base import TransportError
 from app.services.transport.factory import get_transport
 from app.utils.crypto import encrypt_ssh_key, validate_ssh_private_key
@@ -938,6 +940,147 @@ async def create_server(
     return server
 
 
+async def _repush_tunnels_on_engine_change(
+    server: Server,
+    old_engine: str,
+    session: AsyncSession,
+) -> None:
+    """Re-render and push all active tunnels to a server after its ipsec_engine changed.
+
+    Called from update_server when ipsec_engine transitions between "stroke" and "swanctl".
+    Must be called BEFORE session.commit() so that the IPSEC_CONFIG advisory lock is still held.
+
+    For each active tunnel:
+    1. Fetches the PSK from S3 (stroke-format secrets file: ``{peer_ip} {ip} : PSK "{psk}"``).
+    2. Renders the config for the NEW engine (determined by ``server.ipsec_engine``).
+    3. Pushes to this server only via ``sftp_push_tunnel_config``.
+    4. If old engine was ``stroke`` and new engine is ``swanctl``: deletes the orphaned
+       ``vpn_stroke_secrets_dir/{name}.secrets`` from the server after a successful push.
+
+    PSK values are never logged. Errors are logged per-tunnel; the loop continues on
+    individual failures so a single unreachable tunnel does not abort the whole batch.
+
+    Args:
+        server: Target Server instance (with the NEW ipsec_engine already applied).
+        old_engine: The previous ipsec_engine value ("stroke" or "swanctl").
+        session: Active database session.
+    """
+    # Local imports to break the circular dependency:
+    # server_service <- ipsec_config imports sftp_push_on_all_servers from server_service
+    from app.services import s3
+    from app.services.ipsec_config import (
+        render_connection_conf,
+        render_secrets_file,
+        render_swanctl_conf,
+    )
+
+    new_engine = server.ipsec_engine
+    logger.info(
+        "server_engine_repush_start",
+        server_id=server.id,
+        server_name=server.name,
+        old_engine=old_engine,
+        new_engine=new_engine,
+    )
+
+    result = await session.execute(
+        select(Tunnel).where(Tunnel.deleted_at.is_(None))
+    )
+    tunnels = result.scalars().all()
+
+    if not tunnels:
+        logger.info("server_engine_repush_no_tunnels", server_id=server.id)
+        return
+
+    for tunnel in tunnels:
+        try:
+            # Fetch PSK from S3 stroke-format: "{peer_ip} {left_ip} : PSK "{psk}""
+            secrets_s3 = await s3.download_file(f"secrets/{tunnel.name}.secrets")
+            m = re.search(r': PSK "(.+)"', secrets_s3)
+            if not m:
+                logger.error(
+                    "server_engine_repush_psk_parse_failed",
+                    server_id=server.id,
+                    tunnel=tunnel.name,
+                )
+                continue
+            psk = m.group(1)
+
+            conf_content = render_connection_conf(tunnel)
+            secrets_content = render_secrets_file(tunnel, psk)
+            swanctl_content = render_swanctl_conf(tunnel, psk)
+
+            push_result = await sftp_push_tunnel_config(
+                server,
+                tunnel.name,
+                conf_content,
+                secrets_content,
+                swanctl_content=swanctl_content,
+            )
+
+            if not push_result.success:
+                logger.warning(
+                    "server_engine_repush_push_failed",
+                    server_id=server.id,
+                    tunnel=tunnel.name,
+                    error=push_result.error,
+                )
+                continue
+
+            # Cleanup: if stroke -> swanctl, delete the orphaned stroke secrets file.
+            # The new swanctl file already embeds the PSK; the stroke secrets file is unused.
+            if old_engine == "stroke" and new_engine == "swanctl":
+                stroke_secrets_path = _remote_stroke_secrets_path(tunnel.name)
+                transport = get_transport(server)
+                try:
+                    await transport.delete_file(stroke_secrets_path)
+                    logger.info(
+                        "server_engine_cleanup_stroke_secrets",
+                        server_id=server.id,
+                        tunnel=tunnel.name,
+                        path=stroke_secrets_path,
+                    )
+                except TransportError as exc:
+                    logger.warning(
+                        "server_engine_cleanup_stroke_secrets_failed",
+                        server_id=server.id,
+                        tunnel=tunnel.name,
+                        path=stroke_secrets_path,
+                        error=str(exc),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "server_engine_cleanup_stroke_secrets_unexpected",
+                        server_id=server.id,
+                        tunnel=tunnel.name,
+                        path=stroke_secrets_path,
+                        error=str(exc),
+                    )
+
+        except InfrastructureError as exc:
+            logger.error(
+                "server_engine_repush_infra_error",
+                server_id=server.id,
+                tunnel=tunnel.name,
+                error=exc.message,
+            )
+        except Exception as exc:
+            logger.error(
+                "server_engine_repush_unexpected",
+                server_id=server.id,
+                tunnel=tunnel.name,
+                error=str(exc),
+                exc_info=True,
+            )
+
+    logger.info(
+        "server_engine_repush_complete",
+        server_id=server.id,
+        server_name=server.name,
+        tunnel_count=len(tunnels),
+    )
+
+
 async def update_server(
     session: AsyncSession,
     server_id: int,
@@ -951,9 +1094,11 @@ async def update_server(
     1. Get existing server, capture previous state.
     2. Validate name uniqueness if renaming.
     3. Validate and re-encrypt SSH key if changed.
-    4. Apply partial updates.
-    5. Create audit log entry.
-    6. Commit transaction.
+    4. Acquire IPSEC_CONFIG lock if ipsec_engine is changing.
+    5. Apply partial updates.
+    6. If ipsec_engine changed: re-push all active tunnels to this server with the new engine.
+    7. Create audit log entry.
+    8. Commit transaction (releases advisory lock).
 
     Args:
         session: Active database session.
@@ -968,6 +1113,7 @@ async def update_server(
     Raises:
         NotFoundError: If the server does not exist.
         ConflictError: If renaming to a name that already exists.
+        LockConflictError: If ipsec_engine is changing and the IPSEC_CONFIG lock is held.
         ValueError: If the new SSH key is invalid.
         EncryptionError: If the encryption key is not configured.
     """
@@ -975,6 +1121,13 @@ async def update_server(
     previous_state = _server_to_dict(server)
 
     update_data = data.model_dump(exclude_unset=True)
+
+    # Detect engine change BEFORE applying updates so we can capture the old value.
+    old_engine = server.ipsec_engine
+    engine_changed = (
+        "ipsec_engine" in update_data
+        and update_data["ipsec_engine"] != old_engine
+    )
 
     # Check name uniqueness if renaming
     if "name" in update_data and update_data["name"] != server.name:
@@ -994,9 +1147,18 @@ async def update_server(
         validate_ssh_private_key(ssh_private_key)
         server.ssh_private_key_encrypted = encrypt_ssh_key(ssh_private_key)
 
+    # Serialise concurrent ipsec-config changes when the engine is switching.
+    if engine_changed:
+        await require_lock(session, LOCK_IPSEC_CONFIG)
+
     # Apply remaining updates
     for field, value in update_data.items():
         setattr(server, field, value)
+
+    # Re-push all active tunnels to this server with the new engine format.
+    # Runs within the same transaction so the advisory lock is still held throughout.
+    if engine_changed:
+        await _repush_tunnels_on_engine_change(server, old_engine, session)
 
     # Audit log
     await audit.log_action(
