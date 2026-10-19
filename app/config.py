@@ -119,6 +119,14 @@ class Settings(BaseSettings):
             "Files are written with mode 0600."
         ),
     )
+    vpn_swanctl_conf_dir: str = Field(
+        default="/etc/swanctl/conf.d",
+        description=(
+            "Remote path for swanctl connection config files on VPN servers. "
+            "Must be included by /etc/swanctl/swanctl.conf (e.g. 'include conf.d/*.conf'). "
+            "Files are written with mode 0600 and contain both connection and secrets sections."
+        ),
+    )
 
     # CORS
     cors_origins: list[str] = Field(default=["http://localhost:3000"])

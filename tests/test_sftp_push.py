@@ -229,6 +229,7 @@ class TestSftpPushTunnelConfig:
             vpn_conf_dir="/opt/strongswan/config/connections",
             vpn_secrets_dir="/opt/strongswan/config/secrets",
             vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
+            vpn_swanctl_conf_dir="/etc/swanctl/conf.d",
         )
         mock_decrypt.return_value = "raw-key"
         mock_import_key.return_value = MagicMock()
@@ -594,8 +595,9 @@ class TestSwanctlServerPush:
 
         mock_settings.return_value = MagicMock(
             ssh_command_timeout=30,
-            vpn_conf_dir="/etc/swanctl/conf.d",
+            vpn_conf_dir="/opt/strongswan/config/connections",
             vpn_secrets_dir="/etc/swanctl/secrets",
+            vpn_swanctl_conf_dir="/etc/swanctl/conf.d",
         )
         mock_decrypt.return_value = "raw-key"
         mock_import_key.return_value = MagicMock()
@@ -639,8 +641,9 @@ class TestSwanctlServerPush:
 
         mock_settings.return_value = MagicMock(
             ssh_command_timeout=30,
-            vpn_conf_dir="/etc/swanctl/conf.d",
+            vpn_conf_dir="/opt/strongswan/config/connections",
             vpn_secrets_dir="/etc/swanctl/secrets",
+            vpn_swanctl_conf_dir="/etc/swanctl/conf.d",
         )
         mock_decrypt.return_value = "raw-key"
         mock_import_key.return_value = MagicMock()
@@ -681,8 +684,9 @@ class TestReloadCommandByEngine:
 
         mock_settings.return_value = MagicMock(
             ssh_command_timeout=30,
-            vpn_conf_dir="/etc/swanctl/conf.d",
+            vpn_conf_dir="/opt/strongswan/config/connections",
             vpn_secrets_dir="/etc/swanctl/secrets",
+            vpn_swanctl_conf_dir="/etc/swanctl/conf.d",
         )
         mock_decrypt.return_value = "raw-key"
         mock_import_key.return_value = MagicMock()
@@ -848,3 +852,204 @@ class TestStrokeSecretsPath:
         rm_secrets = next(c for c in calls if "rm -f" in c and "secrets" in c)
         assert "/etc/ipsec.d/secrets/my-tunnel.secrets" in rm_secrets
         assert "/opt/strongswan/config/secrets" not in rm_secrets
+
+
+# ---------------------------------------------------------------------------
+# Engine-aware conf path — swanctl uses vpn_swanctl_conf_dir, stroke uses vpn_conf_dir
+# ---------------------------------------------------------------------------
+
+
+class TestConfPathByEngine:
+    """Verify that the remote conf path differs between swanctl and stroke engines."""
+
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
+    @patch("app.services.server_service.get_settings")
+    async def test_swanctl_push_uses_vpn_swanctl_conf_dir(
+        self, mock_settings, mock_decrypt, mock_import_key
+    ):
+        """Swanctl push writes to vpn_swanctl_conf_dir, NOT vpn_conf_dir."""
+        from app.services.server_service import sftp_push_tunnel_config
+
+        mock_settings.return_value = MagicMock(
+            ssh_command_timeout=30,
+            vpn_conf_dir="/opt/strongswan/config/connections",
+            vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_swanctl_conf_dir="/etc/swanctl/conf.d",
+        )
+        mock_decrypt.return_value = "raw-key"
+        mock_import_key.return_value = MagicMock()
+
+        server = _make_server(ipsec_engine="swanctl")
+        ok = _make_run_result()
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok])
+
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
+            result = await sftp_push_tunnel_config(
+                server,
+                name="t-engine",
+                conf_content="conn t-engine\n",
+                secrets_content=None,
+                swanctl_content="combined\n",
+            )
+
+        assert result.success is True
+        calls = [c.args[0] for c in mock_conn.run.call_args_list]
+        # File must be in vpn_swanctl_conf_dir
+        assert any("/etc/swanctl/conf.d/t-engine.conf" in c for c in calls)
+        # Must NOT write to vpn_conf_dir
+        assert not any("/opt/strongswan/config/connections" in c for c in calls)
+
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
+    @patch("app.services.server_service.get_settings")
+    async def test_stroke_push_uses_vpn_conf_dir(
+        self, mock_settings, mock_decrypt, mock_import_key
+    ):
+        """Stroke push writes to vpn_conf_dir, NOT vpn_swanctl_conf_dir."""
+        from app.services.server_service import sftp_push_tunnel_config
+
+        mock_settings.return_value = MagicMock(
+            ssh_command_timeout=30,
+            vpn_conf_dir="/opt/strongswan/config/connections",
+            vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
+            vpn_swanctl_conf_dir="/etc/swanctl/conf.d",
+        )
+        mock_decrypt.return_value = "raw-key"
+        mock_import_key.return_value = MagicMock()
+
+        server = _make_server(ipsec_engine="stroke")
+        ok = _make_run_result()
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok])
+
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
+            result = await sftp_push_tunnel_config(
+                server,
+                name="t-engine",
+                conf_content="conn t-engine\n",
+                secrets_content=None,
+            )
+
+        assert result.success is True
+        calls = [c.args[0] for c in mock_conn.run.call_args_list]
+        # File must be in vpn_conf_dir
+        assert any("/opt/strongswan/config/connections/t-engine.conf" in c for c in calls)
+        # Must NOT write to vpn_swanctl_conf_dir
+        assert not any("/etc/swanctl/conf.d" in c for c in calls)
+
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
+    @patch("app.services.server_service.get_settings")
+    async def test_swanctl_delete_uses_vpn_swanctl_conf_dir(
+        self, mock_settings, mock_decrypt, mock_import_key
+    ):
+        """Swanctl delete removes from vpn_swanctl_conf_dir, NOT vpn_conf_dir."""
+        from app.services.server_service import sftp_delete_tunnel_config
+
+        mock_settings.return_value = MagicMock(
+            ssh_command_timeout=30,
+            vpn_conf_dir="/opt/strongswan/config/connections",
+            vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_swanctl_conf_dir="/etc/swanctl/conf.d",
+        )
+        mock_decrypt.return_value = "raw-key"
+        mock_import_key.return_value = MagicMock()
+
+        server = _make_server(ipsec_engine="swanctl")
+        ok = _make_run_result()
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok])
+
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
+            result = await sftp_delete_tunnel_config(server, name="t-del")
+
+        assert result.success is True
+        calls = [c.args[0] for c in mock_conn.run.call_args_list]
+        assert any("/etc/swanctl/conf.d/t-del.conf" in c for c in calls)
+        assert not any("/opt/strongswan/config/connections" in c for c in calls)
+
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
+    @patch("app.services.server_service.get_settings")
+    async def test_rename_swanctl_uses_swanctl_conf_dir_for_old_and_new(
+        self, mock_settings, mock_decrypt, mock_import_key
+    ):
+        """Swanctl rename: old and new conf paths use vpn_swanctl_conf_dir."""
+        from app.services.server_service import _sftp_rename_on_server
+
+        mock_settings.return_value = MagicMock(
+            ssh_command_timeout=30,
+            vpn_conf_dir="/opt/strongswan/config/connections",
+            vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
+            vpn_swanctl_conf_dir="/etc/swanctl/conf.d",
+        )
+        mock_decrypt.return_value = "raw-key"
+        mock_import_key.return_value = MagicMock()
+
+        server = _make_server(ipsec_engine="swanctl")
+        ok = _make_run_result()
+        # rm old, mkdir new-dir, tee new, chmod new, swanctl --load-all
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok, ok])
+
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
+            result = await _sftp_rename_on_server(
+                server,
+                old_name="old-t",
+                new_name="new-t",
+                conf_content="conn new-t\n",
+                secrets_content="secret\n",
+                swanctl_content="combined\n",
+            )
+
+        assert result.success is True
+        calls = [c.args[0] for c in mock_conn.run.call_args_list]
+        # Old file in swanctl dir
+        assert any("/etc/swanctl/conf.d/old-t.conf" in c for c in calls)
+        # New file in swanctl dir
+        assert any("/etc/swanctl/conf.d/new-t.conf" in c for c in calls)
+        # Neither path goes to stroke dir
+        assert not any("/opt/strongswan/config/connections" in c for c in calls)
+
+    @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
+    @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
+    @patch("app.services.server_service.get_settings")
+    async def test_rename_stroke_uses_vpn_conf_dir_for_old_and_new(
+        self, mock_settings, mock_decrypt, mock_import_key
+    ):
+        """Stroke rename: old and new conf paths use vpn_conf_dir."""
+        from app.services.server_service import _sftp_rename_on_server
+
+        mock_settings.return_value = MagicMock(
+            ssh_command_timeout=30,
+            vpn_conf_dir="/opt/strongswan/config/connections",
+            vpn_secrets_dir="/opt/strongswan/config/secrets",
+            vpn_stroke_secrets_dir="/etc/ipsec.d/secrets",
+            vpn_swanctl_conf_dir="/etc/swanctl/conf.d",
+        )
+        mock_decrypt.return_value = "raw-key"
+        mock_import_key.return_value = MagicMock()
+
+        server = _make_server(ipsec_engine="stroke")
+        ok = _make_run_result()
+        # rm old-conf, rm old-secrets, mkdir new-conf-dir, tee new-conf, chmod new-conf,
+        # mkdir new-secrets-dir, tee new-secrets, chmod new-secrets, ipsec reload
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok] * 9)
+
+        with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
+            result = await _sftp_rename_on_server(
+                server,
+                old_name="old-t",
+                new_name="new-t",
+                conf_content="conn new-t\n",
+                secrets_content="secret\n",
+            )
+
+        assert result.success is True
+        calls = [c.args[0] for c in mock_conn.run.call_args_list]
+        # Old conf in vpn_conf_dir
+        assert any("/opt/strongswan/config/connections/old-t.conf" in c for c in calls)
+        # New conf in vpn_conf_dir
+        assert any("/opt/strongswan/config/connections/new-t.conf" in c for c in calls)
+        # Neither path goes to swanctl dir
+        assert not any("/etc/swanctl/conf.d" in c for c in calls)
