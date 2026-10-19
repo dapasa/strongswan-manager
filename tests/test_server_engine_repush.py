@@ -276,12 +276,11 @@ class TestRepushTunnelsOnEngineChange:
     @patch("app.services.server_service.sftp_push_tunnel_config", new_callable=AsyncMock)
     @patch("app.services.server_service.get_transport")
     @patch("app.services.server_service.s3", create=True)
-    async def test_stroke_to_swanctl_pushes_and_cleans_secrets(
+    async def test_stroke_to_swanctl_pushes_and_cleans_old_stroke_files(
         self, mock_s3_module, mock_get_transport, mock_push
     ):
-        """stroke→swanctl: push swanctl config AND delete old stroke secrets file."""
+        """stroke→swanctl: push swanctl config AND delete old stroke conf + old stroke secrets."""
         from app.services.server_service import _repush_tunnels_on_engine_change
-        from app.services import s3 as real_s3
 
         server = _make_server(ipsec_engine="swanctl")  # new engine already set
         tunnel = _make_tunnel("t1")
@@ -297,21 +296,13 @@ class TestRepushTunnelsOnEngineChange:
 
         session = self._make_session_with_tunnels([tunnel])
 
-        with patch("app.services.server_service.s3") as patched_s3, \
-             patch("app.services.server_service.render_connection_conf", create=True), \
-             patch("app.services.server_service.render_secrets_file", create=True), \
-             patch("app.services.server_service.render_swanctl_conf", create=True):
-            patched_s3.download_file = AsyncMock(return_value=s3_content)
-
-            # Patch the local imports inside the function
-            with patch.dict("sys.modules", {}):
-                import app.services.ipsec_config as ic
-                with patch.object(ic, "render_connection_conf", return_value="conn t1\n"), \
-                     patch.object(ic, "render_secrets_file", return_value="secrets\n"), \
-                     patch.object(ic, "render_swanctl_conf", return_value="swanctl\n"):
-                    with patch("app.services.s3") as s3_patch:
-                        s3_patch.download_file = AsyncMock(return_value=s3_content)
-                        await _repush_tunnels_on_engine_change(server, "stroke", session)
+        import app.services.ipsec_config as ic
+        with patch.object(ic, "render_connection_conf", return_value="conn t1\n"), \
+             patch.object(ic, "render_secrets_file", return_value="secrets\n"), \
+             patch.object(ic, "render_swanctl_conf", return_value="swanctl\n"), \
+             patch("app.services.s3") as s3_patch:
+            s3_patch.download_file = AsyncMock(return_value=s3_content)
+            await _repush_tunnels_on_engine_change(server, "stroke", session)
 
         # push was called for the tunnel
         mock_push.assert_called_once()
@@ -319,18 +310,21 @@ class TestRepushTunnelsOnEngineChange:
         assert push_call_args[0][0] is server
         assert push_call_args[0][1] == "t1"
 
-        # old stroke secrets file was deleted after successful push
-        mock_transport.delete_file.assert_called_once()
-        deleted_path = mock_transport.delete_file.call_args[0][0]
-        assert "t1" in deleted_path  # secrets path contains tunnel name
+        # Both old stroke conf and old stroke secrets were deleted (2 calls)
+        assert mock_transport.delete_file.call_count == 2
+        deleted_paths = [c[0][0] for c in mock_transport.delete_file.call_args_list]
+        # One path is the old stroke conf, one is the stroke secrets file
+        assert all("t1" in p for p in deleted_paths)
+        # None of the deleted paths should be the NEW swanctl conf path
+        assert not any("/etc/swanctl/conf.d" in p for p in deleted_paths)
 
     @pytest.mark.asyncio
     @patch("app.services.server_service.sftp_push_tunnel_config", new_callable=AsyncMock)
     @patch("app.services.server_service.get_transport")
-    async def test_swanctl_to_stroke_no_cleanup(
+    async def test_swanctl_to_stroke_deletes_old_swanctl_conf(
         self, mock_get_transport, mock_push
     ):
-        """swanctl→stroke: push stroke config, NO cleanup of swanctl files (conf overwrites)."""
+        """swanctl→stroke: push stroke config AND delete old swanctl conf file."""
         from app.services.server_service import _repush_tunnels_on_engine_change
 
         server = _make_server(ipsec_engine="stroke")  # new engine already set
@@ -339,6 +333,9 @@ class TestRepushTunnelsOnEngineChange:
         s3_content = '203.0.113.1 10.0.0.1 : PSK "another_secret"\n'
         push_result = ServerResult(server_id=server.id, server_name=server.name, success=True)
         mock_push.return_value = push_result
+
+        mock_transport = AsyncMock()
+        mock_get_transport.return_value = mock_transport
 
         session = self._make_session_with_tunnels([tunnel])
 
@@ -351,8 +348,16 @@ class TestRepushTunnelsOnEngineChange:
             await _repush_tunnels_on_engine_change(server, "swanctl", session)
 
         mock_push.assert_called_once()
-        # get_transport should NOT be called (no cleanup for swanctl→stroke)
-        mock_get_transport.assert_not_called()
+        # get_transport IS called to delete the old swanctl conf file
+        mock_get_transport.assert_called_once_with(server)
+        # delete_file called exactly once for the old swanctl conf
+        mock_transport.delete_file.assert_called_once()
+        deleted_path = mock_transport.delete_file.call_args[0][0]
+        assert "t2" in deleted_path
+        # Deleted path must be the old swanctl conf dir, not the new stroke conf dir
+        assert "/etc/swanctl/conf.d" in deleted_path or "swanctl" in deleted_path.lower()
+        # Must NOT delete the new stroke conf path
+        assert "/opt/strongswan/config/connections" not in deleted_path
 
     @pytest.mark.asyncio
     @patch("app.services.server_service.sftp_push_tunnel_config", new_callable=AsyncMock)

@@ -34,9 +34,16 @@ _LOAD_ALL = "sudo /usr/sbin/swanctl --load-all"
 _IPSEC_RELOAD = "sudo ipsec reload"
 
 
-def _remote_conf_path(name: str) -> str:
-    """Remote path for a tunnel's .conf file on VPN servers."""
-    return f"{get_settings().vpn_conf_dir}/{name}.conf"
+def _remote_conf_path(name: str, engine: str = "stroke") -> str:
+    """Remote path for a tunnel's .conf file on VPN servers, engine-aware.
+
+    For swanctl engines: uses vpn_swanctl_conf_dir (default /etc/swanctl/conf.d).
+    For stroke engines: uses vpn_conf_dir (default /opt/strongswan/config/connections).
+    """
+    settings = get_settings()
+    if engine == "swanctl":
+        return f"{settings.vpn_swanctl_conf_dir}/{name}.conf"
+    return f"{settings.vpn_conf_dir}/{name}.conf"
 
 
 def _remote_secrets_path(name: str) -> str:
@@ -270,7 +277,7 @@ async def sftp_push_tunnel_config(
         ServerResult with success=True on success, or success=False with error message.
     """
     effective_timeout = timeout if timeout is not None else get_settings().ssh_command_timeout
-    conf_path = _remote_conf_path(name)
+    conf_path = _remote_conf_path(name, server.ipsec_engine)
     stroke_secrets_path = _remote_stroke_secrets_path(name)
     transport = get_transport(server)
 
@@ -348,7 +355,7 @@ async def sftp_delete_tunnel_config(
         ServerResult with success=True on success (including file-not-found), or success=False with error.
     """
     effective_timeout = timeout if timeout is not None else get_settings().ssh_command_timeout
-    conf_path = _remote_conf_path(name)
+    conf_path = _remote_conf_path(name, server.ipsec_engine)
     stroke_secrets_path = _remote_stroke_secrets_path(name)
     transport = get_transport(server)
 
@@ -442,9 +449,9 @@ async def _sftp_rename_on_server(
         ServerResult with success=True on success, or success=False with error.
     """
     effective_timeout = timeout if timeout is not None else get_settings().ssh_command_timeout
-    old_conf = _remote_conf_path(old_name)
+    old_conf = _remote_conf_path(old_name, server.ipsec_engine)
     old_stroke_secrets = _remote_stroke_secrets_path(old_name)
-    new_conf = _remote_conf_path(new_name)
+    new_conf = _remote_conf_path(new_name, server.ipsec_engine)
     new_stroke_secrets = _remote_stroke_secrets_path(new_name)
     transport = get_transport(server)
 
@@ -1027,33 +1034,71 @@ async def _repush_tunnels_on_engine_change(
                 )
                 continue
 
-            # Cleanup: if stroke -> swanctl, delete the orphaned stroke secrets file.
-            # The new swanctl file already embeds the PSK; the stroke secrets file is unused.
+            # Cleanup: after a successful push to the new engine, delete files
+            # belonging to the old engine path so orphaned configs don't linger.
+            # The new file is at _remote_conf_path(tunnel.name, new_engine) —
+            # cleanup only touches _remote_conf_path(tunnel.name, old_engine).
             if old_engine == "stroke" and new_engine == "swanctl":
+                # stroke→swanctl: delete old stroke conf + old stroke secrets file.
+                # The new swanctl file already embeds the PSK.
+                old_stroke_conf_path = _remote_conf_path(tunnel.name, "stroke")
                 stroke_secrets_path = _remote_stroke_secrets_path(tunnel.name)
                 transport = get_transport(server)
+                for path, label in [
+                    (old_stroke_conf_path, "server_engine_cleanup_stroke_conf"),
+                    (stroke_secrets_path, "server_engine_cleanup_stroke_secrets"),
+                ]:
+                    try:
+                        await transport.delete_file(path)
+                        logger.info(
+                            label,
+                            server_id=server.id,
+                            tunnel=tunnel.name,
+                            path=path,
+                        )
+                    except TransportError as exc:
+                        logger.warning(
+                            f"{label}_failed",
+                            server_id=server.id,
+                            tunnel=tunnel.name,
+                            path=path,
+                            error=str(exc),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"{label}_unexpected",
+                            server_id=server.id,
+                            tunnel=tunnel.name,
+                            path=path,
+                            error=str(exc),
+                        )
+            elif old_engine == "swanctl" and new_engine == "stroke":
+                # swanctl→stroke: delete old swanctl conf file.
+                # The new stroke conf + secrets files were written by the push.
+                old_swanctl_conf_path = _remote_conf_path(tunnel.name, "swanctl")
+                transport = get_transport(server)
                 try:
-                    await transport.delete_file(stroke_secrets_path)
+                    await transport.delete_file(old_swanctl_conf_path)
                     logger.info(
-                        "server_engine_cleanup_stroke_secrets",
+                        "server_engine_cleanup_swanctl_conf",
                         server_id=server.id,
                         tunnel=tunnel.name,
-                        path=stroke_secrets_path,
+                        path=old_swanctl_conf_path,
                     )
                 except TransportError as exc:
                     logger.warning(
-                        "server_engine_cleanup_stroke_secrets_failed",
+                        "server_engine_cleanup_swanctl_conf_failed",
                         server_id=server.id,
                         tunnel=tunnel.name,
-                        path=stroke_secrets_path,
+                        path=old_swanctl_conf_path,
                         error=str(exc),
                     )
                 except Exception as exc:
                     logger.warning(
-                        "server_engine_cleanup_stroke_secrets_unexpected",
+                        "server_engine_cleanup_swanctl_conf_unexpected",
                         server_id=server.id,
                         tunnel=tunnel.name,
-                        path=stroke_secrets_path,
+                        path=old_swanctl_conf_path,
                         error=str(exc),
                     )
 
