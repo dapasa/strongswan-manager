@@ -145,8 +145,9 @@ Security Associations (0 up, 1 connecting):
 class TestTunnelServiceCreate:
     @patch("app.services.tunnel_service.audit.log_action", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.ipsec_config.sync_tunnel_config", new_callable=AsyncMock)
+    @patch("app.services.kms.encrypt_psk", new_callable=AsyncMock, return_value="dGVzdC1jaXBoZXJ0ZXh0")
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
-    async def test_create_tunnel_success(self, mock_lock, mock_sync, mock_audit):
+    async def test_create_tunnel_success(self, mock_lock, mock_encrypt, mock_sync, mock_audit):
         from app.services.tunnel_service import create_tunnel
 
         session = AsyncMock()
@@ -207,12 +208,11 @@ class TestTunnelServiceCreate:
 
 class TestTunnelServiceRetry:
     @patch("app.services.tunnel_service.audit.log_action", new_callable=AsyncMock)
-    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
-    @patch("app.services.s3.upload_file", new_callable=AsyncMock)
-    @patch("app.services.tunnel_service.ipsec_config.render_connection_conf", return_value="conn test\n")
+    @patch("app.services.tunnel_service.ipsec_config.sync_tunnel_config", new_callable=AsyncMock)
+    @patch("app.services.kms.decrypt_psk", new_callable=AsyncMock, return_value="test-psk-plaintext")
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
-    async def test_retry_success(self, mock_get, mock_lock, mock_render, mock_upload, mock_fan_out, mock_audit):
+    async def test_retry_success(self, mock_get, mock_lock, mock_decrypt, mock_sync, mock_audit):
         from app.services.tunnel_service import retry_tunnel_sync
         from app.utils.fan_out import FanOutResult, ServerResult
 
@@ -220,13 +220,14 @@ class TestTunnelServiceRetry:
         tunnel.id = 1
         tunnel.sync_status = "failed"
         tunnel.name = "test"
+        tunnel.psk_encrypted = "dGVzdC1jaXBoZXJ0ZXh0"
         tunnel.peer_ip = "1.2.3.4"
         tunnel.local_cidrs = ["10.0.0.0/24"]
         tunnel.remote_cidrs = ["192.168.0.0/24"]
         tunnel.created_at = datetime.now(timezone.utc)
         tunnel.updated_at = datetime.now(timezone.utc)
         mock_get.return_value = tunnel
-        mock_fan_out.return_value = FanOutResult(
+        mock_sync.return_value = FanOutResult(
             total=1, succeeded=1, failed=0,
             servers=[ServerResult(server_id=1, server_name="vpn-1", success=True, output="ok")],
         )
@@ -237,8 +238,8 @@ class TestTunnelServiceRetry:
 
         result = await retry_tunnel_sync(session, 1, user=user)
         assert result.sync_status == "synced"
-        mock_upload.assert_called_once()
-        mock_fan_out.assert_called_once()
+        mock_decrypt.assert_called_once_with("dGVzdC1jaXBoZXJ0ZXh0")
+        mock_sync.assert_called_once()
 
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
     async def test_retry_not_failed_raises_conflict(self, mock_get):

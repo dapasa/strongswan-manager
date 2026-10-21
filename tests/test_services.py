@@ -131,83 +131,59 @@ class TestAuditService:
 
 
 # ---------------------------------------------------------------------------
-# S3 service
+# KMS service
 # ---------------------------------------------------------------------------
 
 
-class TestS3Service:
-    @patch("app.services.s3._get_s3_client")
-    @patch("app.services.s3.get_settings")
-    async def test_download_file_success(self, mock_settings, mock_client_fn):
-        from app.services.s3 import download_file
+class TestKMSService:
+    @patch("app.services.kms._get_kms_client")
+    @patch("app.services.kms.get_settings")
+    async def test_encrypt_psk_success(self, mock_settings, mock_client_fn):
+        import base64
+        from app.services.kms import encrypt_psk
 
-        settings = MagicMock()
-        settings.s3_bucket = "test-bucket"
-        mock_settings.return_value = settings
-
-        body_mock = MagicMock()
-        body_mock.read.return_value = b"conn test\n    left=%defaultroute\n"
+        mock_settings.return_value = MagicMock(kms_psk_key_id="alias/test-key")
         mock_client = MagicMock()
-        mock_client.get_object.return_value = {"Body": body_mock}
+        mock_client.encrypt.return_value = {"CiphertextBlob": b"raw-ciphertext"}
         mock_client_fn.return_value = mock_client
 
-        content = await download_file("connections/test.conf")
-        assert "conn test" in content
-        mock_client.get_object.assert_called_once_with(Bucket="test-bucket", Key="connections/test.conf")
+        result = await encrypt_psk("MySuperSecretPSK")
+        assert result == base64.b64encode(b"raw-ciphertext").decode("ascii")
+        mock_client.encrypt.assert_called_once()
+        call_kwargs = mock_client.encrypt.call_args[1]
+        assert call_kwargs["KeyId"] == "alias/test-key"
+        assert call_kwargs["Plaintext"] == b"MySuperSecretPSK"
 
-    @patch("app.services.s3._get_s3_client")
-    @patch("app.services.s3.get_settings")
-    async def test_download_file_no_such_key(self, mock_settings, mock_client_fn):
-        from app.services.s3 import download_file
+    @patch("app.services.kms._get_kms_client")
+    @patch("app.services.kms.get_settings")
+    async def test_decrypt_psk_success(self, mock_settings, mock_client_fn):
+        import base64
+        from app.services.kms import decrypt_psk
 
-        settings = MagicMock()
-        settings.s3_bucket = "test-bucket"
-        mock_settings.return_value = settings
-
-        error_response = {"Error": {"Code": "NoSuchKey", "Message": "Not found"}}
+        mock_settings.return_value = MagicMock(kms_psk_key_id="alias/test-key")
         mock_client = MagicMock()
-        mock_client.get_object.side_effect = ClientError(error_response, "GetObject")
+        mock_client.decrypt.return_value = {"Plaintext": b"MySuperSecretPSK"}
         mock_client_fn.return_value = mock_client
 
-        with pytest.raises(InfrastructureError) as exc_info:
-            await download_file("connections/missing.conf")
-        assert "not found" in exc_info.value.message.lower()
+        ciphertext_b64 = base64.b64encode(b"raw-ciphertext").decode("ascii")
+        result = await decrypt_psk(ciphertext_b64)
+        assert result == "MySuperSecretPSK"
+        mock_client.decrypt.assert_called_once_with(CiphertextBlob=b"raw-ciphertext")
 
-    @patch("app.services.s3._get_s3_client")
-    @patch("app.services.s3.get_settings")
-    async def test_upload_file_success(self, mock_settings, mock_client_fn):
-        from app.services.s3 import upload_file
+    @patch("app.services.kms._get_kms_client")
+    @patch("app.services.kms.get_settings")
+    async def test_encrypt_psk_failure(self, mock_settings, mock_client_fn):
+        from app.services.kms import encrypt_psk
 
-        settings = MagicMock()
-        settings.s3_bucket = "test-bucket"
-        mock_settings.return_value = settings
-
+        mock_settings.return_value = MagicMock(kms_psk_key_id="alias/test-key")
+        error_response = {"Error": {"Code": "AccessDeniedException", "Message": "Denied"}}
         mock_client = MagicMock()
-        mock_client_fn.return_value = mock_client
-
-        await upload_file("connections/test.conf", "conn test\n")
-        mock_client.put_object.assert_called_once()
-        call_kwargs = mock_client.put_object.call_args[1]
-        assert call_kwargs["Bucket"] == "test-bucket"
-        assert call_kwargs["Key"] == "connections/test.conf"
-
-    @patch("app.services.s3._get_s3_client")
-    @patch("app.services.s3.get_settings")
-    async def test_upload_file_failure(self, mock_settings, mock_client_fn):
-        from app.services.s3 import upload_file
-
-        settings = MagicMock()
-        settings.s3_bucket = "test-bucket"
-        mock_settings.return_value = settings
-
-        error_response = {"Error": {"Code": "AccessDenied", "Message": "Denied"}}
-        mock_client = MagicMock()
-        mock_client.put_object.side_effect = ClientError(error_response, "PutObject")
+        mock_client.encrypt.side_effect = ClientError(error_response, "Encrypt")
         mock_client_fn.return_value = mock_client
 
         with pytest.raises(InfrastructureError) as exc_info:
-            await upload_file("connections/test.conf", "content")
-        assert exc_info.value.service == "S3"
+            await encrypt_psk("psk")
+        assert exc_info.value.service == "KMS"
 
 
 # ---------------------------------------------------------------------------
@@ -364,8 +340,7 @@ class TestIPSecConfigGenerator:
         assert '203.0.113.1 10.0.0.0 : PSK "MySecretPSK"' in content
 
     @patch("app.services.ipsec_config.sftp_push_on_all_servers", new_callable=AsyncMock)
-    @patch("app.services.ipsec_config.s3.upload_file", new_callable=AsyncMock)
-    async def test_sync_tunnel_config(self, mock_upload, mock_fan_out):
+    async def test_sync_tunnel_config(self, mock_fan_out):
         from app.services.ipsec_config import sync_tunnel_config
         from app.utils.fan_out import FanOutResult, ServerResult
 
@@ -389,19 +364,15 @@ class TestIPSecConfigGenerator:
         session = AsyncMock()
         result = await sync_tunnel_config(tunnel, psk="TestPSK123", session=session)
 
-        assert mock_upload.call_count == 2  # .conf + .secrets
         mock_fan_out.assert_called_once()
         assert result.is_success is True
 
-        # Verify keys
-        conf_call = mock_upload.call_args_list[0]
-        secrets_call = mock_upload.call_args_list[1]
-        assert conf_call[0][0] == "connections/test-tunnel.conf"
-        assert secrets_call[0][0] == "secrets/test-tunnel.secrets"
+        # Verify fan-out received both conf and secrets content
+        call_kwargs = mock_fan_out.call_args
+        assert call_kwargs[0][1] == "test-tunnel"  # tunnel name
 
     @patch("app.services.ipsec_config.sftp_delete_on_all_servers", new_callable=AsyncMock)
-    @patch("app.services.ipsec_config.s3.delete_file", new_callable=AsyncMock)
-    async def test_remove_tunnel_config(self, mock_delete, mock_fan_out):
+    async def test_remove_tunnel_config(self, mock_fan_out):
         from app.services.ipsec_config import remove_tunnel_config
         from app.utils.fan_out import FanOutResult, ServerResult
 
@@ -413,10 +384,8 @@ class TestIPSecConfigGenerator:
         session = AsyncMock()
         result = await remove_tunnel_config("old-tunnel", session=session)
 
-        assert mock_delete.call_count == 2  # .conf + .secrets
         mock_fan_out.assert_called_once()
-        mock_delete.assert_any_call("connections/old-tunnel.conf")
-        mock_delete.assert_any_call("secrets/old-tunnel.secrets")
+        assert result.is_success is True
 
 
 # ---------------------------------------------------------------------------

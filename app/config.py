@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+import boto3
+from botocore.exceptions import ClientError
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
@@ -22,6 +24,18 @@ class Settings(BaseSettings):
     )
     db_pool_size: int = Field(default=5, ge=1, le=50)
     db_max_overflow: int = Field(default=10, ge=0, le=50)
+
+    # SSM — optional: if set, the app reads DATABASE_URL from this SSM parameter at startup.
+    # The parameter is fetched with decryption (SecureString). When unset, DATABASE_URL
+    # must be provided directly via the environment variable or .env file.
+    ssm_database_url_parameter: str | None = Field(
+        default=None,
+        description=(
+            "SSM Parameter Store name that holds the DATABASE_URL. "
+            "If set, overrides DATABASE_URL at startup (SecureString, decrypted). "
+            "If unset, DATABASE_URL is read from the environment as usual."
+        ),
+    )
 
     # Auth mode
     auth_mode: str = Field(
@@ -54,15 +68,23 @@ class Settings(BaseSettings):
         description="OIDC audience claim to validate. Required when auth_mode=oidc.",
     )
 
-    # AWS / S3
-    s3_bucket: str = Field(..., description="S3 bucket for StrongSwan config files")
+    # AWS
     aws_region: str = Field(default="us-east-1")
 
     # AWS Cross-Account
     aws_assume_role_arn: str | None = Field(
         default=None,
-        description="IAM role ARN to assume for dev-account access (SSM, EC2, S3). "
+        description="IAM role ARN to assume for dev-account access (SSM, EC2). "
         "If unset, uses default credentials.",
+    )
+
+    # KMS — key used to encrypt/decrypt PSK values stored in the database.
+    kms_psk_key_id: str = Field(
+        ...,
+        description=(
+            "KMS key ID or alias (e.g. 'alias/strongswan-psk') used to encrypt "
+            "PSK values stored in the tunnels table. Required."
+        ),
     )
 
     # SSM
@@ -174,7 +196,59 @@ class Settings(BaseSettings):
     }
 
 
+def _fetch_ssm_database_url(settings: Settings) -> str:
+    """Synchronously fetch DATABASE_URL from SSM Parameter Store.
+
+    Called once at startup when SSM_DATABASE_URL_PARAMETER is set.
+    Uses the same role-assumption logic as the rest of the app when
+    AWS_ASSUME_ROLE_ARN is configured.
+
+    Returns:
+        A valid postgresql+asyncpg:// connection string.
+
+    Raises:
+        RuntimeError: If the SSM parameter cannot be read.
+    """
+    param_name = settings.ssm_database_url_parameter
+    assert param_name  # guarded by caller
+
+    try:
+        if settings.aws_assume_role_arn:
+            sts = boto3.client("sts", region_name=settings.aws_region)
+            creds = sts.assume_role(
+                RoleArn=settings.aws_assume_role_arn,
+                RoleSessionName="strongswan-manager-config",
+                DurationSeconds=900,
+            )["Credentials"]
+            ssm = boto3.client(
+                "ssm",
+                region_name=settings.aws_region,
+                aws_access_key_id=creds["AccessKeyId"],
+                aws_secret_access_key=creds["SecretAccessKey"],
+                aws_session_token=creds["SessionToken"],
+            )
+        else:
+            ssm = boto3.client("ssm", region_name=settings.aws_region)
+
+        response = ssm.get_parameter(Name=param_name, WithDecryption=True)
+        return response["Parameter"]["Value"]
+
+    except ClientError as exc:
+        raise RuntimeError(
+            f"Failed to read DATABASE_URL from SSM parameter '{param_name}': {exc}"
+        ) from exc
+
+
 @lru_cache
 def get_settings() -> Settings:
-    """Return cached singleton Settings instance."""
-    return Settings()
+    """Return cached singleton Settings instance.
+
+    If SSM_DATABASE_URL_PARAMETER is set, the DATABASE_URL is fetched from
+    SSM Parameter Store (with decryption) and used in place of the environment
+    variable value. This fetch happens once and is cached.
+    """
+    raw = Settings()
+    if raw.ssm_database_url_parameter:
+        db_url = _fetch_ssm_database_url(raw)
+        return Settings(database_url=db_url)
+    return raw

@@ -974,7 +974,7 @@ async def _repush_tunnels_on_engine_change(
     """
     # Local imports to break the circular dependency:
     # server_service <- ipsec_config imports sftp_push_on_all_servers from server_service
-    from app.services import s3
+    from app.services import kms
     from app.services.ipsec_config import (
         render_connection_conf,
         render_secrets_file,
@@ -1001,17 +1001,15 @@ async def _repush_tunnels_on_engine_change(
 
     for tunnel in tunnels:
         try:
-            # Fetch PSK from S3 stroke-format: "{peer_ip} {left_ip} : PSK "{psk}""
-            secrets_s3 = await s3.download_file(f"secrets/{tunnel.name}.secrets")
-            m = re.search(r': PSK "(.+)"', secrets_s3)
-            if not m:
+            # Decrypt PSK from DB — never logged.
+            if not tunnel.psk_encrypted:
                 logger.error(
-                    "server_engine_repush_psk_parse_failed",
+                    "server_engine_repush_psk_missing",
                     server_id=server.id,
                     tunnel=tunnel.name,
                 )
                 continue
-            psk = m.group(1)
+            psk = await kms.decrypt_psk(tunnel.psk_encrypted)
 
             conf_content = render_connection_conf(tunnel)
             secrets_content = render_secrets_file(tunnel, psk)

@@ -72,7 +72,11 @@ class Tunnel(TimestampMixin, SoftDeleteMixin, Base):
     sync_status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
     sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     sync_details: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    psk_secret_name: Mapped[str] = mapped_column(Text, nullable=False)
+    # psk_secret_name kept nullable for migration compatibility (previously pointed to S3 path).
+    # New tunnels leave this NULL; the PSK is now stored encrypted in psk_encrypted.
+    psk_secret_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # KMS-encrypted PSK, base64-encoded (set on create/update, decrypted only when pushing config).
+    psk_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     # IKE identity for the local side (e.g. the node's EIP). When null,
     # strongSwan uses the source IP automatically. Renders as leftid (stroke)
     # or local { id = ... } (swanctl) — omitted entirely when null.

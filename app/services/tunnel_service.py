@@ -1,4 +1,4 @@
-"""Tunnel orchestration service — coordinates DB, S3, SSH for tunnel CRUD."""
+"""Tunnel orchestration service — coordinates DB, KMS, and SSH for tunnel CRUD."""
 
 from __future__ import annotations
 
@@ -60,7 +60,6 @@ def _tunnel_to_dict(tunnel: Tunnel) -> dict[str, Any]:
         "sync_status": tunnel.sync_status,
         "sync_error": tunnel.sync_error,
         "sync_details": tunnel.sync_details,
-        "psk_secret_name": tunnel.psk_secret_name,
         "created_by": tunnel.created_by,
         "created_at": tunnel.created_at.isoformat() if tunnel.created_at else None,
         "updated_at": tunnel.updated_at.isoformat() if tunnel.updated_at else None,
@@ -165,7 +164,7 @@ async def create_tunnel(
     1. Validate name uniqueness among active tunnels.
     2. Acquire IPSEC_CONF_LOCK advisory lock.
     3. Insert tunnel with sync_status='pending'.
-    4. Regenerate ipsec.conf from DB, upload to S3, reload via SSH fan-out.
+    4. Encrypt PSK with KMS, store ciphertext in DB, push config via SSH fan-out.
     5. Apply FanOutResult to sync_status/sync_error/sync_details.
     6. Create audit log entry.
     7. Commit transaction.
@@ -196,7 +195,10 @@ async def create_tunnel(
     # Acquire lock
     await require_lock(session, LOCK_IPSEC_CONFIG)
 
-    # Insert tunnel (PSK is NOT stored in DB — only written to S3)
+    # Encrypt PSK with KMS before touching infra — fail fast if KMS is unavailable.
+    from app.services import kms
+    psk_encrypted = await kms.encrypt_psk(data.psk)
+
     tunnel = Tunnel(
         name=data.name,
         description=data.description,
@@ -211,13 +213,13 @@ async def create_tunnel(
         dpd_timeout=data.dpd_timeout,
         status="active",
         sync_status="pending",
-        psk_secret_name=f"secrets/{data.name}.secrets",
+        psk_encrypted=psk_encrypted,
         created_by=user.id,
     )
     session.add(tunnel)
     await session.flush()
 
-    # Sync infrastructure — upload .conf + .secrets to S3, reload ipsec via SSH
+    # Push config to VPN nodes via SSH fan-out.
     try:
         fan_out_result = await ipsec_config.sync_tunnel_config(tunnel, psk=data.psk, session=session)
         _apply_fan_out_result(tunnel, fan_out_result)
@@ -324,16 +326,14 @@ async def update_tunnel(
         else:
             setattr(tunnel, field, value)
 
-    # Keep psk_secret_name in sync with tunnel name
-    if "name" in update_data:
-        tunnel.psk_secret_name = f"secrets/{tunnel.name}.secrets"
-
     # Sync infrastructure if connection params or PSK changed
     if needs_sync:
+        from app.services import kms
         tunnel.sync_status = "pending"
         try:
             if "name" in update_data and update_data["name"] != old_name and psk is not None:
-                # Rename: delete old files, upload new
+                # Rename + PSK change: re-encrypt PSK, push new config, remove old.
+                tunnel.psk_encrypted = await kms.encrypt_psk(psk)
                 fan_out_result = await ipsec_config.rename_tunnel_config(
                     old_name, tunnel, psk, session
                 )
@@ -343,14 +343,14 @@ async def update_tunnel(
                 tunnel.sync_status = "failed"
                 tunnel.sync_error = "PSK is required when renaming a tunnel"
             elif psk is not None:
-                # PSK or config changed, same name
+                # PSK or config changed, same name: re-encrypt and full push.
+                tunnel.psk_encrypted = await kms.encrypt_psk(psk)
                 fan_out_result = await ipsec_config.sync_tunnel_config(tunnel, psk, session)
                 _apply_fan_out_result(tunnel, fan_out_result)
             else:
-                # Config changed but no PSK — re-upload .conf only, keep .secrets
-                from app.services import s3
+                # Config-only change, no PSK in request: decrypt from DB and full push.
+                psk_plain = await kms.decrypt_psk(tunnel.psk_encrypted)
                 conf_content = ipsec_config.render_connection_conf(tunnel)
-                await s3.upload_file(f"connections/{tunnel.name}.conf", conf_content)
                 fan_out_result = await sftp_push_on_all_servers(
                     session, tunnel.name, conf_content, secrets_content=None
                 )
@@ -584,13 +584,10 @@ async def retry_tunnel_sync(
 
     tunnel.sync_status = "pending"
     try:
-        # Re-upload .conf from current DB state; .secrets already exists in S3 and on servers
-        from app.services import s3
-        conf_content = ipsec_config.render_connection_conf(tunnel)
-        await s3.upload_file(f"connections/{tunnel.name}.conf", conf_content)
-        fan_out_result = await sftp_push_on_all_servers(
-            session, tunnel.name, conf_content, secrets_content=None
-        )
+        # Decrypt PSK from DB and do a full re-sync (conf + secrets) to all servers.
+        from app.services import kms
+        psk = await kms.decrypt_psk(tunnel.psk_encrypted)
+        fan_out_result = await ipsec_config.sync_tunnel_config(tunnel, psk, session)
         _apply_fan_out_result(tunnel, fan_out_result)
         logger.info(
             "tunnel_retry_synced",

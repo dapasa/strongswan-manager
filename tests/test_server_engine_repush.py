@@ -65,7 +65,7 @@ def _make_tunnel(name: str = "t1") -> MagicMock:
     t.sync_status = "synced"
     t.sync_error = None
     t.sync_details = None
-    t.psk_secret_name = f"secrets/{name}.secrets"
+    t.psk_encrypted = "dGVzdC1jaXBoZXJ0ZXh0"  # base64("test-ciphertext"); KMS is mocked
     t.created_by = 1
     t.deleted_at = None
     t.routes = []
@@ -275,18 +275,14 @@ class TestRepushTunnelsOnEngineChange:
     @pytest.mark.asyncio
     @patch("app.services.server_service.sftp_push_tunnel_config", new_callable=AsyncMock)
     @patch("app.services.server_service.get_transport")
-    @patch("app.services.server_service.s3", create=True)
     async def test_stroke_to_swanctl_pushes_and_cleans_old_stroke_files(
-        self, mock_s3_module, mock_get_transport, mock_push
+        self, mock_get_transport, mock_push
     ):
         """stroke→swanctl: push swanctl config AND delete old stroke conf + old stroke secrets."""
         from app.services.server_service import _repush_tunnels_on_engine_change
 
         server = _make_server(ipsec_engine="swanctl")  # new engine already set
         tunnel = _make_tunnel("t1")
-
-        # S3 returns stroke-format secrets: peer_ip left_ip : PSK "secret123"
-        s3_content = '203.0.113.1 10.0.0.1 : PSK "secret123"\n'
 
         mock_transport = AsyncMock()
         mock_get_transport.return_value = mock_transport
@@ -300,8 +296,7 @@ class TestRepushTunnelsOnEngineChange:
         with patch.object(ic, "render_connection_conf", return_value="conn t1\n"), \
              patch.object(ic, "render_secrets_file", return_value="secrets\n"), \
              patch.object(ic, "render_swanctl_conf", return_value="swanctl\n"), \
-             patch("app.services.s3") as s3_patch:
-            s3_patch.download_file = AsyncMock(return_value=s3_content)
+             patch("app.services.kms.decrypt_psk", new_callable=AsyncMock, return_value="secret123"):
             await _repush_tunnels_on_engine_change(server, "stroke", session)
 
         # push was called for the tunnel
@@ -330,7 +325,6 @@ class TestRepushTunnelsOnEngineChange:
         server = _make_server(ipsec_engine="stroke")  # new engine already set
         tunnel = _make_tunnel("t2")
 
-        s3_content = '203.0.113.1 10.0.0.1 : PSK "another_secret"\n'
         push_result = ServerResult(server_id=server.id, server_name=server.name, success=True)
         mock_push.return_value = push_result
 
@@ -343,8 +337,7 @@ class TestRepushTunnelsOnEngineChange:
         with patch.object(ic, "render_connection_conf", return_value="conn t2\n"), \
              patch.object(ic, "render_secrets_file", return_value="secrets\n"), \
              patch.object(ic, "render_swanctl_conf", return_value="swanctl\n"), \
-             patch("app.services.s3") as s3_patch:
-            s3_patch.download_file = AsyncMock(return_value=s3_content)
+             patch("app.services.kms.decrypt_psk", new_callable=AsyncMock, return_value="another_secret"):
             await _repush_tunnels_on_engine_change(server, "swanctl", session)
 
         mock_push.assert_called_once()
@@ -369,8 +362,6 @@ class TestRepushTunnelsOnEngineChange:
         tunnel1 = _make_tunnel("t1")
         tunnel2 = _make_tunnel("t2")
 
-        s3_content = '203.0.113.1 10.0.0.1 : PSK "sec"\n'
-
         # tunnel1 fails, tunnel2 succeeds
         mock_push.side_effect = [
             ServerResult(server_id=server.id, server_name=server.name, success=False, error="timeout"),
@@ -383,9 +374,8 @@ class TestRepushTunnelsOnEngineChange:
         with patch.object(ic, "render_connection_conf", return_value="conf\n"), \
              patch.object(ic, "render_secrets_file", return_value="secrets\n"), \
              patch.object(ic, "render_swanctl_conf", return_value="swanctl\n"), \
-             patch("app.services.s3") as s3_patch, \
+             patch("app.services.kms.decrypt_psk", new_callable=AsyncMock, return_value="sec"), \
              patch("app.services.server_service.get_transport"):
-            s3_patch.download_file = AsyncMock(return_value=s3_content)
             # Must NOT raise
             await _repush_tunnels_on_engine_change(server, "stroke", session)
 
@@ -414,7 +404,6 @@ class TestRepushTunnelsOnEngineChange:
         server = _make_server(ipsec_engine="swanctl")
         tunnel = _make_tunnel("t1")
         secret_psk = "TOPSECRETPSK42"
-        s3_content = f'203.0.113.1 10.0.0.1 : PSK "{secret_psk}"\n'
 
         mock_push.return_value = ServerResult(
             server_id=server.id, server_name=server.name, success=True
@@ -424,12 +413,11 @@ class TestRepushTunnelsOnEngineChange:
 
         import app.services.ipsec_config as ic
         with patch.object(ic, "render_connection_conf", return_value="conf\n"), \
-             patch.object(ic, "render_secrets_file", return_value="secrets\n") as mock_rsf, \
+             patch.object(ic, "render_secrets_file", return_value="secrets\n"), \
              patch.object(ic, "render_swanctl_conf", return_value="swanctl\n"), \
-             patch("app.services.s3") as s3_patch, \
+             patch("app.services.kms.decrypt_psk", new_callable=AsyncMock, return_value=secret_psk), \
              patch("app.services.server_service.get_transport"), \
              patch("app.services.server_service.logger") as mock_logger:
-            s3_patch.download_file = AsyncMock(return_value=s3_content)
             await _repush_tunnels_on_engine_change(server, "stroke", session)
 
         # Collect all log call kwargs and args as strings

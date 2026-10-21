@@ -32,8 +32,8 @@ class TestRenderFieldsCoverage:
         """TUNNEL_RENDER_FIELDS must contain every tunnel attribute the renderers touch."""
         accessed = self._render_field_names()
         # Exclude non-data attributes that are not DB columns (e.g. 'name' is already in)
-        # and exclude 'psk_secret_name' which is metadata, not render input
-        non_render = {"psk_secret_name", "sync_status", "sync_error", "sync_details",
+        # psk_encrypted is metadata (stored ciphertext), not a render input field
+        non_render = {"psk_encrypted", "sync_status", "sync_error", "sync_details",
                       "status", "description", "created_by", "deleted_at"}
         render_accessed = accessed - non_render
         missing = render_accessed - TUNNEL_RENDER_FIELDS
@@ -79,7 +79,7 @@ def _make_tunnel(name: str = "t1") -> MagicMock:
     t.sync_status = "synced"
     t.sync_error = None
     t.sync_details = None
-    t.psk_secret_name = f"secrets/{name}.secrets"
+    t.psk_encrypted = "dGVzdC1jaXBoZXJ0ZXh0"  # fake ciphertext; KMS is mocked in tests
     t.created_by = 1
     t.deleted_at = None
     t.routes = []
@@ -127,10 +127,8 @@ class TestPatchLocalIdTriggerSync:
         mock_ipsec.render_connection_conf.return_value = "conn t1\n"
         mock_push.return_value = fan_out
 
-        # s3 is imported as a local import inside the else-branch; patch the module directly
-        with patch("app.services.s3") as mock_s3, \
+        with patch("app.services.kms.decrypt_psk", new_callable=AsyncMock, return_value="test-psk"), \
              patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock, return_value=tunnel):
-            mock_s3.upload_file = AsyncMock()
             data = TunnelUpdate(local_id="44.215.155.152")
             await update_tunnel(self._make_session(), tunnel.id, data=data, user=MagicMock(id=1), request=None)
 
@@ -156,9 +154,8 @@ class TestPatchLocalIdTriggerSync:
         mock_ipsec.render_connection_conf.return_value = "conn t1\n"
         mock_push.return_value = fan_out
 
-        with patch("app.services.s3") as mock_s3, \
+        with patch("app.services.kms.decrypt_psk", new_callable=AsyncMock, return_value="test-psk"), \
              patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock, return_value=tunnel):
-            mock_s3.upload_file = AsyncMock()
             data = TunnelUpdate(ike_lifetime=7200)
             await update_tunnel(self._make_session(), tunnel.id, data=data, user=MagicMock(id=1), request=None)
 
