@@ -62,8 +62,7 @@ class TestHealthRouter:
         assert resp.json()["status"] == "ok"
 
     @patch("app.routers.health.execute_on_all_servers", new_callable=AsyncMock)
-    @patch("app.routers.health.s3.check_connectivity", new_callable=AsyncMock, return_value=True)
-    async def test_health_readiness_all_ok(self, mock_s3, mock_fan_out):
+    async def test_health_readiness_all_ok(self, mock_fan_out):
         from app.utils.fan_out import FanOutResult, ServerResult
 
         mock_fan_out.return_value = FanOutResult(
@@ -90,7 +89,7 @@ class TestHealthRouter:
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
-        assert data["checks"]["s3"] == "ok"
+        assert "s3" not in data["checks"]
         assert data["checks"]["ssh"] == "ok"
 
 

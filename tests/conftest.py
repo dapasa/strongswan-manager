@@ -213,7 +213,8 @@ def create_test_tunnel(db_session: AsyncSession):
         if user is not None:
             defaults["created_by"] = user.id
         defaults.update(overrides)
-        defaults.setdefault("psk_secret_name", f"secrets/{defaults['name']}.secrets")
+        # psk_encrypted: use a fake ciphertext in tests (KMS is always mocked)
+        defaults.setdefault("psk_encrypted", "dGVzdC1jaXBoZXJ0ZXh0")  # base64("test-ciphertext")
         tunnel = Tunnel(**defaults)
         db_session.add(tunnel)
         await db_session.flush()
@@ -284,23 +285,21 @@ def create_test_iptables_rule(db_session: AsyncSession):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def mock_s3_service():
-    """Patch S3 service functions with AsyncMock."""
+def mock_kms_service():
+    """Patch KMS service functions with AsyncMock.
+
+    encrypt_psk returns a fixed base64 ciphertext.
+    decrypt_psk returns a fixed plaintext PSK.
+    """
     with (
-        patch("app.services.s3.upload_file", new_callable=AsyncMock) as mock_upload,
-        patch("app.services.s3.download_file", new_callable=AsyncMock) as mock_download,
-        patch("app.services.s3.delete_file", new_callable=AsyncMock) as mock_delete,
-        patch("app.services.s3.check_connectivity", new_callable=AsyncMock) as mock_check,
+        patch("app.services.kms.encrypt_psk", new_callable=AsyncMock) as mock_encrypt,
+        patch("app.services.kms.decrypt_psk", new_callable=AsyncMock) as mock_decrypt,
     ):
-        mock_download.return_value = "conn test\n"
-        mock_upload.return_value = None
-        mock_delete.return_value = None
-        mock_check.return_value = True
+        mock_encrypt.return_value = "dGVzdC1jaXBoZXJ0ZXh0"  # base64("test-ciphertext")
+        mock_decrypt.return_value = "test-psk-plaintext"
         yield {
-            "upload_file": mock_upload,
-            "download_file": mock_download,
-            "delete_file": mock_delete,
-            "check_connectivity": mock_check,
+            "encrypt_psk": mock_encrypt,
+            "decrypt_psk": mock_decrypt,
         }
 
 

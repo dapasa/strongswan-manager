@@ -396,7 +396,7 @@ def test_error_response():
 
 
 def test_health_response():
-    h = HealthResponse(status="ok", checks={"db": "ok", "s3": "ok"})
+    h = HealthResponse(status="ok", checks={"db": "ok", "ssh": "ok"})
     assert h.status == "ok"
     assert h.checks["db"] == "ok"
 

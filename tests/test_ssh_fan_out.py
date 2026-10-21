@@ -480,13 +480,13 @@ class TestDeleteTunnelBlocking:
 class TestRetryTunnelSync:
     """Tests for retry_tunnel_sync() status guard."""
 
-    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
-    @patch("app.services.s3.upload_file", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.ipsec_config.sync_tunnel_config", new_callable=AsyncMock)
+    @patch("app.services.kms.decrypt_psk", new_callable=AsyncMock, return_value="test-psk-plaintext")
     @patch("app.services.tunnel_service.audit.log_action", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
     async def test_retry_allowed_when_failed(
-        self, mock_get_tunnel, mock_lock, mock_audit, mock_upload, mock_fan_out
+        self, mock_get_tunnel, mock_lock, mock_audit, mock_decrypt, mock_sync
     ):
         """Retry is allowed when sync_status == 'failed'."""
         from app.services.tunnel_service import retry_tunnel_sync
@@ -495,6 +495,7 @@ class TestRetryTunnelSync:
         tunnel.id = 1
         tunnel.name = "test-tunnel"
         tunnel.sync_status = "failed"
+        tunnel.psk_encrypted = "dGVzdC1jaXBoZXJ0ZXh0"
         tunnel.local_cidrs = ["10.0.0.0/24"]
         tunnel.remote_cidrs = ["192.168.1.0/24"]
         tunnel.peer_ip = "1.2.3.4"
@@ -505,7 +506,7 @@ class TestRetryTunnelSync:
         tunnel.dpd_delay = 30
         tunnel.dpd_timeout = 150
         mock_get_tunnel.return_value = tunnel
-        mock_fan_out.return_value = _make_fan_out(2, 2)
+        mock_sync.return_value = _make_fan_out(2, 2)
 
         session = AsyncMock()
         user = MagicMock()
@@ -513,13 +514,13 @@ class TestRetryTunnelSync:
         result = await retry_tunnel_sync(session, 1, user=user)
         assert result.sync_status == "synced"
 
-    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
-    @patch("app.services.s3.upload_file", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.ipsec_config.sync_tunnel_config", new_callable=AsyncMock)
+    @patch("app.services.kms.decrypt_psk", new_callable=AsyncMock, return_value="test-psk-plaintext")
     @patch("app.services.tunnel_service.audit.log_action", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
     async def test_retry_allowed_when_partial(
-        self, mock_get_tunnel, mock_lock, mock_audit, mock_upload, mock_fan_out
+        self, mock_get_tunnel, mock_lock, mock_audit, mock_decrypt, mock_sync
     ):
         """Retry is allowed when sync_status == 'partial'."""
         from app.services.tunnel_service import retry_tunnel_sync
@@ -528,6 +529,7 @@ class TestRetryTunnelSync:
         tunnel.id = 1
         tunnel.name = "test-tunnel"
         tunnel.sync_status = "partial"
+        tunnel.psk_encrypted = "dGVzdC1jaXBoZXJ0ZXh0"
         tunnel.local_cidrs = ["10.0.0.0/24"]
         tunnel.remote_cidrs = ["192.168.1.0/24"]
         tunnel.peer_ip = "1.2.3.4"
@@ -538,7 +540,7 @@ class TestRetryTunnelSync:
         tunnel.dpd_delay = 30
         tunnel.dpd_timeout = 150
         mock_get_tunnel.return_value = tunnel
-        mock_fan_out.return_value = _make_fan_out(2, 2)
+        mock_sync.return_value = _make_fan_out(2, 2)
 
         session = AsyncMock()
         user = MagicMock()
@@ -713,14 +715,12 @@ class TestHealthEndpointSSH:
         return _make_fan_out(total, succeeded)
 
     @patch("app.routers.health.execute_on_all_servers", new_callable=AsyncMock)
-    @patch("app.routers.health.s3.check_connectivity", new_callable=AsyncMock)
-    async def test_all_servers_reachable_healthy(self, mock_s3, mock_fan_out):
-        """All servers reachable → ssh=ok → overall status=ok (if db+s3 ok)."""
+    async def test_all_servers_reachable_healthy(self, mock_fan_out):
+        """All servers reachable → ssh=ok → overall status=ok."""
         import httpx
 
         from app.main import app
 
-        mock_s3.return_value = True
         mock_fan_out.return_value = self._build_fan_out(total=2, succeeded=2)
 
         async def _override_get_db():
@@ -743,14 +743,12 @@ class TestHealthEndpointSSH:
         assert data["status"] == "ok"
 
     @patch("app.routers.health.execute_on_all_servers", new_callable=AsyncMock)
-    @patch("app.routers.health.s3.check_connectivity", new_callable=AsyncMock)
-    async def test_partial_servers_degraded(self, mock_s3, mock_fan_out):
+    async def test_partial_servers_degraded(self, mock_fan_out):
         """Some servers unreachable → ssh=degraded → status=not_ready."""
         import httpx
 
         from app.main import app
 
-        mock_s3.return_value = True
         mock_fan_out.return_value = self._build_fan_out(total=3, succeeded=2)
 
         async def _override_get_db():
@@ -773,14 +771,12 @@ class TestHealthEndpointSSH:
         assert data["status"] == "not_ready"
 
     @patch("app.routers.health.execute_on_all_servers", new_callable=AsyncMock)
-    @patch("app.routers.health.s3.check_connectivity", new_callable=AsyncMock)
-    async def test_all_servers_fail_unhealthy(self, mock_s3, mock_fan_out):
+    async def test_all_servers_fail_unhealthy(self, mock_fan_out):
         """All servers unreachable → ssh=failed → status=not_ready."""
         import httpx
 
         from app.main import app
 
-        mock_s3.return_value = True
         mock_fan_out.return_value = self._build_fan_out(total=2, succeeded=0)
 
         async def _override_get_db():
@@ -803,14 +799,12 @@ class TestHealthEndpointSSH:
         assert data["status"] == "not_ready"
 
     @patch("app.routers.health.execute_on_all_servers", new_callable=AsyncMock)
-    @patch("app.routers.health.s3.check_connectivity", new_callable=AsyncMock)
-    async def test_no_servers_registered_warn(self, mock_s3, mock_fan_out):
+    async def test_no_servers_registered_warn(self, mock_fan_out):
         """No servers registered → ssh=warn (not a hard failure)."""
         import httpx
 
         from app.main import app
 
-        mock_s3.return_value = True
         mock_fan_out.side_effect = InfrastructureError(
             service="SSH", message="No active servers registered"
         )

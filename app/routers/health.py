@@ -10,7 +10,6 @@ from app.db.session import get_db
 from app.exceptions import InfrastructureError
 from app.logging_config import get_logger
 from app.schemas.common import HealthResponse
-from app.services import s3
 from app.services.server_service import execute_on_all_servers
 
 logger = get_logger(__name__)
@@ -36,7 +35,7 @@ async def health_check() -> HealthResponse:
 async def readiness_check(
     db: AsyncSession = Depends(get_db),
 ) -> HealthResponse:
-    """Check connectivity to database, S3, and SSH servers. No authentication required.
+    """Check connectivity to database and SSH servers. No authentication required.
 
     SSH check semantics:
     - No servers registered  → ``warn``   (degraded, not an error)
@@ -54,15 +53,7 @@ async def readiness_check(
         logger.warning("readiness_db_check_failed")
         checks["db"] = "failed"
 
-    # S3 check
-    try:
-        s3_ok = await s3.check_connectivity()
-        checks["s3"] = "ok" if s3_ok else "failed"
-    except Exception:
-        logger.warning("readiness_s3_check_failed")
-        checks["s3"] = "failed"
-
-    # SSH fan-out check — replaces SSM connectivity check
+    # SSH fan-out check
     try:
         fan_out = await execute_on_all_servers(db, ["echo ok"])
         if fan_out.is_success:
