@@ -1204,6 +1204,11 @@ async def update_server(
     # Runs within the same transaction so the advisory lock is still held throughout.
     if engine_changed:
         await _repush_tunnels_on_engine_change(server, old_engine, session)
+        # The select inside _repush_tunnels_on_engine_change triggers an autoflush
+        # that writes ipsec_engine to the DB and expires server.updated_at.
+        # Refresh here so _server_to_dict can access updated_at synchronously
+        # without hitting MissingGreenlet in the async context.
+        await session.refresh(server)
 
     # Audit log
     await audit.log_action(

@@ -110,15 +110,25 @@ class TestRenderSwanctlConf:
         result = render_swanctl_conf(tunnel, "test-psk-value")
         assert "dpd_action = restart" in result
 
-    def test_local_block_contains_send_cert_never(self, tunnel):
-        """leftsendcert=never maps to send_cert = never inside local { }."""
+    def test_local_block_has_no_send_cert(self, tunnel):
+        """send_cert is not a valid key inside local { }; swanctl rejects it."""
         result = render_swanctl_conf(tunnel, "test-psk-value")
-        assert "send_cert = never" in result
-        # Verify it is inside the local { } block (appears after "local {" line)
         local_pos = result.index("    local {")
         local_close = result.index("    }", local_pos)
         local_block = result[local_pos:local_close]
-        assert "send_cert = never" in local_block
+        assert "send_cert" not in local_block
+
+    def test_no_invalid_connection_options(self, tunnel):
+        """rekey_attempts and compress do not exist in swanctl; keyingtries does."""
+        result = render_swanctl_conf(tunnel, "test-psk-value")
+        assert "rekey_attempts" not in result
+        assert "compress" not in result
+        assert "keyingtries = 0" in result
+
+    def test_psk_quotes_and_backslashes_are_escaped(self, tunnel):
+        """A '"' or '\\' in the PSK must not break the quoted secret."""
+        result = render_swanctl_conf(tunnel, 'a"b\\c')
+        assert 'secret = "a\\"b\\\\c"' in result
 
     def test_no_stroke_leftsendcert_literal(self, tunnel):
         """The stroke attribute name leftsendcert must not appear verbatim."""
