@@ -151,8 +151,7 @@ def render_swanctl_conf(tunnel: Tunnel, psk: str) -> str:
         # (equivalent to stroke's ikelifetime)
         f"    rekey_time = {tunnel.ike_lifetime}s",
         f"    dpd_delay = {tunnel.dpd_delay}s",
-        "    rekey_attempts = 0",
-        "    compress = no",
+        "    keyingtries = 0",
     ]
 
     # swanctl proposals are strict by default; no '!' suffix needed
@@ -168,7 +167,7 @@ def render_swanctl_conf(tunnel: Tunnel, psk: str) -> str:
         local_block.append(f"      id = {tunnel.local_id}")
     local_block.extend([
         "      auth = psk",
-        "      send_cert = never",
+        # send_cert = never is a stroke-only option; omit for swanctl PSK auth
         "    }",
     ])
     conn_lines.extend(local_block)
@@ -199,11 +198,14 @@ def render_swanctl_conf(tunnel: Tunnel, psk: str) -> str:
         "}",
     ])
 
+    # Escape PSK for UCL double-quoted string format (swanctl uses UCL).
+    # A raw '"' in the PSK terminates the string early; '\' must also be escaped.
+    _escaped_psk = psk.replace("\\", "\\\\").replace('"', '\\"')
     secrets_lines = [
         "secrets {",
         f"  ike-{tunnel.name} {{",
         "    id = %any",
-        f'    secret = "{psk}"',
+        f'    secret = "{_escaped_psk}"',
         "  }",
         "}",
     ]
