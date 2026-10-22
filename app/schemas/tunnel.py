@@ -4,7 +4,7 @@ from datetime import datetime
 from ipaddress import IPv4Address, IPv4Network
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 from app.schemas.iptables import IPTablesRuleDetail
 from app.schemas.route import RouteDetail
@@ -27,7 +27,23 @@ class TunnelCreate(BaseModel):
     dpd_delay: int = Field(default=30, ge=1, description="DPD delay in seconds")
     dpd_timeout: int = Field(default=150, ge=1, description="DPD timeout in seconds")
     local_id: str | None = Field(None, description="Local IKE identity (e.g. node's EIP). Omit to let strongSwan use the source IP.")
+    remote_id: str | None = Field(None, description="IKE identity the peer presents (IP, FQDN or email). Leave blank to use the Peer IP.")
+    start_action: Literal["trap", "none", "start"] = Field(default="trap", description="How to initiate the child SA: trap=route-based (auto=route), none=passive (auto=add), start=initiate immediately")
     ike_lifetime: int = Field(default=86400, ge=60, description="IKE SA lifetime in seconds")
+
+    @field_validator("remote_id")
+    @classmethod
+    def validate_remote_id(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            return None
+        if " " in v:
+            raise ValueError("remote_id must not contain spaces")
+        if '"' in v or "'" in v:
+            raise ValueError("remote_id must not contain quotes")
+        return v
 
 
 class TunnelUpdate(BaseModel):
@@ -47,7 +63,23 @@ class TunnelUpdate(BaseModel):
     dpd_timeout: int | None = Field(None, ge=1)
     status: Literal["active", "inactive"] | None = None
     local_id: str | None = None
+    remote_id: str | None = None
+    start_action: Literal["trap", "none", "start"] | None = None
     ike_lifetime: int | None = Field(None, ge=60, description="IKE SA lifetime in seconds")
+
+    @field_validator("remote_id")
+    @classmethod
+    def validate_remote_id(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            return None
+        if " " in v:
+            raise ValueError("remote_id must not contain spaces")
+        if '"' in v or "'" in v:
+            raise ValueError("remote_id must not contain quotes")
+        return v
 
 
 class TunnelSummary(BaseModel):
@@ -82,6 +114,8 @@ class TunnelDetail(BaseModel):
     dpd_delay: int
     dpd_timeout: int
     local_id: str | None = None
+    remote_id: str | None = None
+    start_action: str = "trap"
     ike_lifetime: int
     status: str
     sync_status: str

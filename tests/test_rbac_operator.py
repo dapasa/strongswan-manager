@@ -75,6 +75,8 @@ class TestOperatorTunnelAccess:
         mock_tunnel.dpd_delay = 30
         mock_tunnel.dpd_timeout = 150
         mock_tunnel.local_id = None
+        mock_tunnel.remote_id = None
+        mock_tunnel.start_action = "trap"
         mock_tunnel.ike_lifetime = 86400
         mock_tunnel.status = "active"
         mock_tunnel.sync_status = "synced"
@@ -122,6 +124,8 @@ class TestOperatorTunnelAccess:
         mock_tunnel.dpd_delay = 30
         mock_tunnel.dpd_timeout = 150
         mock_tunnel.local_id = None
+        mock_tunnel.remote_id = None
+        mock_tunnel.start_action = "trap"
         mock_tunnel.ike_lifetime = 86400
         mock_tunnel.status = "active"
         mock_tunnel.sync_status = "synced"
@@ -469,6 +473,8 @@ class TestAdminFullAccess:
         mock_tunnel.dpd_delay = 30
         mock_tunnel.dpd_timeout = 150
         mock_tunnel.local_id = None
+        mock_tunnel.remote_id = None
+        mock_tunnel.start_action = "trap"
         mock_tunnel.ike_lifetime = 86400
         mock_tunnel.status = "active"
         mock_tunnel.sync_status = "synced"

@@ -22,6 +22,7 @@ def tunnel():
     t.dpd_delay = 30
     t.dpd_timeout = 150
     t.local_id = None
+    t.start_action = "none"
     t.ike_lifetime = 86400
     return t
 
@@ -98,3 +99,23 @@ class TestTunnelModelDefaults:
         from app.db.models import Tunnel
         col = Tunnel.__table__.c["local_id"]
         assert col.nullable is True
+
+
+class TestStrokeStartAction:
+    def test_start_action_trap_renders_route(self, tunnel):
+        """start_action=trap maps to auto=route in stroke conf."""
+        tunnel.start_action = "trap"
+        result = render_connection_conf(tunnel)
+        assert "auto=route" in result
+
+    def test_start_action_none_renders_add(self, tunnel):
+        """start_action=none maps to auto=add in stroke conf."""
+        tunnel.start_action = "none"
+        result = render_connection_conf(tunnel)
+        assert "auto=add" in result
+
+    def test_start_action_start_renders_start(self, tunnel):
+        """start_action=start maps to auto=start in stroke conf."""
+        tunnel.start_action = "start"
+        result = render_connection_conf(tunnel)
+        assert "auto=start" in result

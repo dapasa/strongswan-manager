@@ -19,6 +19,11 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { useCreateTunnel, useUpdateTunnel } from '@/hooks/useTunnels'
 
 const DPD_ACTIONS = ['none', 'clear', 'restart']
+const START_ACTIONS = [
+  { value: 'trap', label: 'Route-based — initiate on traffic' },
+  { value: 'none', label: 'Passive — wait for peer to initiate' },
+  { value: 'start', label: 'Immediate — initiate on load' },
+]
 
 const ipv4Regex = /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$/
 const cidrRegex = /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\/(?:3[0-2]|[12]?\d)$/
@@ -94,6 +99,14 @@ function buildSchema(mode) {
             .optional()
             .default(''),
     local_id: z.string().optional().default(''),
+    remote_id: z
+      .string()
+      .optional()
+      .default('')
+      .refine((v) => !v || !/\s/.test(v), 'Remote Identity must not contain spaces')
+      .refine((v) => !v || !/"/.test(v), 'Remote Identity must not contain double quotes')
+      .refine((v) => !v || !/'/.test(v), "Remote Identity must not contain single quotes"),
+    start_action: z.enum(['trap', 'none', 'start']).optional().default('trap'),
     ike_lifetime: z
       .string()
       .transform((v) => (v === '' ? null : Number(v)))
@@ -163,6 +176,8 @@ export default function TunnelForm({ mode = 'create', tunnel }) {
       ike_version: tunnel?.ike_version ?? '2',
       psk: '',
       local_id: tunnel?.local_id ?? '',
+      remote_id: tunnel?.remote_id ?? '',
+      start_action: tunnel?.start_action ?? 'trap',
       ike_lifetime: tunnel?.ike_lifetime != null ? String(tunnel.ike_lifetime) : '86400',
       ike_proposals: tunnel?.ike_proposals ?? '',
       esp_proposals: tunnel?.esp_proposals ?? '',
@@ -186,6 +201,8 @@ export default function TunnelForm({ mode = 'create', tunnel }) {
       remote_cidrs: values.remote_cidrs.map((c) => c.value),
       ike_version: values.ike_version,
       local_id: values.local_id || null,
+      remote_id: values.remote_id || null,
+      start_action: values.start_action,
       ike_lifetime: values.ike_lifetime ?? 86400,
       ike_proposals: values.ike_proposals || null,
       esp_proposals: values.esp_proposals || null,
@@ -427,6 +444,45 @@ export default function TunnelForm({ mode = 'create', tunnel }) {
                 />
                 {errors.ike_lifetime && (
                   <p className="text-sm text-destructive">{errors.ike_lifetime.message}</p>
+                )}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="remote_id">Remote Identity (optional)</Label>
+                <Input
+                  id="remote_id"
+                  placeholder="e.g. peer.example.com or 203.0.113.1"
+                  {...register('remote_id')}
+                />
+                <p className="text-xs text-muted-foreground">
+                  IKE identity the peer presents (IP, FQDN or email). Leave blank to use the Peer IP.
+                </p>
+                {errors.remote_id && (
+                  <p className="text-sm text-destructive">{errors.remote_id.message}</p>
+                )}
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="start_action">Start Action</Label>
+                <Select
+                  value={watch('start_action')}
+                  onValueChange={(val) => setValue('start_action', val)}
+                >
+                  <SelectTrigger id="start_action">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {START_ACTIONS.map((a) => (
+                      <SelectItem key={a.value} value={a.value}>
+                        {a.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {errors.start_action && (
+                  <p className="text-sm text-destructive">{errors.start_action.message}</p>
                 )}
               </div>
             </div>

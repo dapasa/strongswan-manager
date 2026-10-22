@@ -26,6 +26,8 @@ def tunnel():
     t.dpd_delay = 30
     t.dpd_timeout = 150
     t.local_id = None
+    t.remote_id = None
+    t.start_action = "trap"
     t.ike_lifetime = 86400
     return t
 
@@ -44,9 +46,13 @@ class TestRenderSwanctlConf:
         assert "  ike-vpn-test {" in result
         assert 'secret = "test-psk-value"' in result
 
-    def test_secrets_id_is_percent_any(self, tunnel):
+    def test_secrets_id1_uses_peer_ip_when_no_remote_id(self, tunnel):
+        """When remote_id is None the secrets id-1 falls back to peer_ip."""
+        tunnel.remote_id = None
         result = render_swanctl_conf(tunnel, "test-psk-value")
-        assert "id = %any" in result
+        secrets_pos = result.index("secrets {")
+        secrets_block = result[secrets_pos:]
+        assert "id-1 = 203.0.113.1" in secrets_block
 
     def test_contains_local_cidrs(self, tunnel):
         result = render_swanctl_conf(tunnel, "test-psk-value")
@@ -168,13 +174,14 @@ class TestRenderSwanctlConf:
         result = render_swanctl_conf(tunnel, "test-psk-value")
         assert "!" not in result
 
-    def test_secrets_id_percent_any_unchanged(self, tunnel):
-        """The secrets block id = %any must remain regardless of local_id."""
+    def test_secrets_id1_uses_peer_ip_when_local_id_set(self, tunnel):
+        """When local_id is set but remote_id is None, id-1 still uses peer_ip."""
         tunnel.local_id = "44.215.155.152"
+        tunnel.remote_id = None
         result = render_swanctl_conf(tunnel, "test-psk-value")
         secrets_pos = result.index("secrets {")
         secrets_block = result[secrets_pos:]
-        assert "id = %any" in secrets_block
+        assert "id-1 = 203.0.113.1" in secrets_block
 
     def test_no_cidr_id_when_empty_local_cidrs(self):
         """With empty local_cidrs and no local_id there is no id line in local block."""
@@ -189,6 +196,8 @@ class TestRenderSwanctlConf:
         t.dpd_action = "none"
         t.dpd_delay = 30
         t.local_id = None
+        t.remote_id = None
+        t.start_action = "trap"
         t.ike_lifetime = 86400
         result = render_swanctl_conf(t, "psk")
         # No local_id set — id line must not appear in local block
@@ -196,6 +205,77 @@ class TestRenderSwanctlConf:
         local_close = result.index("    }", local_pos)
         local_block = result[local_pos:local_close]
         assert "id =" not in local_block
+
+
+    def test_remote_id_uses_peer_ip_when_none(self, tunnel):
+        """When remote_id is None the remote block uses peer_ip."""
+        tunnel.remote_id = None
+        result = render_swanctl_conf(tunnel, "test-psk-value")
+        remote_pos = result.index("    remote {")
+        remote_close = result.index("    }", remote_pos)
+        remote_block = result[remote_pos:remote_close]
+        assert "id = 203.0.113.1" in remote_block
+
+    def test_remote_id_uses_remote_id_when_set(self, tunnel):
+        """When remote_id is set it appears in the remote block."""
+        tunnel.remote_id = "client.example.com"
+        result = render_swanctl_conf(tunnel, "test-psk-value")
+        remote_pos = result.index("    remote {")
+        remote_close = result.index("    }", remote_pos)
+        remote_block = result[remote_pos:remote_close]
+        assert "id = client.example.com" in remote_block
+
+    def test_secrets_id1_uses_peer_ip_when_no_remote_id_set(self, tunnel):
+        """id-1 in secrets falls back to peer_ip when remote_id is None."""
+        tunnel.remote_id = None
+        result = render_swanctl_conf(tunnel, "test-psk-value")
+        secrets_pos = result.index("secrets {")
+        assert "id-1 = 203.0.113.1" in result[secrets_pos:]
+
+    def test_secrets_id1_uses_remote_id_when_set(self, tunnel):
+        """id-1 in secrets uses remote_id when set."""
+        tunnel.remote_id = "client.example.com"
+        result = render_swanctl_conf(tunnel, "test-psk-value")
+        secrets_pos = result.index("secrets {")
+        assert "id-1 = client.example.com" in result[secrets_pos:]
+
+    def test_secrets_id2_present_when_local_id_set(self, tunnel):
+        """id-2 appears in secrets when local_id is set."""
+        tunnel.local_id = "44.215.155.152"
+        result = render_swanctl_conf(tunnel, "test-psk-value")
+        secrets_pos = result.index("secrets {")
+        assert "id-2 = 44.215.155.152" in result[secrets_pos:]
+
+    def test_secrets_id2_absent_when_no_local_id(self, tunnel):
+        """id-2 does not appear in secrets when local_id is None."""
+        tunnel.local_id = None
+        result = render_swanctl_conf(tunnel, "test-psk-value")
+        secrets_pos = result.index("secrets {")
+        assert "id-2" not in result[secrets_pos:]
+
+    def test_start_action_trap(self, tunnel):
+        """start_action=trap renders as start_action = trap in children block."""
+        tunnel.start_action = "trap"
+        result = render_swanctl_conf(tunnel, "test-psk-value")
+        assert "start_action = trap" in result
+
+    def test_start_action_none(self, tunnel):
+        """start_action=none renders as start_action = none in children block."""
+        tunnel.start_action = "none"
+        result = render_swanctl_conf(tunnel, "test-psk-value")
+        assert "start_action = none" in result
+
+    def test_start_action_start(self, tunnel):
+        """start_action=start renders as start_action = start in children block."""
+        tunnel.start_action = "start"
+        result = render_swanctl_conf(tunnel, "test-psk-value")
+        assert "start_action = start" in result
+
+    def test_no_percent_any_in_secrets(self, tunnel):
+        """The secrets block must never contain %any."""
+        result = render_swanctl_conf(tunnel, "test-psk-value")
+        secrets_pos = result.index("secrets {")
+        assert "%any" not in result[secrets_pos:]
 
 
 class TestStrokeRendersUnchanged:
