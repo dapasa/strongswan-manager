@@ -66,10 +66,12 @@ def render_connection_conf(tunnel: Tunnel) -> str:
     if esp_strict:
         lines.append(f"    esp={esp_strict}")
 
+    _auto_map = {"trap": "route", "none": "add", "start": "start"}
+    _auto_val = _auto_map.get(tunnel.start_action, "add")
     lines.extend([
         "    authby=psk",
         "    type=tunnel",
-        "    auto=add",
+        f"    auto={_auto_val}",
         "    forceencaps=yes",
         "    fragmentation=yes",
         f"    dpdaction={tunnel.dpd_action}",
@@ -166,11 +168,10 @@ def render_swanctl_conf(tunnel: Tunnel, psk: str) -> str:
     ])
     conn_lines.extend(local_block)
 
+    _remote_id = tunnel.remote_id if tunnel.remote_id else tunnel.peer_ip
     conn_lines.extend([
         "    remote {",
-        # id = %any: wildcard selector — matches any IKE identity from the peer,
-        # which is correct for PSK matching where the remote identity is not fixed.
-        "      id = %any",
+        f"      id = {_remote_id}",
         "      auth = psk",
         "    }",
         "    children {",
@@ -178,7 +179,7 @@ def render_swanctl_conf(tunnel: Tunnel, psk: str) -> str:
         f"        local_ts = {local_cidrs}",
         f"        remote_ts = {remote_cidrs}",
         f"        dpd_action = {tunnel.dpd_action}",
-        "        start_action = none",
+        f"        start_action = {tunnel.start_action}",
         "        rekey_time = 3600s",
     ])
 
@@ -198,11 +199,15 @@ def render_swanctl_conf(tunnel: Tunnel, psk: str) -> str:
     secrets_lines = [
         "secrets {",
         f"  ike-{tunnel.name} {{",
-        "    id = %any",
+        f"    id-1 = {_remote_id}",
+    ]
+    if tunnel.local_id:
+        secrets_lines.append(f"    id-2 = {tunnel.local_id}")
+    secrets_lines.extend([
         f'    secret = "{_escaped_psk}"',
         "  }",
         "}",
-    ]
+    ])
 
     return "\n".join(conn_lines + [""] + secrets_lines) + "\n"
 

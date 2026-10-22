@@ -541,3 +541,53 @@ def test_server_update_invalid_port():
 def test_server_update_invalid_port_too_high():
     with pytest.raises(ValidationError):
         ServerUpdate(ssh_port=70000)
+
+
+# ---------------------------------------------------------------------------
+# TunnelCreate / TunnelUpdate — remote_id validator
+# ---------------------------------------------------------------------------
+
+
+def _base_create_kwargs():
+    return dict(
+        name="t",
+        peer_ip="203.0.113.1",
+        local_cidrs=["10.0.0.0/24"],
+        remote_cidrs=["192.168.1.0/24"],
+        psk="secret",
+    )
+
+
+def test_remote_id_accepts_none():
+    t = TunnelCreate(**_base_create_kwargs(), remote_id=None)
+    assert t.remote_id is None
+
+
+def test_remote_id_accepts_ip():
+    t = TunnelCreate(**_base_create_kwargs(), remote_id="192.168.1.1")
+    assert t.remote_id == "192.168.1.1"
+
+
+def test_remote_id_accepts_fqdn():
+    t = TunnelCreate(**_base_create_kwargs(), remote_id="client.example.com")
+    assert t.remote_id == "client.example.com"
+
+
+def test_remote_id_rejects_spaces():
+    with pytest.raises(ValidationError, match="spaces"):
+        TunnelCreate(**_base_create_kwargs(), remote_id="has space")
+
+
+def test_remote_id_rejects_double_quote():
+    with pytest.raises(ValidationError, match="quotes"):
+        TunnelCreate(**_base_create_kwargs(), remote_id='has"quote')
+
+
+def test_remote_id_rejects_single_quote():
+    with pytest.raises(ValidationError, match="quotes"):
+        TunnelCreate(**_base_create_kwargs(), remote_id="has'quote")
+
+
+def test_remote_id_update_rejects_spaces():
+    with pytest.raises(ValidationError, match="spaces"):
+        TunnelUpdate(remote_id="bad value")

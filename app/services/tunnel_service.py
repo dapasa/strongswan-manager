@@ -31,6 +31,8 @@ TUNNEL_RENDER_FIELDS: frozenset[str] = frozenset({
     "local_cidrs",
     "remote_cidrs",
     "local_id",
+    "remote_id",
+    "start_action",
     "ike_version",
     "ike_proposals",
     "esp_proposals",

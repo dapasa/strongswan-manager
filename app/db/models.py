@@ -81,6 +81,11 @@ class Tunnel(TimestampMixin, SoftDeleteMixin, Base):
     # strongSwan uses the source IP automatically. Renders as leftid (stroke)
     # or local { id = ... } (swanctl) — omitted entirely when null.
     local_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # IKE identity the remote peer presents. When null, falls back to peer_ip.
+    remote_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Controls how the child SA is initiated: 'trap' (route-based, waits for traffic),
+    # 'none' (passive, waits for peer to initiate), 'start' (initiates immediately).
+    start_action: Mapped[str] = mapped_column(Text, nullable=False, server_default="trap")
     # IKE SA lifetime in seconds. Hardcoded as 86400 previously; now configurable.
     ike_lifetime: Mapped[int] = mapped_column(Integer, server_default=text("86400"))
     created_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
@@ -98,6 +103,7 @@ class Tunnel(TimestampMixin, SoftDeleteMixin, Base):
             name="ck_tunnels_sync_status",
         ),
         CheckConstraint("dpd_action IN ('none', 'clear', 'restart')", name="ck_tunnels_dpd_action"),
+        CheckConstraint("start_action IN ('trap', 'none', 'start')", name="ck_tunnels_start_action"),
         Index(
             "idx_tunnels_name_active",
             "name",

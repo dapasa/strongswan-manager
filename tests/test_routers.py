@@ -160,6 +160,8 @@ class TestTunnelRouter:
         tunnel.dpd_delay = 30
         tunnel.dpd_timeout = 150
         tunnel.local_id = None
+        tunnel.remote_id = None
+        tunnel.start_action = "trap"
         tunnel.ike_lifetime = 86400
         tunnel.status = "active"
         tunnel.sync_status = "synced"
