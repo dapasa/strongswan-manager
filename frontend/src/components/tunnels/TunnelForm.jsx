@@ -63,8 +63,8 @@ function buildSchema(mode) {
     peer_ip: z
       .string()
       .min(1, 'Peer IP is required')
-      .refine(isNotCidr, 'Enter an IP address, not a CIDR (remove the /prefix)')
-      .regex(ipv4Regex, 'Must be a valid IPv4 address'),
+      .regex(ipv4Regex, 'Must be a valid IPv4 address')
+      .refine(isNotCidr, 'Enter an IP address, not a CIDR (remove the /prefix)'),
     local_cidrs: z
       .array(cidrEntry)
       .min(1, 'At least one local CIDR is required')
