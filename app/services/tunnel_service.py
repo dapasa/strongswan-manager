@@ -211,6 +211,8 @@ async def create_tunnel(
         dpd_action=data.dpd_action,
         dpd_delay=data.dpd_delay,
         dpd_timeout=data.dpd_timeout,
+        local_id=data.local_id,
+        ike_lifetime=data.ike_lifetime,
         status="active",
         sync_status="pending",
         psk_encrypted=psk_encrypted,
@@ -323,6 +325,10 @@ async def update_tunnel(
             setattr(tunnel, field, str(value))
         elif field in ("local_cidrs", "remote_cidrs") and value is not None:
             setattr(tunnel, field, [str(c) for c in value])
+        elif field == "ike_lifetime" and value is None:
+            # ike_lifetime is NOT NULL; skip if explicitly sent as null rather than
+            # overwriting a valid value with NULL and violating the DB constraint.
+            pass
         else:
             setattr(tunnel, field, value)
 

@@ -440,3 +440,225 @@ class TestTerragruntFileOps:
 
             url = _authenticated_url()
             assert url == "https://ghp_abc123@github.com/org/repo.git"
+
+
+
+# ---------------------------------------------------------------------------
+# Tunnel service — create_tunnel and update_tunnel field handling
+# ---------------------------------------------------------------------------
+
+
+class TestTunnelServiceCreateFields:
+    """Verify create_tunnel passes local_id and ike_lifetime to the Tunnel constructor."""
+
+    @patch("app.services.tunnel_service.audit")
+    @patch("app.services.tunnel_service.ipsec_config")
+    @patch("app.services.kms.encrypt_psk", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
+    async def test_create_tunnel_passes_local_id_and_ike_lifetime(
+        self, mock_lock, mock_encrypt, mock_ipsec, mock_audit
+    ):
+        from ipaddress import IPv4Address, IPv4Network
+
+        from app.schemas.tunnel import TunnelCreate
+        from app.services.tunnel_service import create_tunnel
+        from app.utils.fan_out import FanOutResult, ServerResult
+
+        session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None
+        session.execute.return_value = mock_result
+
+        mock_encrypt.return_value = "encrypted_psk"
+        fan_out = FanOutResult(
+            total=1, succeeded=1, failed=0,
+            servers=[ServerResult(server_id=1, server_name="vpn-1", success=True, output="ok")],
+        )
+        mock_ipsec.sync_tunnel_config = AsyncMock(return_value=fan_out)
+        mock_audit.log_action = AsyncMock()
+
+        user = MagicMock()
+        user.id = 1
+
+        data = TunnelCreate(
+            name="t1",
+            peer_ip=IPv4Address("10.0.0.1"),
+            local_cidrs=[IPv4Network("192.168.0.0/24")],
+            remote_cidrs=[IPv4Network("10.100.0.0/24")],
+            psk="secret",
+            local_id="eip-203.0.113.5",
+            ike_lifetime=28800,
+        )
+
+        await create_tunnel(session, data=data, user=user)
+
+        # The Tunnel instance is captured from session.add()
+        assert session.add.called
+        tunnel_obj = session.add.call_args[0][0]
+        assert tunnel_obj.local_id == "eip-203.0.113.5"
+        assert tunnel_obj.ike_lifetime == 28800
+
+    @patch("app.services.tunnel_service.audit")
+    @patch("app.services.tunnel_service.ipsec_config")
+    @patch("app.services.kms.encrypt_psk", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
+    async def test_create_tunnel_defaults_local_id_none_ike_lifetime_86400(
+        self, mock_lock, mock_encrypt, mock_ipsec, mock_audit
+    ):
+        """When local_id and ike_lifetime are omitted, schema defaults are forwarded."""
+        from ipaddress import IPv4Address, IPv4Network
+
+        from app.schemas.tunnel import TunnelCreate
+        from app.services.tunnel_service import create_tunnel
+        from app.utils.fan_out import FanOutResult, ServerResult
+
+        session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None
+        session.execute.return_value = mock_result
+
+        mock_encrypt.return_value = "enc"
+        fan_out = FanOutResult(
+            total=1, succeeded=1, failed=0,
+            servers=[ServerResult(server_id=1, server_name="vpn-1", success=True, output="ok")],
+        )
+        mock_ipsec.sync_tunnel_config = AsyncMock(return_value=fan_out)
+        mock_audit.log_action = AsyncMock()
+
+        user = MagicMock()
+        user.id = 1
+
+        data = TunnelCreate(
+            name="t2",
+            peer_ip=IPv4Address("10.0.0.2"),
+            local_cidrs=[IPv4Network("192.168.0.0/24")],
+            remote_cidrs=[IPv4Network("10.100.0.0/24")],
+            psk="secret",
+        )
+
+        await create_tunnel(session, data=data, user=user)
+
+        assert session.add.called
+        tunnel_obj = session.add.call_args[0][0]
+        assert tunnel_obj.local_id is None
+        assert tunnel_obj.ike_lifetime == 86400
+
+
+class TestTunnelServiceUpdateFields:
+    """Verify update_tunnel handles local_id and ike_lifetime correctly."""
+
+    def _make_tunnel(self, local_id=None, ike_lifetime=86400):
+        tunnel = MagicMock()
+        tunnel.id = 1
+        tunnel.name = "existing"
+        tunnel.local_id = local_id
+        tunnel.ike_lifetime = ike_lifetime
+        tunnel.psk_encrypted = "enc"
+        tunnel.sync_status = "synced"
+        return tunnel
+
+    @patch("app.services.tunnel_service.audit")
+    @patch("app.services.tunnel_service.ipsec_config")
+    @patch("app.services.kms.decrypt_psk", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
+    async def test_update_tunnel_sets_local_id(
+        self, mock_get, mock_lock, mock_sftp, mock_decrypt, mock_ipsec, mock_audit
+    ):
+        from app.schemas.tunnel import TunnelUpdate
+        from app.services.tunnel_service import update_tunnel
+        from app.utils.fan_out import FanOutResult, ServerResult
+
+        tunnel = self._make_tunnel()
+        mock_get.return_value = tunnel
+
+        mock_decrypt.return_value = "plain_psk"
+        fan_out = FanOutResult(
+            total=1, succeeded=1, failed=0,
+            servers=[ServerResult(server_id=1, server_name="vpn-1", success=True, output="ok")],
+        )
+        mock_sftp.return_value = fan_out
+        mock_ipsec.render_connection_conf = MagicMock(return_value="conf")
+        mock_audit.log_action = AsyncMock()
+
+        session = AsyncMock()
+        session.execute.return_value = MagicMock()
+        user = MagicMock()
+        user.id = 1
+
+        data = TunnelUpdate(local_id="203.0.113.99")
+        await update_tunnel(session, 1, data=data, user=user)
+
+        assert tunnel.local_id == "203.0.113.99"
+
+    @patch("app.services.tunnel_service.audit")
+    @patch("app.services.tunnel_service.ipsec_config")
+    @patch("app.services.kms.decrypt_psk", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
+    async def test_update_tunnel_ike_lifetime_none_not_overwritten(
+        self, mock_get, mock_lock, mock_sftp, mock_decrypt, mock_ipsec, mock_audit
+    ):
+        """Sending ike_lifetime=null must not overwrite the existing value with NULL."""
+        from app.schemas.tunnel import TunnelUpdate
+        from app.services.tunnel_service import update_tunnel
+        from app.utils.fan_out import FanOutResult, ServerResult
+
+        tunnel = self._make_tunnel(ike_lifetime=3600)
+        mock_get.return_value = tunnel
+
+        mock_decrypt.return_value = "plain_psk"
+        fan_out = FanOutResult(
+            total=1, succeeded=1, failed=0,
+            servers=[ServerResult(server_id=1, server_name="vpn-1", success=True, output="ok")],
+        )
+        mock_sftp.return_value = fan_out
+        mock_ipsec.render_connection_conf = MagicMock(return_value="conf")
+        mock_audit.log_action = AsyncMock()
+
+        session = AsyncMock()
+        session.execute.return_value = MagicMock()
+        user = MagicMock()
+        user.id = 1
+
+        data = TunnelUpdate(ike_lifetime=None)
+        await update_tunnel(session, 1, data=data, user=user)
+
+        assert tunnel.ike_lifetime == 3600
+
+    @patch("app.services.tunnel_service.audit")
+    @patch("app.services.tunnel_service.ipsec_config")
+    @patch("app.services.kms.decrypt_psk", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
+    async def test_update_tunnel_ike_lifetime_valid_value_updated(
+        self, mock_get, mock_lock, mock_sftp, mock_decrypt, mock_ipsec, mock_audit
+    ):
+        from app.schemas.tunnel import TunnelUpdate
+        from app.services.tunnel_service import update_tunnel
+        from app.utils.fan_out import FanOutResult, ServerResult
+
+        tunnel = self._make_tunnel(ike_lifetime=86400)
+        mock_get.return_value = tunnel
+
+        mock_decrypt.return_value = "plain_psk"
+        fan_out = FanOutResult(
+            total=1, succeeded=1, failed=0,
+            servers=[ServerResult(server_id=1, server_name="vpn-1", success=True, output="ok")],
+        )
+        mock_sftp.return_value = fan_out
+        mock_ipsec.render_connection_conf = MagicMock(return_value="conf")
+        mock_audit.log_action = AsyncMock()
+
+        session = AsyncMock()
+        session.execute.return_value = MagicMock()
+        user = MagicMock()
+        user.id = 1
+
+        data = TunnelUpdate(ike_lifetime=7200)
+        await update_tunnel(session, 1, data=data, user=user)
+
+        assert tunnel.ike_lifetime == 7200

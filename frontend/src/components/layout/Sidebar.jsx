@@ -28,7 +28,7 @@ export default function Sidebar({ className, onNavigate }) {
   return (
     <aside
       className={cn(
-        'flex h-full w-64 flex-col bg-sidebar',
+        'flex h-screen w-64 flex-col bg-sidebar sticky top-0',
         className,
       )}
     >
