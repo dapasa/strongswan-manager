@@ -358,10 +358,7 @@ async def update_tunnel(
             else:
                 # Config-only change, no PSK in request: decrypt from DB and full push.
                 psk_plain = await kms.decrypt_psk(tunnel.psk_encrypted)
-                conf_content = ipsec_config.render_connection_conf(tunnel)
-                fan_out_result = await sftp_push_on_all_servers(
-                    session, tunnel.name, conf_content, secrets_content=None
-                )
+                fan_out_result = await ipsec_config.sync_tunnel_config(tunnel, psk_plain, session)
                 _apply_fan_out_result(tunnel, fan_out_result)
 
             logger.info(
