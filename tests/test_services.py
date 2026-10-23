@@ -335,6 +335,8 @@ class TestIPSecConfigGenerator:
         tunnel = MagicMock()
         tunnel.peer_ip = "203.0.113.1"
         tunnel.local_cidrs = ["10.0.0.0/24"]
+        tunnel.remote_id = None
+        tunnel.local_id = None
 
         content = render_secrets_file(tunnel, "MySecretPSK")
         assert '203.0.113.1 10.0.0.0 : PSK "MySecretPSK"' in content
@@ -580,6 +582,7 @@ class TestTunnelServiceUpdateFields:
         )
         mock_sftp.return_value = fan_out
         mock_ipsec.render_connection_conf = MagicMock(return_value="conf")
+        mock_ipsec.sync_tunnel_config = AsyncMock(return_value=fan_out)
         mock_audit.log_action = AsyncMock()
 
         session = AsyncMock()
@@ -616,6 +619,7 @@ class TestTunnelServiceUpdateFields:
         )
         mock_sftp.return_value = fan_out
         mock_ipsec.render_connection_conf = MagicMock(return_value="conf")
+        mock_ipsec.sync_tunnel_config = AsyncMock(return_value=fan_out)
         mock_audit.log_action = AsyncMock()
 
         session = AsyncMock()
@@ -651,6 +655,7 @@ class TestTunnelServiceUpdateFields:
         )
         mock_sftp.return_value = fan_out
         mock_ipsec.render_connection_conf = MagicMock(return_value="conf")
+        mock_ipsec.sync_tunnel_config = AsyncMock(return_value=fan_out)
         mock_audit.log_action = AsyncMock()
 
         session = AsyncMock()

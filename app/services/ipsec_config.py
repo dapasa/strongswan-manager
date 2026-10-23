@@ -92,7 +92,13 @@ def render_connection_conf(tunnel: Tunnel) -> str:
 def render_secrets_file(tunnel: Tunnel, psk: str) -> str:
     """Render a StrongSwan secrets file for a tunnel.
 
-    Format: ``<right_ip> <left_ip> : PSK "<psk>"``
+    Format: ``<remote_id> <local_id> : PSK "<psk>"``
+
+    Uses ``remote_id`` when set, otherwise falls back to ``peer_ip``.
+    Uses ``local_id`` when set, otherwise falls back to the first IP in
+    ``local_cidrs`` (or ``%any`` if local_cidrs is empty).
+
+    This mirrors the identity resolution used by ``render_swanctl_conf``.
 
     Args:
         tunnel: The Tunnel model instance.
@@ -101,8 +107,10 @@ def render_secrets_file(tunnel: Tunnel, psk: str) -> str:
     Returns:
         The rendered .secrets file content.
     """
-    left_ip = str(tunnel.local_cidrs[0]).split("/")[0] if tunnel.local_cidrs else "%any"
-    return f'{tunnel.peer_ip} {left_ip} : PSK "{psk}"\n'
+    remote = tunnel.remote_id if tunnel.remote_id else tunnel.peer_ip
+    left_fallback = str(tunnel.local_cidrs[0]).split("/")[0] if tunnel.local_cidrs else "%any"
+    local = tunnel.local_id if tunnel.local_id else left_fallback
+    return f'{remote} {local} : PSK "{psk}"\n'
 
 
 def render_swanctl_conf(tunnel: Tunnel, psk: str) -> str:
