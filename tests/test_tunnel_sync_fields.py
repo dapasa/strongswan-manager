@@ -125,19 +125,15 @@ class TestPatchLocalIdTriggerSync:
         tunnel = _make_tunnel()
         mock_audit.log_action = AsyncMock()
         fan_out = self._make_fan_out()
-        # psk=None path: render_connection_conf + sftp_push_on_all_servers (no sync_tunnel_config)
-        mock_ipsec.render_connection_conf.return_value = "conn t1\n"
-        mock_push.return_value = fan_out
+        mock_ipsec.sync_tunnel_config = AsyncMock(return_value=fan_out)
 
         with patch("app.services.kms.decrypt_psk", new_callable=AsyncMock, return_value="test-psk"), \
              patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock, return_value=tunnel):
             data = TunnelUpdate(local_id="44.215.155.152")
             await update_tunnel(self._make_session(), tunnel.id, data=data, user=MagicMock(id=1), request=None)
 
-        # render_connection_conf was called (sync path entered)
-        mock_ipsec.render_connection_conf.assert_called_once()
-        # sftp fan-out was triggered
-        mock_push.assert_called_once()
+        # sync_tunnel_config was called (full re-push path entered)
+        mock_ipsec.sync_tunnel_config.assert_called_once()
 
     @pytest.mark.asyncio
     @patch("app.services.ipsec_config.sftp_push_on_all_servers", new_callable=AsyncMock)
@@ -153,16 +149,14 @@ class TestPatchLocalIdTriggerSync:
         tunnel = _make_tunnel()
         mock_audit.log_action = AsyncMock()
         fan_out = self._make_fan_out()
-        mock_ipsec.render_connection_conf.return_value = "conn t1\n"
-        mock_push.return_value = fan_out
+        mock_ipsec.sync_tunnel_config = AsyncMock(return_value=fan_out)
 
         with patch("app.services.kms.decrypt_psk", new_callable=AsyncMock, return_value="test-psk"), \
              patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock, return_value=tunnel):
             data = TunnelUpdate(ike_lifetime=7200)
             await update_tunnel(self._make_session(), tunnel.id, data=data, user=MagicMock(id=1), request=None)
 
-        mock_ipsec.render_connection_conf.assert_called_once()
-        mock_push.assert_called_once()
+        mock_ipsec.sync_tunnel_config.assert_called_once()
 
     @pytest.mark.asyncio
     @patch("app.services.ipsec_config.sftp_push_on_all_servers", new_callable=AsyncMock)
