@@ -17,7 +17,7 @@ from app.services import audit, ipsec_config
 from app.services import ssm  # SSM retained for iptables cascade — migrate with iptables-ssh-migration
 from app.services.iptables_service import build_iptables_command
 from app.services.locks import LOCK_IPSEC_CONFIG, require_lock
-from app.services.server_service import execute_on_all_servers, sftp_push_on_all_servers
+from app.services.server_service import execute_on_all_servers
 from app.utils.fan_out import FanOutResult
 
 logger = get_logger(__name__)

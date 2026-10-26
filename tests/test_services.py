@@ -562,7 +562,7 @@ class TestTunnelServiceUpdateFields:
     @patch("app.services.tunnel_service.audit")
     @patch("app.services.tunnel_service.ipsec_config")
     @patch("app.services.kms.decrypt_psk", new_callable=AsyncMock)
-    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.ipsec_config.sftp_push_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
     async def test_update_tunnel_sets_local_id(
@@ -598,7 +598,7 @@ class TestTunnelServiceUpdateFields:
     @patch("app.services.tunnel_service.audit")
     @patch("app.services.tunnel_service.ipsec_config")
     @patch("app.services.kms.decrypt_psk", new_callable=AsyncMock)
-    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.ipsec_config.sftp_push_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
     async def test_update_tunnel_ike_lifetime_none_not_overwritten(
@@ -635,7 +635,7 @@ class TestTunnelServiceUpdateFields:
     @patch("app.services.tunnel_service.audit")
     @patch("app.services.tunnel_service.ipsec_config")
     @patch("app.services.kms.decrypt_psk", new_callable=AsyncMock)
-    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.ipsec_config.sftp_push_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
     async def test_update_tunnel_ike_lifetime_valid_value_updated(

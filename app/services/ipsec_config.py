@@ -55,7 +55,7 @@ def render_connection_conf(tunnel: Tunnel) -> str:
         "    leftauth=psk",
         "    leftsendcert=never",
         f"    right={tunnel.peer_ip}",
-        "    rightid=%any",
+        f"    rightid={tunnel.remote_id if tunnel.remote_id else tunnel.peer_ip}",
         f"    rightsubnet={remote_cidrs}",
         "    rightauth=psk",
     ])

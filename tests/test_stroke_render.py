@@ -22,6 +22,7 @@ def tunnel():
     t.dpd_delay = 30
     t.dpd_timeout = 150
     t.local_id = None
+    t.remote_id = None
     t.start_action = "none"
     t.ike_lifetime = 86400
     return t
@@ -119,3 +120,18 @@ class TestStrokeStartAction:
         tunnel.start_action = "start"
         result = render_connection_conf(tunnel)
         assert "auto=start" in result
+
+
+class TestStrokeRightId:
+    def test_rightid_uses_remote_id_when_set(self, tunnel):
+        """rightid must be the explicit remote_id when provided."""
+        tunnel.remote_id = "203.0.113.42"
+        result = render_connection_conf(tunnel)
+        assert "rightid=203.0.113.42" in result
+
+    def test_rightid_falls_back_to_peer_ip_when_remote_id_empty(self, tunnel):
+        """rightid must fall back to peer_ip when remote_id is None."""
+        tunnel.remote_id = None
+        result = render_connection_conf(tunnel)
+        assert f"rightid={tunnel.peer_ip}" in result
+        assert "rightid=%any" not in result
