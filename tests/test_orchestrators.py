@@ -125,11 +125,11 @@ Security Associations (0 up, 1 connecting):
 """
         assert _parse_tunnel_state("prod-tunnel", output) == "DOWN"
 
-    def test_unknown_tunnel_not_in_output(self):
+    def test_tunnel_down_when_not_in_output(self):
         from app.services.tunnel_service import _parse_tunnel_state
 
         output = "Security Associations (0 up, 0 connecting):"
-        assert _parse_tunnel_state("missing-tunnel", output) == "UNKNOWN"
+        assert _parse_tunnel_state("missing-tunnel", output) == "DOWN"
 
     def test_empty_output(self):
         from app.services.tunnel_service import _parse_tunnel_state

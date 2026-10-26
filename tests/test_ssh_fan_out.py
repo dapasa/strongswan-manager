@@ -643,11 +643,11 @@ class TestAggregateTunnelStates:
 
         assert _parse_tunnel_state("vpn-tunnel", "") == "UNKNOWN"
 
-    def test_parse_tunnel_state_unknown_when_not_found(self):
+    def test_parse_tunnel_state_down_when_not_found(self):
         from app.services.tunnel_service import _parse_tunnel_state
 
         output = "other-tunnel: ESTABLISHED\nanother-tunnel: INSTALLED"
-        assert _parse_tunnel_state("vpn-tunnel", output) == "UNKNOWN"
+        assert _parse_tunnel_state("vpn-tunnel", output) == "DOWN"
 
     @patch("app.services.tunnel_service.execute_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
