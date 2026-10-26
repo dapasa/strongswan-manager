@@ -335,6 +335,8 @@ class TestIPSecConfigGenerator:
         tunnel = MagicMock()
         tunnel.peer_ip = "203.0.113.1"
         tunnel.local_cidrs = ["10.0.0.0/24"]
+        tunnel.remote_id = None
+        tunnel.local_id = None
 
         content = render_secrets_file(tunnel, "MySecretPSK")
         assert '203.0.113.1 10.0.0.0 : PSK "MySecretPSK"' in content
@@ -560,7 +562,7 @@ class TestTunnelServiceUpdateFields:
     @patch("app.services.tunnel_service.audit")
     @patch("app.services.tunnel_service.ipsec_config")
     @patch("app.services.kms.decrypt_psk", new_callable=AsyncMock)
-    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.ipsec_config.sftp_push_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
     async def test_update_tunnel_sets_local_id(
@@ -580,6 +582,7 @@ class TestTunnelServiceUpdateFields:
         )
         mock_sftp.return_value = fan_out
         mock_ipsec.render_connection_conf = MagicMock(return_value="conf")
+        mock_ipsec.sync_tunnel_config = AsyncMock(return_value=fan_out)
         mock_audit.log_action = AsyncMock()
 
         session = AsyncMock()
@@ -595,7 +598,7 @@ class TestTunnelServiceUpdateFields:
     @patch("app.services.tunnel_service.audit")
     @patch("app.services.tunnel_service.ipsec_config")
     @patch("app.services.kms.decrypt_psk", new_callable=AsyncMock)
-    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.ipsec_config.sftp_push_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
     async def test_update_tunnel_ike_lifetime_none_not_overwritten(
@@ -616,6 +619,7 @@ class TestTunnelServiceUpdateFields:
         )
         mock_sftp.return_value = fan_out
         mock_ipsec.render_connection_conf = MagicMock(return_value="conf")
+        mock_ipsec.sync_tunnel_config = AsyncMock(return_value=fan_out)
         mock_audit.log_action = AsyncMock()
 
         session = AsyncMock()
@@ -631,7 +635,7 @@ class TestTunnelServiceUpdateFields:
     @patch("app.services.tunnel_service.audit")
     @patch("app.services.tunnel_service.ipsec_config")
     @patch("app.services.kms.decrypt_psk", new_callable=AsyncMock)
-    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.ipsec_config.sftp_push_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
     async def test_update_tunnel_ike_lifetime_valid_value_updated(
@@ -651,6 +655,7 @@ class TestTunnelServiceUpdateFields:
         )
         mock_sftp.return_value = fan_out
         mock_ipsec.render_connection_conf = MagicMock(return_value="conf")
+        mock_ipsec.sync_tunnel_config = AsyncMock(return_value=fan_out)
         mock_audit.log_action = AsyncMock()
 
         session = AsyncMock()

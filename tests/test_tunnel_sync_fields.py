@@ -111,7 +111,7 @@ class TestPatchLocalIdTriggerSync:
         return session
 
     @pytest.mark.asyncio
-    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.ipsec_config.sftp_push_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.audit")
     @patch("app.services.tunnel_service.ipsec_config")
@@ -140,7 +140,7 @@ class TestPatchLocalIdTriggerSync:
         mock_push.assert_called_once()
 
     @pytest.mark.asyncio
-    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.ipsec_config.sftp_push_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.audit")
     @patch("app.services.tunnel_service.ipsec_config")
@@ -165,7 +165,7 @@ class TestPatchLocalIdTriggerSync:
         mock_push.assert_called_once()
 
     @pytest.mark.asyncio
-    @patch("app.services.tunnel_service.sftp_push_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.ipsec_config.sftp_push_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.audit")
     @patch("app.services.tunnel_service.ipsec_config")
