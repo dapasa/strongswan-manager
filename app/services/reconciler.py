@@ -82,12 +82,20 @@ async def _process_tunnel(
         tunnel.sync_status = fan_out_result.to_sync_status()
         tunnel.sync_error = fan_out_result.to_sync_error()
         tunnel.sync_details = fan_out_result.to_sync_details()
-        logger.info(
-            "reconciler_tunnel_synced",
-            tunnel_id=tunnel_id,
-            sync_status=tunnel.sync_status,
-            attempt=attempt,
-        )
+        if tunnel.sync_status == "synced":
+            logger.info(
+                "reconciler_tunnel_synced",
+                tunnel_id=tunnel_id,
+                sync_status=tunnel.sync_status,
+                attempt=attempt,
+            )
+        else:
+            logger.warning(
+                "reconciler_tunnel_still_failing",
+                tunnel_id=tunnel_id,
+                sync_status=tunnel.sync_status,
+                attempt=attempt,
+            )
     except InfrastructureError as exc:
         tunnel.sync_status = "failed"
         tunnel.sync_error = exc.message

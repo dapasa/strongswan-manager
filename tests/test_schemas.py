@@ -591,3 +591,57 @@ def test_remote_id_rejects_single_quote():
 def test_remote_id_update_rejects_spaces():
     with pytest.raises(ValidationError, match="spaces"):
         TunnelUpdate(remote_id="bad value")
+
+
+# ---------------------------------------------------------------------------
+# TunnelCreate / TunnelUpdate — ike_proposals / esp_proposals validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("proposals", [
+    "aes256-sha256-modp2048",
+    "aes256-sha256",
+    "aes256-sha256-ecp521",
+    "aes256gcm16-prfsha384-ecp384",
+    "aes128-sha1-modp1024!",
+    "3des-sha1-modp1024",
+    "aes256-sha256-modp2048,aes128-sha1-modp1024",
+])
+def test_ike_proposals_valid(proposals):
+    t = TunnelCreate(**_base_create_kwargs(), ike_proposals=proposals)
+    assert t.ike_proposals == proposals
+
+
+def test_ike_proposals_none_accepted():
+    t = TunnelCreate(**_base_create_kwargs())
+    assert t.ike_proposals is None
+
+
+def test_ike_proposals_invalid_keyword():
+    with pytest.raises(ValidationError, match="unrecognized"):
+        TunnelCreate(**_base_create_kwargs(), ike_proposals="aes256-bogus-modp9999")
+
+
+def test_esp_proposals_invalid_keyword():
+    with pytest.raises(ValidationError, match="unrecognized"):
+        TunnelCreate(**_base_create_kwargs(), esp_proposals="aes256-bogus-modp9999")
+
+
+def test_tunnel_update_proposals_invalid():
+    with pytest.raises(ValidationError, match="unrecognized"):
+        TunnelUpdate(ike_proposals="bad-keyword")
+
+
+def test_tunnel_update_proposals_valid():
+    t = TunnelUpdate(ike_proposals="aes256-sha256-modp2048")
+    assert t.ike_proposals == "aes256-sha256-modp2048"
+
+
+def test_esp_proposals_esn_accepted():
+    t = TunnelCreate(**_base_create_kwargs(), esp_proposals="aes256gcm16-esn")
+    assert t.esp_proposals == "aes256gcm16-esn"
+
+
+def test_proposals_none_on_update_accepted():
+    t = TunnelUpdate(esp_proposals=None)
+    assert t.esp_proposals is None

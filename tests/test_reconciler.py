@@ -353,3 +353,79 @@ class TestReconcilerLoop:
             await reconciler_loop(factory, settings)
 
         assert mock_reconcile.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# _process_tunnel — log event distinction
+# ---------------------------------------------------------------------------
+
+
+class TestProcessTunnelLogEvents:
+    """Verify that distinct log events are emitted for synced vs still-failing."""
+
+    @patch("app.services.reconciler.acquire_advisory_lock", new_callable=AsyncMock, return_value=True)
+    @patch("app.services.reconciler.audit.log_action", new_callable=AsyncMock)
+    @patch("app.services.reconciler.ipsec_config.sync_tunnel_config", new_callable=AsyncMock)
+    @patch("app.services.reconciler.kms.decrypt_psk", new_callable=AsyncMock, return_value="psk")
+    @patch("app.services.reconciler.logger")
+    async def test_logs_synced_on_full_success(
+        self, mock_logger, mock_decrypt, mock_sync, mock_audit, mock_lock
+    ):
+        """Full fan-out success logs reconciler_tunnel_synced (info)."""
+        from app.services.reconciler import _process_tunnel
+
+        tunnel = _make_tunnel(1, "failed")
+        session = AsyncMock()
+        session.execute.return_value = _mock_execute_scalar_one_or_none(tunnel)
+        mock_sync.return_value = FanOutResult(total=2, succeeded=2, failed=0)
+
+        await _process_tunnel({}, 1, session, _make_settings())
+
+        info_events = [c.args[0] for c in mock_logger.info.call_args_list]
+        assert "reconciler_tunnel_synced" in info_events
+        warning_events = [c.args[0] for c in mock_logger.warning.call_args_list]
+        assert "reconciler_tunnel_still_failing" not in warning_events
+
+    @patch("app.services.reconciler.acquire_advisory_lock", new_callable=AsyncMock, return_value=True)
+    @patch("app.services.reconciler.audit.log_action", new_callable=AsyncMock)
+    @patch("app.services.reconciler.ipsec_config.sync_tunnel_config", new_callable=AsyncMock)
+    @patch("app.services.reconciler.kms.decrypt_psk", new_callable=AsyncMock, return_value="psk")
+    @patch("app.services.reconciler.logger")
+    async def test_logs_still_failing_on_partial(
+        self, mock_logger, mock_decrypt, mock_sync, mock_audit, mock_lock
+    ):
+        """Partial fan-out result logs reconciler_tunnel_still_failing (warning)."""
+        from app.services.reconciler import _process_tunnel
+
+        tunnel = _make_tunnel(1, "failed")
+        session = AsyncMock()
+        session.execute.return_value = _mock_execute_scalar_one_or_none(tunnel)
+        mock_sync.return_value = FanOutResult(total=2, succeeded=1, failed=1)
+
+        await _process_tunnel({}, 1, session, _make_settings())
+
+        warning_events = [c.args[0] for c in mock_logger.warning.call_args_list]
+        assert "reconciler_tunnel_still_failing" in warning_events
+        info_events = [c.args[0] for c in mock_logger.info.call_args_list]
+        assert "reconciler_tunnel_synced" not in info_events
+
+    @patch("app.services.reconciler.acquire_advisory_lock", new_callable=AsyncMock, return_value=True)
+    @patch("app.services.reconciler.audit.log_action", new_callable=AsyncMock)
+    @patch("app.services.reconciler.ipsec_config.sync_tunnel_config", new_callable=AsyncMock)
+    @patch("app.services.reconciler.kms.decrypt_psk", new_callable=AsyncMock, return_value="psk")
+    @patch("app.services.reconciler.logger")
+    async def test_logs_still_failing_on_total_failure(
+        self, mock_logger, mock_decrypt, mock_sync, mock_audit, mock_lock
+    ):
+        """Total fan-out failure (all servers fail) logs reconciler_tunnel_still_failing."""
+        from app.services.reconciler import _process_tunnel
+
+        tunnel = _make_tunnel(1, "failed")
+        session = AsyncMock()
+        session.execute.return_value = _mock_execute_scalar_one_or_none(tunnel)
+        mock_sync.return_value = FanOutResult(total=2, succeeded=0, failed=2)
+
+        await _process_tunnel({}, 1, session, _make_settings())
+
+        warning_events = [c.args[0] for c in mock_logger.warning.call_args_list]
+        assert "reconciler_tunnel_still_failing" in warning_events
