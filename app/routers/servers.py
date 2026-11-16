@@ -10,6 +10,7 @@ from app.db.models import User
 from app.db.session import get_db
 from app.logging_config import get_logger
 from app.schemas.common import PaginatedResponse
+from app.schemas.drift import ServerDriftReport
 from app.schemas.server import (
     ServerCreate,
     ServerDetail,
@@ -18,7 +19,7 @@ from app.schemas.server import (
     ServerTestResult,
     ServerUpdate,
 )
-from app.services import server_service
+from app.services import drift_service, server_service
 
 logger = get_logger(__name__)
 
@@ -165,3 +166,24 @@ async def check_server_status(
     """Check transport connectivity (SSH or SSM) and persist the result to the database."""
     result = await server_service.check_status(db, server_id)
     return ServerStatusResult(**result)
+
+
+@router.get(
+    "/{server_id}/drift",
+    response_model=ServerDriftReport,
+    summary="Detect config drift on a server",
+)
+async def get_server_drift(
+    server_id: int,
+    tunnel_id: int | None = Query(None, description="Restrict check to this tunnel ID"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_viewer),
+) -> ServerDriftReport:
+    """Compare on-disk VPN config files against DB-rendered expectations.
+
+    Returns per-tunnel status (in_sync / drifted / missing_on_node) and a list
+    of orphan files found in the manager-owned directories.  File contents and
+    PSKs are never read back or returned — comparison is by sha256 hash only.
+    """
+    result = await drift_service.detect_server_drift(db, server_id, tunnel_id=tunnel_id)
+    return ServerDriftReport(**result)
