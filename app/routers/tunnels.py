@@ -14,6 +14,7 @@ from app.schemas.iptables import IPTablesRuleCreate, IPTablesRuleDetail
 from app.schemas.operations import AsyncOperationRef
 from app.schemas.route import RouteCreate, RouteDetail
 from app.schemas.tunnel import (
+    AllTunnelsLiveStatus,
     TunnelCheckStatusResult,
     TunnelCreate,
     TunnelDetail,
@@ -74,6 +75,25 @@ async def list_tunnels(
         page_size=page_size,
         has_next=(offset + page_size) < total,
     )
+
+
+@router.get(
+    "/status/live",
+    response_model=AllTunnelsLiveStatus,
+    summary="Live status of all tunnels in one call",
+)
+async def get_all_tunnels_live_status(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_viewer),
+) -> AllTunnelsLiveStatus:
+    """Run ipsec statusall ONCE per server and map results to all active tunnels.
+
+    Returns per-tunnel, per-server IKE state plus an overall count summary.
+    If a server cannot be reached its tunnels are marked UNKNOWN and the error
+    is captured in server_errors; the rest of the response is still returned.
+    """
+    result = await tunnel_service.get_all_tunnels_live_status(db)
+    return AllTunnelsLiveStatus(**result)
 
 
 @router.get(

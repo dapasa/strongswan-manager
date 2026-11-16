@@ -295,3 +295,90 @@ class TestRouteRouter:
             resp = await client.delete("/api/v1/routes/1")
 
         assert resp.status_code == 202
+
+
+# ---------------------------------------------------------------------------
+# Tunnel router — GET /api/v1/tunnels/status/live
+# ---------------------------------------------------------------------------
+
+
+class TestLiveStatusRouter:
+    @patch("app.services.tunnel_service.get_all_tunnels_live_status", new_callable=AsyncMock)
+    async def test_live_status_returns_ok(self, mock_service):
+        from datetime import datetime, timezone
+
+        mock_service.return_value = {
+            "tunnels": [],
+            "summary": {"total": 0, "up": 0, "down": 0, "partial": 0, "unknown": 0},
+            "checked_at": datetime.now(timezone.utc),
+            "server_errors": {},
+        }
+
+        client = await _get_client()
+        async with client:
+            resp = await client.get("/api/v1/tunnels/status/live")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "tunnels" in data
+        assert "summary" in data
+        assert "checked_at" in data
+        assert "server_errors" in data
+        mock_service.assert_awaited_once()
+
+    @patch("app.services.tunnel_service.get_all_tunnels_live_status", new_callable=AsyncMock)
+    async def test_live_status_viewer_role_allowed(self, mock_service):
+        from datetime import datetime, timezone
+
+        mock_service.return_value = {
+            "tunnels": [],
+            "summary": {"total": 0, "up": 0, "down": 0, "partial": 0, "unknown": 0},
+            "checked_at": datetime.now(timezone.utc),
+            "server_errors": {},
+        }
+
+        client = await _get_client(user=_make_mock_user(role="viewer"))
+        async with client:
+            resp = await client.get("/api/v1/tunnels/status/live")
+
+        assert resp.status_code == 200
+
+    @patch("app.services.tunnel_service.get_all_tunnels_live_status", new_callable=AsyncMock)
+    async def test_live_status_response_shape(self, mock_service):
+        """Verify the response includes per-tunnel rows with expected keys."""
+        from datetime import datetime, timezone
+
+        mock_service.return_value = {
+            "tunnels": [
+                {
+                    "tunnel_id": 1,
+                    "name": "prod-vpn",
+                    "overall": "UP",
+                    "per_server": [
+                        {
+                            "server_id": 1,
+                            "server_name": "vpn-1",
+                            "state": "UP",
+                            "success": True,
+                            "error": None,
+                        }
+                    ],
+                }
+            ],
+            "summary": {"total": 1, "up": 1, "down": 0, "partial": 0, "unknown": 0},
+            "checked_at": datetime.now(timezone.utc),
+            "server_errors": {},
+        }
+
+        client = await _get_client()
+        async with client:
+            resp = await client.get("/api/v1/tunnels/status/live")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["tunnels"]) == 1
+        row = data["tunnels"][0]
+        assert row["name"] == "prod-vpn"
+        assert row["overall"] == "UP"
+        assert len(row["per_server"]) == 1
+        assert data["summary"]["up"] == 1

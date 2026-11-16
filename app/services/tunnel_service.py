@@ -782,6 +782,102 @@ async def check_tunnel_status(
     }
 
 
+async def get_all_tunnels_live_status(session: AsyncSession) -> dict[str, Any]:
+    """Get live IKE state for all non-deleted tunnels in one pass per server.
+
+    Runs ``ipsec statusall`` ONCE per active server concurrently, then maps
+    each server's output against every tunnel name.  If a server is unreachable
+    its per-tunnel column is UNKNOWN and its error is recorded in server_errors.
+
+    Args:
+        session: Active database session.
+
+    Returns:
+        Dict with keys: tunnels, summary, checked_at, server_errors.
+    """
+    checked_at = datetime.now(timezone.utc)
+
+    result = await session.execute(
+        select(Tunnel).where(Tunnel.deleted_at.is_(None))
+    )
+    tunnels = list(result.scalars().all())
+
+    empty_summary = {"total": 0, "up": 0, "down": 0, "partial": 0, "unknown": 0}
+
+    if not tunnels:
+        return {
+            "tunnels": [],
+            "summary": empty_summary,
+            "checked_at": checked_at,
+            "server_errors": {},
+        }
+
+    try:
+        fan_out = await execute_on_all_servers(session, ["sudo /usr/sbin/ipsec statusall"])
+    except InfrastructureError as exc:
+        logger.error("live_status_no_servers", error=exc.message)
+        unknown_count = len(tunnels)
+        return {
+            "tunnels": [
+                {"tunnel_id": t.id, "name": t.name, "overall": "UNKNOWN", "per_server": []}
+                for t in tunnels
+            ],
+            "summary": {**empty_summary, "total": unknown_count, "unknown": unknown_count},
+            "checked_at": checked_at,
+            "server_errors": {},
+        }
+
+    server_errors: dict[int, str] = {
+        srv.server_id: srv.error
+        for srv in fan_out.servers
+        if not srv.success
+    }
+
+    summary: dict[str, int] = {"total": len(tunnels), "up": 0, "down": 0, "partial": 0, "unknown": 0}
+    tunnel_rows: list[dict[str, Any]] = []
+
+    for tunnel in tunnels:
+        per_server: list[dict[str, Any]] = []
+        states: list[str] = []
+
+        for srv in fan_out.servers:
+            if srv.success:
+                state = _parse_tunnel_state(tunnel.name, srv.output)
+            else:
+                state = "UNKNOWN"
+            per_server.append({
+                "server_id": srv.server_id,
+                "server_name": srv.server_name,
+                "state": state,
+                "success": srv.success,
+                "error": srv.error or None,
+            })
+            states.append(state)
+
+        overall = _aggregate_tunnel_states(states)
+        summary[overall.lower()] += 1
+        tunnel_rows.append({
+            "tunnel_id": tunnel.id,
+            "name": tunnel.name,
+            "overall": overall,
+            "per_server": per_server,
+        })
+
+    logger.info(
+        "live_status_done",
+        tunnel_count=len(tunnels),
+        server_count=fan_out.total,
+        server_errors=len(server_errors),
+    )
+
+    return {
+        "tunnels": tunnel_rows,
+        "summary": summary,
+        "checked_at": checked_at,
+        "server_errors": server_errors,
+    }
+
+
 def _parse_tunnel_state(tunnel_name: str, ipsec_output: str) -> str:
     """Parse ipsec status output to determine tunnel state.
 

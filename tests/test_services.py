@@ -667,3 +667,106 @@ class TestTunnelServiceUpdateFields:
         await update_tunnel(session, 1, data=data, user=user)
 
         assert tunnel.ike_lifetime == 7200
+
+
+# ---------------------------------------------------------------------------
+# get_all_tunnels_live_status
+# ---------------------------------------------------------------------------
+
+
+class TestGetAllTunnelsLiveStatus:
+    """Unit tests for the bulk live status service function."""
+
+    def _make_tunnel(self, tunnel_id: int, name: str):
+        t = MagicMock()
+        t.id = tunnel_id
+        t.name = name
+        t.deleted_at = None
+        return t
+
+    def _mock_scalars(self, values):
+        scalars = MagicMock()
+        scalars.all.return_value = values
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        return result
+
+    @patch("app.services.tunnel_service.execute_on_all_servers", new_callable=AsyncMock)
+    async def test_maps_states_per_tunnel(self, mock_fan_out):
+        from app.services.tunnel_service import get_all_tunnels_live_status
+        from app.utils.fan_out import FanOutResult, ServerResult
+
+        t1 = self._make_tunnel(1, "tunnel-one")
+        t2 = self._make_tunnel(2, "tunnel-two")
+
+        session = AsyncMock()
+        session.execute.return_value = self._mock_scalars([t1, t2])
+
+        output = "tunnel-one[1]: ESTABLISHED\n"
+        mock_fan_out.return_value = FanOutResult(
+            total=1, succeeded=1, failed=0,
+            servers=[ServerResult(server_id=1, server_name="vpn-1", success=True, output=output)],
+        )
+
+        data = await get_all_tunnels_live_status(session)
+
+        assert len(data["tunnels"]) == 2
+        rows = {r["name"]: r for r in data["tunnels"]}
+        assert rows["tunnel-one"]["overall"] == "UP"
+        assert rows["tunnel-two"]["overall"] == "DOWN"
+        assert data["server_errors"] == {}
+        assert data["summary"]["total"] == 2
+        assert data["summary"]["up"] == 1
+        assert data["summary"]["down"] == 1
+
+    @patch("app.services.tunnel_service.execute_on_all_servers", new_callable=AsyncMock)
+    async def test_server_error_marks_tunnels_unknown(self, mock_fan_out):
+        from app.services.tunnel_service import get_all_tunnels_live_status
+        from app.utils.fan_out import FanOutResult, ServerResult
+
+        t1 = self._make_tunnel(1, "tunnel-one")
+
+        session = AsyncMock()
+        session.execute.return_value = self._mock_scalars([t1])
+
+        mock_fan_out.return_value = FanOutResult(
+            total=1, succeeded=0, failed=1,
+            servers=[ServerResult(
+                server_id=1, server_name="vpn-1", success=False, error="connection refused"
+            )],
+        )
+
+        data = await get_all_tunnels_live_status(session)
+
+        assert data["tunnels"][0]["overall"] == "UNKNOWN"
+        assert 1 in data["server_errors"]
+        assert "connection refused" in data["server_errors"][1]
+
+    async def test_no_tunnels_returns_empty(self):
+        from app.services.tunnel_service import get_all_tunnels_live_status
+
+        session = AsyncMock()
+        session.execute.return_value = self._mock_scalars([])
+
+        data = await get_all_tunnels_live_status(session)
+
+        assert data["tunnels"] == []
+        assert data["summary"]["total"] == 0
+        assert data["server_errors"] == {}
+
+    @patch(
+        "app.services.tunnel_service.execute_on_all_servers",
+        new_callable=AsyncMock,
+        side_effect=InfrastructureError("servers", "No active servers registered"),
+    )
+    async def test_no_servers_returns_all_unknown(self, mock_fan_out):
+        from app.services.tunnel_service import get_all_tunnels_live_status
+
+        t1 = self._make_tunnel(1, "tunnel-one")
+        session = AsyncMock()
+        session.execute.return_value = self._mock_scalars([t1])
+
+        data = await get_all_tunnels_live_status(session)
+
+        assert data["tunnels"][0]["overall"] == "UNKNOWN"
+        assert data["summary"]["unknown"] == 1
