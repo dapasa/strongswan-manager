@@ -14,7 +14,6 @@ from app.db.models import IPTablesRule, Route, Tunnel, User
 from app.exceptions import ConflictError, InfrastructureError, NotFoundError
 from app.logging_config import get_logger
 from app.services import audit, ipsec_config
-from app.services import ssm  # SSM retained for iptables cascade — migrate with iptables-ssh-migration
 from app.services.iptables_service import build_iptables_command
 from app.services.locks import LOCK_IPSEC_CONFIG, require_lock
 from app.services.server_service import execute_on_all_servers
@@ -401,10 +400,13 @@ async def _cleanup_tunnel_iptables(
     request: Request | None = None,
     now: datetime | None = None,
 ) -> None:
-    """Remove iptables rules for a tunnel via SSM and soft-delete them.
+    """Remove iptables rules for a tunnel via per-server transport and soft-delete them.
 
-    TEMPORARY: Still uses SSM. Will be migrated to SSH in iptables-migration change.
-    Extracted from delete_tunnel() to isolate the SSM dependency.
+    Uses execute_on_all_servers (per-server transport) instead of global SSM settings,
+    so the correct servers from the DB are always targeted.
+
+    Failures are logged as errors and reflected in rule.sync_status ("failed" on
+    partial/total failure, "pending_delete" on success).
 
     Args:
         tunnel: The Tunnel instance whose rules to clean up.
@@ -418,16 +420,17 @@ async def _cleanup_tunnel_iptables(
 
     active_rules = [r for r in tunnel.iptables_rules if r.deleted_at is None]
     for rule in active_rules:
+        delete_cmd = build_iptables_command(rule, delete=True)
         try:
-            delete_cmd = build_iptables_command(rule, delete=True)
-            await ssm.run_on_instances(
-                commands=[f"{delete_cmd} || true"],
-                target="both",
+            fan_out = await execute_on_all_servers(
+                session,
+                commands=[f"{delete_cmd} || true", "iptables-save > /etc/iptables/rules.v4"],
             )
-            await ssm.run_on_instances(
-                commands=["iptables-save > /etc/iptables/rules.v4"],
-                target="both",
-            )
+            if not fan_out.is_success:
+                raise InfrastructureError(
+                    service="iptables", message=fan_out.to_sync_error() or "failed"
+                )
+            rule.sync_status = "pending_delete"
         except InfrastructureError as exc:
             logger.error(
                 "cascade_iptables_remove_failed",
@@ -435,9 +438,9 @@ async def _cleanup_tunnel_iptables(
                 tunnel_id=tunnel.id,
                 error=exc.message,
             )
+            rule.sync_status = "failed"
 
         rule.deleted_at = now
-        rule.sync_status = "pending_delete"
 
         await audit.log_action(
             session,

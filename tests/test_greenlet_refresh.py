@@ -301,8 +301,9 @@ class TestCreateIPTablesRuleRefresh:
                 new_callable=AsyncMock,
             ),
             patch(
-                "app.services.iptables_service.ssm.run_on_instances",
+                "app.services.iptables_service.execute_on_all_servers",
                 new_callable=AsyncMock,
+                return_value=MagicMock(is_success=True),
             ),
             patch(
                 "app.services.audit.log_action",
@@ -331,7 +332,7 @@ class TestCreateIPTablesRuleRefresh:
         with (
             patch("app.services.iptables_service._get_active_tunnel", new_callable=AsyncMock, return_value=MagicMock(id=1, deleted_at=None)),
             patch("app.services.iptables_service.require_lock", new_callable=AsyncMock),
-            patch("app.services.iptables_service.ssm.run_on_instances", new_callable=AsyncMock),
+            patch("app.services.iptables_service.execute_on_all_servers", new_callable=AsyncMock, return_value=MagicMock(is_success=True)),
             patch("app.services.audit.log_action", new_callable=AsyncMock),
         ):
             data = IPTablesRuleCreate(chain="FORWARD", protocol="tcp", dport=443, action="ACCEPT")
@@ -370,8 +371,9 @@ class TestUpdateIPTablesRuleRefresh:
                 new_callable=AsyncMock,
             ),
             patch(
-                "app.services.iptables_service.ssm.run_on_instances",
+                "app.services.iptables_service.execute_on_all_servers",
                 new_callable=AsyncMock,
+                return_value=MagicMock(is_success=True),
             ),
             patch(
                 "app.services.audit.log_action",
@@ -394,7 +396,7 @@ class TestUpdateIPTablesRuleRefresh:
         with (
             patch("app.services.iptables_service.get_rule", new_callable=AsyncMock, return_value=rule),
             patch("app.services.iptables_service.require_lock", new_callable=AsyncMock),
-            patch("app.services.iptables_service.ssm.run_on_instances", new_callable=AsyncMock),
+            patch("app.services.iptables_service.execute_on_all_servers", new_callable=AsyncMock, return_value=MagicMock(is_success=True)),
             patch("app.services.audit.log_action", new_callable=AsyncMock),
         ):
             data = IPTablesRuleUpdate(comment="updated")
@@ -433,8 +435,9 @@ class TestRetryIPTablesRuleRefresh:
                 new_callable=AsyncMock,
             ),
             patch(
-                "app.services.iptables_service.ssm.run_on_instances",
+                "app.services.iptables_service.execute_on_all_servers",
                 new_callable=AsyncMock,
+                return_value=MagicMock(is_success=True),
             ),
             patch(
                 "app.services.audit.log_action",
@@ -456,7 +459,7 @@ class TestRetryIPTablesRuleRefresh:
         with (
             patch("app.services.iptables_service.get_rule", new_callable=AsyncMock, return_value=rule),
             patch("app.services.iptables_service.require_lock", new_callable=AsyncMock),
-            patch("app.services.iptables_service.ssm.run_on_instances", new_callable=AsyncMock),
+            patch("app.services.iptables_service.execute_on_all_servers", new_callable=AsyncMock, return_value=MagicMock(is_success=True)),
             patch("app.services.audit.log_action", new_callable=AsyncMock),
         ):
             await iptables_service.retry_rule(session, 7, user=user)

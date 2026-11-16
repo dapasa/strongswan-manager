@@ -263,11 +263,17 @@ class TestTunnelServiceRetry:
 
 class TestIPTablesServiceCreate:
     @patch("app.services.iptables_service.audit.log_action", new_callable=AsyncMock)
-    @patch("app.services.iptables_service.ssm.run_on_instances", new_callable=AsyncMock)
+    @patch("app.services.iptables_service.execute_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.iptables_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.iptables_service._get_active_tunnel", new_callable=AsyncMock)
-    async def test_create_rule_success(self, mock_tunnel, mock_lock, mock_ssm, mock_audit):
+    async def test_create_rule_success(self, mock_tunnel, mock_lock, mock_execute_all, mock_audit):
         from app.services.iptables_service import create_rule
+        from app.utils.fan_out import FanOutResult, ServerResult
+
+        mock_execute_all.return_value = FanOutResult(
+            total=1, succeeded=1, failed=0,
+            servers=[ServerResult(server_id=1, server_name="vpn-1", success=True)],
+        )
 
         session = AsyncMock()
         user = MagicMock()
@@ -289,8 +295,8 @@ class TestIPTablesServiceCreate:
 
         session.add.assert_called_once()
         session.commit.assert_called_once()
-        # SSM called twice: apply rule + iptables-save
-        assert mock_ssm.call_count == 2
+        # execute_on_all_servers called once with both commands combined
+        mock_execute_all.assert_called_once()
         mock_audit.assert_called_once()
 
     @patch("app.services.iptables_service._get_active_tunnel", new_callable=AsyncMock)
@@ -314,11 +320,17 @@ class TestIPTablesServiceCreate:
 
 class TestIPTablesServiceRetry:
     @patch("app.services.iptables_service.audit.log_action", new_callable=AsyncMock)
-    @patch("app.services.iptables_service.ssm.run_on_instances", new_callable=AsyncMock)
+    @patch("app.services.iptables_service.execute_on_all_servers", new_callable=AsyncMock)
     @patch("app.services.iptables_service.require_lock", new_callable=AsyncMock)
     @patch("app.services.iptables_service.get_rule", new_callable=AsyncMock)
-    async def test_retry_success(self, mock_get, mock_lock, mock_ssm, mock_audit):
+    async def test_retry_success(self, mock_get, mock_lock, mock_execute_all, mock_audit):
         from app.services.iptables_service import retry_rule
+        from app.utils.fan_out import FanOutResult, ServerResult
+
+        mock_execute_all.return_value = FanOutResult(
+            total=1, succeeded=1, failed=0,
+            servers=[ServerResult(server_id=1, server_name="vpn-1", success=True)],
+        )
 
         rule = MagicMock()
         rule.id = 1

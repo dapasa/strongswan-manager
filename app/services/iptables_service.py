@@ -1,4 +1,4 @@
-"""IPTables orchestration service — coordinates DB + SSM for iptables rule management."""
+"""IPTables orchestration service — coordinates DB + transport for iptables rule management."""
 
 from __future__ import annotations
 
@@ -12,12 +12,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import IPTablesRule, Tunnel, User
 from app.exceptions import ConflictError, InfrastructureError, NotFoundError, ValidationError
 from app.logging_config import get_logger
-from app.services import audit, ssm
+from app.services import audit
 from app.services.locks import (
     LOCK_IPTABLES_PRIMARY,
     LOCK_IPTABLES_SECONDARY,
     require_lock,
 )
+from app.services.server_service import execute_on_all_servers
 
 logger = get_logger(__name__)
 
@@ -199,14 +200,14 @@ async def create_rule(
     session.add(rule)
     await session.flush()
 
-    # Build and apply command
+    # Build and apply command via per-server transport (not global SSM settings)
     command = build_iptables_command(rule)
     try:
-        await ssm.run_on_instances(commands=[command], target="both")
-        await ssm.run_on_instances(
-            commands=["iptables-save > /etc/iptables/rules.v4"],
-            target="both",
+        fan_out = await execute_on_all_servers(
+            session, commands=[command, "iptables-save > /etc/iptables/rules.v4"]
         )
+        if not fan_out.is_success:
+            raise InfrastructureError(service="iptables", message=fan_out.to_sync_error() or "failed")
         rule.sync_status = "synced"
         rule.sync_error = None
         logger.info("iptables_rule_synced", rule_id=rule.id, command=command)
@@ -291,13 +292,18 @@ async def update_rule(
         await require_lock(session, LOCK_IPTABLES_PRIMARY)
         await require_lock(session, LOCK_IPTABLES_SECONDARY)
 
-        # Remove old rule via SSM (ignore failures — rule might not be applied)
+        # Remove old rule via per-server transport (best-effort — rule might not be applied)
         old_delete_cmd = build_iptables_command(rule, delete=True)
         try:
-            await ssm.run_on_instances(
-                commands=[f"{old_delete_cmd} || true"],
-                target="both",
+            del_result = await execute_on_all_servers(
+                session, commands=[f"{old_delete_cmd} || true"]
             )
+            if not del_result.is_success:
+                logger.warning(
+                    "iptables_old_rule_remove_failed",
+                    rule_id=rule.id,
+                    error=del_result.to_sync_error(),
+                )
         except InfrastructureError as exc:
             logger.warning(
                 "iptables_old_rule_remove_failed",
@@ -315,15 +321,15 @@ async def update_rule(
             setattr(rule, field, value)
 
     if needs_ssm:
-        # Apply new rule via SSM
+        # Apply new rule via per-server transport
         rule.sync_status = "pending"
         new_cmd = build_iptables_command(rule)
         try:
-            await ssm.run_on_instances(commands=[new_cmd], target="both")
-            await ssm.run_on_instances(
-                commands=["iptables-save > /etc/iptables/rules.v4"],
-                target="both",
+            fan_out = await execute_on_all_servers(
+                session, commands=[new_cmd, "iptables-save > /etc/iptables/rules.v4"]
             )
+            if not fan_out.is_success:
+                raise InfrastructureError(service="iptables", message=fan_out.to_sync_error() or "failed")
             rule.sync_status = "synced"
             rule.sync_error = None
             logger.info("iptables_rule_updated_synced", rule_id=rule.id, command=new_cmd)
@@ -395,11 +401,11 @@ async def retry_rule(
     rule.sync_status = "pending"
     command = build_iptables_command(rule)
     try:
-        await ssm.run_on_instances(commands=[command], target="both")
-        await ssm.run_on_instances(
-            commands=["iptables-save > /etc/iptables/rules.v4"],
-            target="both",
+        fan_out = await execute_on_all_servers(
+            session, commands=[command, "iptables-save > /etc/iptables/rules.v4"]
         )
+        if not fan_out.is_success:
+            raise InfrastructureError(service="iptables", message=fan_out.to_sync_error() or "failed")
         rule.sync_status = "synced"
         rule.sync_error = None
         logger.info("iptables_rule_retry_synced", rule_id=rule.id, command=command)
@@ -464,17 +470,14 @@ async def delete_rule(
     await require_lock(session, LOCK_IPTABLES_PRIMARY)
     await require_lock(session, LOCK_IPTABLES_SECONDARY)
 
-    # Remove via SSM
+    # Remove via per-server transport
     delete_cmd = build_iptables_command(rule, delete=True)
     try:
-        await ssm.run_on_instances(
-            commands=[f"{delete_cmd} || true"],
-            target="both",
+        fan_out = await execute_on_all_servers(
+            session, commands=[f"{delete_cmd} || true", "iptables-save > /etc/iptables/rules.v4"]
         )
-        await ssm.run_on_instances(
-            commands=["iptables-save > /etc/iptables/rules.v4"],
-            target="both",
-        )
+        if not fan_out.is_success:
+            raise InfrastructureError(service="iptables", message=fan_out.to_sync_error() or "failed")
         logger.info("iptables_rule_removed", rule_id=rule.id)
     except InfrastructureError as exc:
         logger.error(
