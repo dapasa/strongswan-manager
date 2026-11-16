@@ -649,7 +649,7 @@ class TestAggregateTunnelStates:
         output = "other-tunnel: ESTABLISHED\nanother-tunnel: INSTALLED"
         assert _parse_tunnel_state("vpn-tunnel", output) == "DOWN"
 
-    @patch("app.services.tunnel_service.execute_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service._status_fan_out", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
     async def test_get_tunnel_status_all_established(self, mock_get_tunnel, mock_fan_out):
         """get_tunnel_status returns state=UP when all servers report ESTABLISHED."""
@@ -660,15 +660,10 @@ class TestAggregateTunnelStates:
         tunnel.name = "vpn-tunnel"
         mock_get_tunnel.return_value = tunnel
 
-        mock_fan_out.return_value = FanOutResult(
-            total=2,
-            succeeded=2,
-            failed=0,
-            servers=[
-                ServerResult(1, "vpn-1", True, output="vpn-tunnel: ESTABLISHED"),
-                ServerResult(2, "vpn-2", True, output="vpn-tunnel: ESTABLISHED"),
-            ],
-        )
+        mock_fan_out.return_value = [
+            (ServerResult(1, "vpn-1", True, output="vpn-tunnel: ESTABLISHED"), "stroke"),
+            (ServerResult(2, "vpn-2", True, output="vpn-tunnel: ESTABLISHED"), "stroke"),
+        ]
 
         session = AsyncMock()
         result = await get_tunnel_status(session, 1)
@@ -676,7 +671,7 @@ class TestAggregateTunnelStates:
         assert result["state"] == "UP"
         assert len(result["per_server"]) == 2
 
-    @patch("app.services.tunnel_service.execute_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service._status_fan_out", new_callable=AsyncMock)
     @patch("app.services.tunnel_service.get_tunnel", new_callable=AsyncMock)
     async def test_get_tunnel_status_all_down(self, mock_get_tunnel, mock_fan_out):
         """get_tunnel_status returns state=DOWN when all servers report DOWN."""
@@ -687,15 +682,10 @@ class TestAggregateTunnelStates:
         tunnel.name = "vpn-tunnel"
         mock_get_tunnel.return_value = tunnel
 
-        mock_fan_out.return_value = FanOutResult(
-            total=2,
-            succeeded=2,
-            failed=0,
-            servers=[
-                ServerResult(1, "vpn-1", True, output="vpn-tunnel: not found"),
-                ServerResult(2, "vpn-2", True, output="vpn-tunnel: not found"),
-            ],
-        )
+        mock_fan_out.return_value = [
+            (ServerResult(1, "vpn-1", True, output="vpn-tunnel: not found"), "stroke"),
+            (ServerResult(2, "vpn-2", True, output="vpn-tunnel: not found"), "stroke"),
+        ]
 
         session = AsyncMock()
         result = await get_tunnel_status(session, 1)

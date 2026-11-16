@@ -691,10 +691,10 @@ class TestGetAllTunnelsLiveStatus:
         result.scalars.return_value = scalars
         return result
 
-    @patch("app.services.tunnel_service.execute_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service._status_fan_out", new_callable=AsyncMock)
     async def test_maps_states_per_tunnel(self, mock_fan_out):
         from app.services.tunnel_service import get_all_tunnels_live_status
-        from app.utils.fan_out import FanOutResult, ServerResult
+        from app.utils.fan_out import ServerResult
 
         t1 = self._make_tunnel(1, "tunnel-one")
         t2 = self._make_tunnel(2, "tunnel-two")
@@ -703,10 +703,9 @@ class TestGetAllTunnelsLiveStatus:
         session.execute.return_value = self._mock_scalars([t1, t2])
 
         output = "tunnel-one[1]: ESTABLISHED\n"
-        mock_fan_out.return_value = FanOutResult(
-            total=1, succeeded=1, failed=0,
-            servers=[ServerResult(server_id=1, server_name="vpn-1", success=True, output=output)],
-        )
+        mock_fan_out.return_value = [
+            (ServerResult(server_id=1, server_name="vpn-1", success=True, output=output), "stroke"),
+        ]
 
         data = await get_all_tunnels_live_status(session)
 
@@ -719,22 +718,19 @@ class TestGetAllTunnelsLiveStatus:
         assert data["summary"]["up"] == 1
         assert data["summary"]["down"] == 1
 
-    @patch("app.services.tunnel_service.execute_on_all_servers", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service._status_fan_out", new_callable=AsyncMock)
     async def test_server_error_marks_tunnels_unknown(self, mock_fan_out):
         from app.services.tunnel_service import get_all_tunnels_live_status
-        from app.utils.fan_out import FanOutResult, ServerResult
+        from app.utils.fan_out import ServerResult
 
         t1 = self._make_tunnel(1, "tunnel-one")
 
         session = AsyncMock()
         session.execute.return_value = self._mock_scalars([t1])
 
-        mock_fan_out.return_value = FanOutResult(
-            total=1, succeeded=0, failed=1,
-            servers=[ServerResult(
-                server_id=1, server_name="vpn-1", success=False, error="connection refused"
-            )],
-        )
+        mock_fan_out.return_value = [
+            (ServerResult(server_id=1, server_name="vpn-1", success=False, error="connection refused"), "stroke"),
+        ]
 
         data = await get_all_tunnels_live_status(session)
 
@@ -755,7 +751,7 @@ class TestGetAllTunnelsLiveStatus:
         assert data["server_errors"] == {}
 
     @patch(
-        "app.services.tunnel_service.execute_on_all_servers",
+        "app.services.tunnel_service._status_fan_out",
         new_callable=AsyncMock,
         side_effect=InfrastructureError("servers", "No active servers registered"),
     )
@@ -770,3 +766,193 @@ class TestGetAllTunnelsLiveStatus:
 
         assert data["tunnels"][0]["overall"] == "UNKNOWN"
         assert data["summary"]["unknown"] == 1
+
+    @patch("app.services.tunnel_service._status_fan_out", new_callable=AsyncMock)
+    async def test_swanctl_server_parsed_correctly(self, mock_fan_out):
+        """swanctl output for an active tunnel is correctly parsed as UP."""
+        from app.services.tunnel_service import get_all_tunnels_live_status
+        from app.utils.fan_out import ServerResult
+
+        SWANCTL_REAL_OUTPUT = (
+            "daniel-local-test: #594, ESTABLISHED, IKEv2, abc def\n"
+            "  local  '44.215.155.152' @ 10.0.1.200[4500]\n"
+            "  remote '90.74.94.33' @ 90.74.94.33[58212]\n"
+            "  AES_CBC-256/HMAC_SHA2_256_128/PRF_HMAC_SHA2_256/MODP_2048\n"
+            "  established 11507s ago, rekeying in 17160s\n"
+            "  daniel-local-test: #12, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-256/HMAC_SHA2_256_128\n"
+            "    installed 1491s ago, rekeying in 1879s, expires in 2469s\n"
+        )
+
+        t1 = self._make_tunnel(1, "daniel-local-test")
+        session = AsyncMock()
+        session.execute.return_value = self._mock_scalars([t1])
+
+        mock_fan_out.return_value = [
+            (ServerResult(server_id=1, server_name="vpn-swanctl", success=True, output=SWANCTL_REAL_OUTPUT), "swanctl"),
+        ]
+
+        data = await get_all_tunnels_live_status(session)
+
+        assert data["tunnels"][0]["overall"] == "UP"
+
+    @patch("app.services.tunnel_service._status_fan_out", new_callable=AsyncMock)
+    async def test_mixed_fleet_stroke_up_swanctl_up(self, mock_fan_out):
+        """Mixed fleet: one stroke server, one swanctl server, both show UP → overall UP."""
+        from app.services.tunnel_service import get_all_tunnels_live_status
+        from app.utils.fan_out import ServerResult
+
+        STROKE_OUTPUT = "my-tunnel[1]: ESTABLISHED\n"
+        SWANCTL_OUTPUT = (
+            "my-tunnel: #1, ESTABLISHED, IKEv2, abc def\n"
+            "  my-tunnel: #1, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-256\n"
+        )
+
+        t1 = self._make_tunnel(1, "my-tunnel")
+        session = AsyncMock()
+        session.execute.return_value = self._mock_scalars([t1])
+
+        mock_fan_out.return_value = [
+            (ServerResult(server_id=1, server_name="vpn-stroke", success=True, output=STROKE_OUTPUT), "stroke"),
+            (ServerResult(server_id=2, server_name="vpn-swanctl", success=True, output=SWANCTL_OUTPUT), "swanctl"),
+        ]
+
+        data = await get_all_tunnels_live_status(session)
+
+        assert data["tunnels"][0]["overall"] == "UP"
+        assert data["summary"]["up"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _parse_swanctl_tunnel_state
+# ---------------------------------------------------------------------------
+
+
+class TestParseSwanctlTunnelState:
+    """Unit tests for the swanctl output parser."""
+
+    REAL_OUTPUT = (
+        "daniel-local-test: #594, ESTABLISHED, IKEv2, abc def\n"
+        "  local  '44.215.155.152' @ 10.0.1.200[4500]\n"
+        "  remote '90.74.94.33' @ 90.74.94.33[58212]\n"
+        "  AES_CBC-256/HMAC_SHA2_256_128/PRF_HMAC_SHA2_256/MODP_2048\n"
+        "  established 11507s ago, rekeying in 17160s\n"
+        "  daniel-local-test: #12, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-256/HMAC_SHA2_256_128\n"
+        "    installed 1491s ago, rekeying in 1879s, expires in 2469s\n"
+        "    in  c92b2e85,      0 bytes,     0 packets\n"
+        "    out c68141e3,      0 bytes,     0 packets\n"
+        "    local  10.0.0.0/16\n"
+        "    remote 172.16.99.1/32\n"
+    )
+
+    def test_real_output_established_plus_installed_is_up(self):
+        from app.services.tunnel_service import _parse_swanctl_tunnel_state
+
+        assert _parse_swanctl_tunnel_state("daniel-local-test", self.REAL_OUTPUT) == "UP"
+
+    def test_real_output_unknown_tunnel_is_down(self):
+        from app.services.tunnel_service import _parse_swanctl_tunnel_state
+
+        assert _parse_swanctl_tunnel_state("other-tunnel", self.REAL_OUTPUT) == "DOWN"
+
+    def test_empty_output_is_unknown(self):
+        from app.services.tunnel_service import _parse_swanctl_tunnel_state
+
+        assert _parse_swanctl_tunnel_state("any-tunnel", "") == "UNKNOWN"
+
+    def test_ike_established_but_no_child_installed_is_down(self):
+        from app.services.tunnel_service import _parse_swanctl_tunnel_state
+
+        output = (
+            "my-tunnel: #1, ESTABLISHED, IKEv2, abc def\n"
+            "  my-tunnel: #1, reqid 1, ROUTED, TUNNEL\n"
+        )
+        assert _parse_swanctl_tunnel_state("my-tunnel", output) == "DOWN"
+
+    def test_tunnel_absent_from_output_is_down(self):
+        from app.services.tunnel_service import _parse_swanctl_tunnel_state
+
+        output = (
+            "other-conn: #1, ESTABLISHED, IKEv2, abc\n"
+            "  other-conn: #1, reqid 1, INSTALLED, TUNNEL-in-UDP\n"
+        )
+        assert _parse_swanctl_tunnel_state("my-tunnel", output) == "DOWN"
+
+
+# ---------------------------------------------------------------------------
+# _status_fan_out engine dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestStatusFanOutEngineDispatch:
+    """Verify _status_fan_out sends the right command to each engine type."""
+
+    def _make_server(self, server_id: int, name: str, engine: str):
+        s = MagicMock()
+        s.id = server_id
+        s.name = name
+        s.ipsec_engine = engine
+        s.is_active = True
+        s.deleted_at = None
+        return s
+
+    def _mock_scalars(self, values):
+        scalars = MagicMock()
+        scalars.all.return_value = values
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        return result
+
+    @patch("app.services.tunnel_service.execute_command", new_callable=AsyncMock)
+    async def test_stroke_server_receives_ipsec_statusall(self, mock_exec):
+        from app.services.tunnel_service import _status_fan_out
+        from app.utils.fan_out import ServerResult
+
+        stroke_srv = self._make_server(1, "vpn-stroke", "stroke")
+        session = AsyncMock()
+        session.execute.return_value = self._mock_scalars([stroke_srv])
+        mock_exec.return_value = ServerResult(server_id=1, server_name="vpn-stroke", success=True, output="")
+
+        await _status_fan_out(session)
+
+        mock_exec.assert_called_once()
+        _, _, commands = mock_exec.call_args.args
+        assert commands == ["sudo /usr/sbin/ipsec statusall"]
+
+    @patch("app.services.tunnel_service.execute_command", new_callable=AsyncMock)
+    async def test_swanctl_server_receives_swanctl_list_sas(self, mock_exec):
+        from app.services.tunnel_service import _status_fan_out
+        from app.utils.fan_out import ServerResult
+
+        swanctl_srv = self._make_server(2, "vpn-swanctl", "swanctl")
+        session = AsyncMock()
+        session.execute.return_value = self._mock_scalars([swanctl_srv])
+        mock_exec.return_value = ServerResult(server_id=2, server_name="vpn-swanctl", success=True, output="")
+
+        await _status_fan_out(session)
+
+        mock_exec.assert_called_once()
+        _, _, commands = mock_exec.call_args.args
+        assert commands == ["sudo swanctl --list-sas 2>/dev/null"]
+
+    @patch("app.services.tunnel_service.execute_command", new_callable=AsyncMock)
+    async def test_mixed_fleet_each_server_gets_own_command(self, mock_exec):
+        from app.services.tunnel_service import _status_fan_out
+        from app.utils.fan_out import ServerResult
+
+        stroke_srv = self._make_server(1, "vpn-stroke", "stroke")
+        swanctl_srv = self._make_server(2, "vpn-swanctl", "swanctl")
+        session = AsyncMock()
+        session.execute.return_value = self._mock_scalars([stroke_srv, swanctl_srv])
+        mock_exec.side_effect = [
+            ServerResult(server_id=1, server_name="vpn-stroke", success=True, output=""),
+            ServerResult(server_id=2, server_name="vpn-swanctl", success=True, output=""),
+        ]
+
+        pairs = await _status_fan_out(session)
+
+        assert len(pairs) == 2
+        calls = mock_exec.call_args_list
+        assert calls[0].args[2] == ["sudo /usr/sbin/ipsec statusall"]
+        assert calls[1].args[2] == ["sudo swanctl --list-sas 2>/dev/null"]
+        assert pairs[0][1] == "stroke"
+        assert pairs[1][1] == "swanctl"

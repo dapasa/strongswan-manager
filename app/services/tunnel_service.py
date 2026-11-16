@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
@@ -10,14 +11,14 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.db.models import IPTablesRule, Route, Tunnel, User
+from app.db.models import IPTablesRule, Route, Server, Tunnel, User
 from app.exceptions import ConflictError, InfrastructureError, NotFoundError
 from app.logging_config import get_logger
 from app.services import audit, ipsec_config
 from app.services.iptables_service import build_iptables_command
 from app.services.locks import LOCK_IPSEC_CONFIG, require_lock
-from app.services.server_service import execute_on_all_servers
-from app.utils.fan_out import FanOutResult
+from app.services.server_service import execute_command, execute_on_all_servers
+from app.utils.fan_out import FanOutResult, ServerResult
 
 logger = get_logger(__name__)
 
@@ -40,6 +41,13 @@ TUNNEL_RENDER_FIELDS: frozenset[str] = frozenset({
     "dpd_timeout",
     "ike_lifetime",
 })
+
+# Engine-appropriate ipsec status commands.
+# swanctl nodes: `ipsec statusall` exits 0 with empty output — use swanctl --list-sas instead.
+_STATUS_COMMANDS: dict[str, list[str]] = {
+    "stroke": ["sudo /usr/sbin/ipsec statusall"],
+    "swanctl": ["sudo swanctl --list-sas 2>/dev/null"],
+}
 
 
 def _tunnel_to_dict(tunnel: Tunnel) -> dict[str, Any]:
@@ -658,13 +666,13 @@ async def get_tunnel_status(
     checked_at = datetime.now(timezone.utc)
 
     try:
-        fan_out_result = await execute_on_all_servers(session, ["sudo /usr/sbin/ipsec statusall"])
+        srv_engine_pairs = await _status_fan_out(session)
 
         per_server = []
         states = []
-        for srv in fan_out_result.servers:
+        for srv, engine in srv_engine_pairs:
             if srv.success:
-                state = _parse_tunnel_state(tunnel.name, srv.output)
+                state = _parse_state_for_engine(engine, tunnel.name, srv.output)
             else:
                 state = "UNKNOWN"
             per_server.append({
@@ -729,13 +737,11 @@ async def check_tunnel_status(
     raw_output = ""
 
     try:
-        fan_out_result = await execute_on_all_servers(
-            session, ["sudo /usr/sbin/ipsec statusall"]
-        )
+        srv_engine_pairs = await _status_fan_out(session)
 
-        for srv in fan_out_result.servers:
+        for srv, engine in srv_engine_pairs:
             if srv.success:
-                state = _parse_tunnel_state(tunnel.name, srv.output)
+                state = _parse_state_for_engine(engine, tunnel.name, srv.output)
                 raw_output = srv.output
             else:
                 state = "UNKNOWN"
@@ -813,7 +819,7 @@ async def get_all_tunnels_live_status(session: AsyncSession) -> dict[str, Any]:
         }
 
     try:
-        fan_out = await execute_on_all_servers(session, ["sudo /usr/sbin/ipsec statusall"])
+        srv_engine_pairs = await _status_fan_out(session)
     except InfrastructureError as exc:
         logger.error("live_status_no_servers", error=exc.message)
         unknown_count = len(tunnels)
@@ -829,7 +835,7 @@ async def get_all_tunnels_live_status(session: AsyncSession) -> dict[str, Any]:
 
     server_errors: dict[int, str] = {
         srv.server_id: srv.error
-        for srv in fan_out.servers
+        for srv, _ in srv_engine_pairs
         if not srv.success
     }
 
@@ -840,9 +846,9 @@ async def get_all_tunnels_live_status(session: AsyncSession) -> dict[str, Any]:
         per_server: list[dict[str, Any]] = []
         states: list[str] = []
 
-        for srv in fan_out.servers:
+        for srv, engine in srv_engine_pairs:
             if srv.success:
-                state = _parse_tunnel_state(tunnel.name, srv.output)
+                state = _parse_state_for_engine(engine, tunnel.name, srv.output)
             else:
                 state = "UNKNOWN"
             per_server.append({
@@ -866,7 +872,7 @@ async def get_all_tunnels_live_status(session: AsyncSession) -> dict[str, Any]:
     logger.info(
         "live_status_done",
         tunnel_count=len(tunnels),
-        server_count=fan_out.total,
+        server_count=len(srv_engine_pairs),
         server_errors=len(server_errors),
     )
 
@@ -876,6 +882,88 @@ async def get_all_tunnels_live_status(session: AsyncSession) -> dict[str, Any]:
         "checked_at": checked_at,
         "server_errors": server_errors,
     }
+
+
+def _parse_swanctl_tunnel_state(tunnel_name: str, output: str) -> str:
+    """Parse ``swanctl --list-sas`` output to determine tunnel state.
+
+    IKE SA line (column 0): ``<name>: #N, ESTABLISHED, IKEv2, ...``
+    CHILD SA line (indented): ``  <name>: #N, reqid R, INSTALLED, ...``
+
+    Returns 'UP' (IKE ESTABLISHED + CHILD INSTALLED), 'DOWN' (tunnel absent or
+    not established), or 'UNKNOWN' (empty output — daemon may be down).
+    """
+    if not output:
+        return "UNKNOWN"
+
+    name_prefix = tunnel_name.lower() + ":"
+    ike_established = False
+    child_installed = False
+
+    for line in output.splitlines():
+        lower_stripped = line.lstrip().lower()
+        if not lower_stripped.startswith(name_prefix):
+            continue
+        if not line[0:1].isspace():
+            # IKE SA: starts at column 0
+            if "established" in lower_stripped:
+                ike_established = True
+        else:
+            # CHILD SA: indented
+            if "installed" in lower_stripped:
+                child_installed = True
+
+    if ike_established and child_installed:
+        return "UP"
+    return "DOWN"
+
+
+def _parse_state_for_engine(engine: str, tunnel_name: str, output: str) -> str:
+    """Dispatch to the correct output parser based on ipsec_engine."""
+    if engine == "swanctl":
+        return _parse_swanctl_tunnel_state(tunnel_name, output)
+    return _parse_tunnel_state(tunnel_name, output)
+
+
+async def _status_fan_out(session: AsyncSession) -> list[tuple[ServerResult, str]]:
+    """Run the engine-appropriate ipsec status command on each active server concurrently.
+
+    Returns a list of (ServerResult, ipsec_engine) pairs.
+
+    Raises:
+        InfrastructureError: If no active servers are registered.
+    """
+    stmt = select(Server).where(Server.is_active.is_(True), Server.deleted_at.is_(None))
+    db_result = await session.execute(stmt)
+    servers = list(db_result.scalars().all())
+
+    if not servers:
+        raise InfrastructureError(
+            service="servers",
+            message="No active servers registered — cannot check status",
+        )
+
+    tasks = [
+        execute_command(session, s.id, _STATUS_COMMANDS.get(s.ipsec_engine, _STATUS_COMMANDS["stroke"]))
+        for s in servers
+    ]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+    pairs: list[tuple[ServerResult, str]] = []
+    for i, outcome in enumerate(gathered):
+        if isinstance(outcome, Exception):
+            pairs.append((
+                ServerResult(
+                    server_id=servers[i].id,
+                    server_name=servers[i].name,
+                    success=False,
+                    error=f"Unexpected error: {outcome}",
+                ),
+                servers[i].ipsec_engine,
+            ))
+        else:
+            pairs.append((outcome, servers[i].ipsec_engine))
+    return pairs
 
 
 def _parse_tunnel_state(tunnel_name: str, ipsec_output: str) -> str:
