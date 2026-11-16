@@ -150,6 +150,25 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Reconciler — periodic retry of partial/failed tunnel syncs
+    reconciler_enabled: bool = Field(
+        default=True,
+        description="Set to False to disable the automatic reconciler background task.",
+    )
+    reconciler_interval_seconds: int = Field(
+        default=300,
+        ge=10,
+        description="How often (in seconds) the reconciler scans for partial/failed tunnels.",
+    )
+    reconciler_max_attempts: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "Maximum number of automated reconciler attempts per tunnel per process lifetime. "
+            "After this many attempts the reconciler stops retrying until the app restarts."
+        ),
+    )
+
     # CORS
     cors_origins: list[str] = Field(default=["http://localhost:3000"])
 

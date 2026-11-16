@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 
@@ -31,6 +32,7 @@ from app.routers import (
     tunnels_router,
     users_router,
 )
+from app.services.reconciler import reconciler_loop
 
 logger = get_logger(__name__)
 
@@ -43,6 +45,7 @@ logger = get_logger(__name__)
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Manage application startup and shutdown."""
     setup_logging()
+    settings = get_settings()
     logger.info("application_starting", version="1.0.0")
 
     # Recover orphaned async operations from previous crash/restart
@@ -67,7 +70,19 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             await db.commit()
             logger.info("orphan_operations_marked_failed", count=len(orphans))
 
+    # Start the periodic reconciler for partial/failed tunnel syncs
+    reconciler_task = asyncio.create_task(
+        reconciler_loop(async_session_factory, settings)
+    )
+
     yield
+
+    reconciler_task.cancel()
+    try:
+        await reconciler_task
+    except asyncio.CancelledError:
+        pass
+
     await engine.dispose()
     logger.info("application_shutdown")
 
