@@ -174,6 +174,27 @@ class TestRenderSwanctlConf:
         result = render_swanctl_conf(tunnel, "test-psk-value")
         assert "!" not in result
 
+    def test_swanctl_strips_bang_from_ike_proposals(self, tunnel):
+        """'!' in ike_proposals is stroke-only syntax — must be stripped for swanctl."""
+        tunnel.ike_proposals = "aes256-sha256-modp2048!"
+        result = render_swanctl_conf(tunnel, "test-psk-value")
+        assert "proposals = aes256-sha256-modp2048" in result
+        assert "!" not in result
+
+    def test_swanctl_strips_bang_from_esp_proposals(self, tunnel):
+        """'!' in esp_proposals is stroke-only syntax — must be stripped for swanctl."""
+        tunnel.esp_proposals = "aes256-sha256!"
+        result = render_swanctl_conf(tunnel, "test-psk-value")
+        assert "esp_proposals = aes256-sha256" in result
+        assert "!" not in result
+
+    def test_swanctl_strips_bang_from_multi_proposal(self, tunnel):
+        """'!' stripped from each comma-separated proposal."""
+        tunnel.ike_proposals = "aes256-sha256-modp2048!,aes128-sha1-modp1024!"
+        result = render_swanctl_conf(tunnel, "test-psk-value")
+        assert "proposals = aes256-sha256-modp2048,aes128-sha1-modp1024" in result
+        assert "!" not in result
+
     def test_secrets_id1_uses_peer_ip_when_local_id_set(self, tunnel):
         """When local_id is set but remote_id is None, id-1 still uses peer_ip."""
         tunnel.local_id = "44.215.155.152"
@@ -307,6 +328,12 @@ class TestStrokeRendersUnchanged:
     def test_stroke_secrets_does_not_contain_ike_prefix(self, tunnel):
         result = render_secrets_file(tunnel, "my-psk")
         assert "ike-" not in result
+
+    def test_stroke_keeps_bang_in_proposals(self, tunnel):
+        """Stroke render must keep '!' — it enforces strict proposal negotiation."""
+        tunnel.ike_proposals = "aes256-sha256-modp2048"
+        result = render_connection_conf(tunnel)
+        assert "ike=aes256-sha256-modp2048!" in result
 
 
 class TestServerModelIpsecEngineDefault:

@@ -132,9 +132,10 @@ Security Associations (0 up, 1 connecting):
         assert _parse_tunnel_state("missing-tunnel", output) == "DOWN"
 
     def test_empty_output(self):
+        """Empty output with successful command means no SAs active → DOWN."""
         from app.services.tunnel_service import _parse_tunnel_state
 
-        assert _parse_tunnel_state("test", "") == "UNKNOWN"
+        assert _parse_tunnel_state("test", "") == "DOWN"
 
 
 # ---------------------------------------------------------------------------

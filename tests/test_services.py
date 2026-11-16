@@ -854,10 +854,11 @@ class TestParseSwanctlTunnelState:
 
         assert _parse_swanctl_tunnel_state("other-tunnel", self.REAL_OUTPUT) == "DOWN"
 
-    def test_empty_output_is_unknown(self):
+    def test_empty_output_is_down(self):
+        """Empty output means command succeeded but no IKE SAs active → DOWN."""
         from app.services.tunnel_service import _parse_swanctl_tunnel_state
 
-        assert _parse_swanctl_tunnel_state("any-tunnel", "") == "UNKNOWN"
+        assert _parse_swanctl_tunnel_state("any-tunnel", "") == "DOWN"
 
     def test_ike_established_but_no_child_installed_is_down(self):
         from app.services.tunnel_service import _parse_swanctl_tunnel_state

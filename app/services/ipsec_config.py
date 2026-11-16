@@ -158,9 +158,11 @@ def render_swanctl_conf(tunnel: Tunnel, psk: str) -> str:
         "    keyingtries = 0",
     ]
 
-    # swanctl proposals are strict by default; no '!' suffix needed
+    # swanctl proposals are strict by default; no '!' suffix needed.
+    # Strip any trailing '!' from each comma-separated proposal (stroke-only syntax).
     if tunnel.ike_proposals:
-        conn_lines.append(f"    proposals = {tunnel.ike_proposals}")
+        _ike = ",".join(p.rstrip("!") for p in tunnel.ike_proposals.split(","))
+        conn_lines.append(f"    proposals = {_ike}")
 
     local_block = [
         "",
@@ -192,7 +194,8 @@ def render_swanctl_conf(tunnel: Tunnel, psk: str) -> str:
     ])
 
     if tunnel.esp_proposals:
-        conn_lines.append(f"        esp_proposals = {tunnel.esp_proposals}")
+        _esp = ",".join(p.rstrip("!") for p in tunnel.esp_proposals.split(","))
+        conn_lines.append(f"        esp_proposals = {_esp}")
 
     conn_lines.extend([
         "      }",

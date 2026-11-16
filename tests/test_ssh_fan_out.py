@@ -596,15 +596,17 @@ class TestAggregateTunnelStates:
 
         assert _aggregate_tunnel_states(["UP", "UP", "UP"]) == "UP"
 
-    def test_mixed_up_down_returns_partial(self):
+    def test_mixed_up_down_returns_up(self):
+        """HA active/standby: UP on primary + DOWN on standby → overall UP."""
         from app.services.tunnel_service import _aggregate_tunnel_states
 
-        assert _aggregate_tunnel_states(["UP", "DOWN", "DOWN"]) == "PARTIAL"
+        assert _aggregate_tunnel_states(["UP", "DOWN", "DOWN"]) == "UP"
 
-    def test_mixed_up_unknown_returns_partial(self):
+    def test_mixed_up_unknown_returns_up(self):
+        """UP on reachable server + unreachable standby → overall UP."""
         from app.services.tunnel_service import _aggregate_tunnel_states
 
-        assert _aggregate_tunnel_states(["UP", "UNKNOWN"]) == "PARTIAL"
+        assert _aggregate_tunnel_states(["UP", "UNKNOWN"]) == "UP"
 
     def test_all_down_returns_down(self):
         from app.services.tunnel_service import _aggregate_tunnel_states
@@ -626,6 +628,16 @@ class TestAggregateTunnelStates:
 
         assert _aggregate_tunnel_states(["DOWN", "UNKNOWN"]) == "DOWN"
 
+    def test_connecting_with_no_up_returns_connecting(self):
+        from app.services.tunnel_service import _aggregate_tunnel_states
+
+        assert _aggregate_tunnel_states(["CONNECTING", "DOWN"]) == "CONNECTING"
+
+    def test_up_takes_precedence_over_connecting(self):
+        from app.services.tunnel_service import _aggregate_tunnel_states
+
+        assert _aggregate_tunnel_states(["UP", "CONNECTING"]) == "UP"
+
     def test_parse_tunnel_state_established(self):
         from app.services.tunnel_service import _parse_tunnel_state
 
@@ -638,10 +650,11 @@ class TestAggregateTunnelStates:
         output = "vpn-tunnel: no match found\nvpn-tunnel: down"
         assert _parse_tunnel_state("vpn-tunnel", output) == "DOWN"
 
-    def test_parse_tunnel_state_unknown_when_empty(self):
+    def test_parse_tunnel_state_down_when_empty(self):
+        """Empty output with successful command means no SAs → DOWN."""
         from app.services.tunnel_service import _parse_tunnel_state
 
-        assert _parse_tunnel_state("vpn-tunnel", "") == "UNKNOWN"
+        assert _parse_tunnel_state("vpn-tunnel", "") == "DOWN"
 
     def test_parse_tunnel_state_down_when_not_found(self):
         from app.services.tunnel_service import _parse_tunnel_state

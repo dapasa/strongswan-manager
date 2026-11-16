@@ -894,7 +894,7 @@ def _parse_swanctl_tunnel_state(tunnel_name: str, output: str) -> str:
     not established), or 'UNKNOWN' (empty output — daemon may be down).
     """
     if not output:
-        return "UNKNOWN"
+        return "DOWN"
 
     name_prefix = tunnel_name.lower() + ":"
     ike_established = False
@@ -980,7 +980,7 @@ def _parse_tunnel_state(tunnel_name: str, ipsec_output: str) -> str:
         'UP', 'DOWN', or 'UNKNOWN'.
     """
     if not ipsec_output:
-        return "UNKNOWN"
+        return "DOWN"
 
     lines = ipsec_output.lower().splitlines()
     found_connection = False
@@ -1010,13 +1010,12 @@ def _aggregate_tunnel_states(states: list[str]) -> str:
     """
     if not states:
         return "UNKNOWN"
-    has_up = "UP" in states
-    has_down_or_unknown = any(s in ("DOWN", "UNKNOWN") for s in states)
-    if has_up and has_down_or_unknown:
-        return "PARTIAL"
-    if has_up:
+    if "UP" in states:
         return "UP"
-    if "DOWN" in states:
+    if "CONNECTING" in states:
+        return "CONNECTING"
+    # Any reachable (non-UNKNOWN) server reporting DOWN → DOWN
+    if any(s != "UNKNOWN" for s in states):
         return "DOWN"
     return "UNKNOWN"
 
