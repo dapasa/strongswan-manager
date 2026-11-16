@@ -544,11 +544,11 @@ class TestMixedEngineFleet:
         assert swanctl_write["mode"] == "600"
         assert "connections {" in swanctl_write["content"]
         assert "secrets {" in swanctl_write["content"]
-        assert execute_calls[1] == ["sudo /usr/sbin/swanctl --load-all"]
+        assert execute_calls[1][-1] == "sudo /usr/sbin/swanctl --load-all"
 
         # Stroke server: two write calls — mode 644 conf + mode 600 secrets
         assert len(write_calls[2]) == 2
         modes = [w["mode"] for w in write_calls[2]]
         assert "644" in modes
         assert "600" in modes
-        assert execute_calls[2] == ["sudo ipsec reload"]
+        assert execute_calls[2][-1] == "sudo ipsec reload"

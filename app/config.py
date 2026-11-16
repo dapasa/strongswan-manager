@@ -150,6 +150,21 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Backup / rollback for per-node config writes
+    vpn_backup_dir: str = Field(
+        default="/var/backups/strongswan-manager",
+        description=(
+            "Remote directory on each VPN node where tunnel config files are backed up "
+            "before each write or delete. Created with mode 700; backup files are written "
+            "with mode 600. Path must not contain spaces or shell-special characters."
+        ),
+    )
+    vpn_backup_retention: int = Field(
+        default=5,
+        ge=1,
+        description="Number of per-file backup copies to keep on each VPN node.",
+    )
+
     # Reconciler — periodic retry of partial/failed tunnel syncs
     reconciler_enabled: bool = Field(
         default=True,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import posixpath
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -245,6 +246,65 @@ async def execute_on_all_servers(
     )
 
 
+def _build_backup_commands(
+    path_modes: list[tuple[str, str]],
+    backup_dir: str,
+    ts: str,
+    retention: int,
+) -> list[str]:
+    """Shell commands that back up path_modes files and prune old copies.
+
+    Returns a list of command strings suitable for a single transport.execute() call.
+    path_modes is a list of (remote_path, original_mode) tuples.  The original mode
+    is not used here — it is kept for symmetry with _attempt_rollback.
+    Backup files are always written mode 600 (they may contain PSKs).
+    File contents are never included in the returned commands.
+    """
+    cmds: list[str] = [f"sudo mkdir -p -m 700 {backup_dir}"]
+    for path, _mode in path_modes:
+        fname = posixpath.basename(path)
+        bpath = f"{backup_dir}/{fname}.{ts}"
+        cmds.append(
+            f"{{ [ -f {path} ]"
+            f" && sudo cp {path} {bpath} && sudo chmod 600 {bpath}; true; }}"
+        )
+        cmds.append(
+            f"{{ ls -1t {backup_dir}/{fname}.* 2>/dev/null"
+            f" | tail -n +{retention + 1} | xargs -r sudo rm -f; true; }}"
+        )
+    return cmds
+
+
+async def _attempt_rollback(
+    transport,
+    path_modes: list[tuple[str, str]],
+    backup_dir: str,
+    ts: str,
+    reload_cmd: str,
+) -> str | None:
+    """Restore backed-up files and reload.  Returns None on success, error string on failure.
+
+    For each path: if the backup file exists, copy it back and restore the original mode;
+    otherwise remove the new file (the file did not exist before the failed operation).
+    File contents are never logged or returned.
+    """
+    cmds: list[str] = []
+    for path, mode in path_modes:
+        fname = posixpath.basename(path)
+        bpath = f"{backup_dir}/{fname}.{ts}"
+        cmds.append(
+            f"{{ [ -f {bpath} ]"
+            f" && sudo cp {bpath} {path} && sudo chmod {mode} {path}"
+            f" || sudo rm -f {path}; true; }}"
+        )
+    cmds.append(reload_cmd)
+    try:
+        await transport.execute(cmds)
+        return None
+    except Exception as exc:
+        return str(exc)
+
+
 async def sftp_push_tunnel_config(
     server: Server,
     name: str,
@@ -276,22 +336,47 @@ async def sftp_push_tunnel_config(
     Returns:
         ServerResult with success=True on success, or success=False with error message.
     """
-    effective_timeout = timeout if timeout is not None else get_settings().ssh_command_timeout
+    settings = get_settings()
+    effective_timeout = timeout if timeout is not None else settings.ssh_command_timeout
     conf_path = _remote_conf_path(name, server.ipsec_engine)
     stroke_secrets_path = _remote_stroke_secrets_path(name)
+    backup_dir = settings.vpn_backup_dir
+    keep = settings.vpn_backup_retention
     transport = get_transport(server)
 
     async def _run() -> ServerResult:
+        backup_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
         if server.ipsec_engine == "swanctl" and swanctl_content is not None:
-            # swanctl: one file in conf.d, mode 0600, no secrets dir write
-            await transport.write_file(conf_path, swanctl_content, mode="600", make_dirs=True)
-            await transport.execute([_LOAD_ALL])
+            path_modes: list[tuple[str, str]] = [(conf_path, "600")]
+            reload_cmd = _LOAD_ALL
         else:
-            # stroke: separate conf + secrets files; secrets in /etc/ipsec.d/secrets/, mode 0600
-            await transport.write_file(conf_path, conf_content, mode="644", make_dirs=True)
+            path_modes = [(conf_path, "644")]
             if secrets_content is not None:
-                await transport.write_file(stroke_secrets_path, secrets_content, mode="600", make_dirs=True)
-            await transport.execute([_IPSEC_RELOAD])
+                path_modes.append((stroke_secrets_path, "600"))
+            reload_cmd = _IPSEC_RELOAD
+
+        # Back up existing files before any write; backup dir created with mode 700.
+        await transport.execute(_build_backup_commands(path_modes, backup_dir, backup_ts, keep))
+
+        try:
+            if server.ipsec_engine == "swanctl" and swanctl_content is not None:
+                # swanctl: one file in conf.d, mode 0600, no secrets dir write
+                await transport.write_file(conf_path, swanctl_content, mode="600", make_dirs=True)
+                await transport.execute([reload_cmd])
+            else:
+                # stroke: separate conf + secrets files; secrets in /etc/ipsec.d/secrets/, mode 0600
+                await transport.write_file(conf_path, conf_content, mode="644", make_dirs=True)
+                if secrets_content is not None:
+                    await transport.write_file(stroke_secrets_path, secrets_content, mode="600", make_dirs=True)
+                await transport.execute([reload_cmd])
+        except Exception as write_exc:
+            rb_error = await _attempt_rollback(transport, path_modes, backup_dir, backup_ts, reload_cmd)
+            if rb_error is None:
+                raise TransportError(f"{write_exc} — rolled back successfully") from write_exc
+            raise TransportError(
+                f"{write_exc} — rollback also failed: {rb_error}"
+            ) from write_exc
 
         logger.info("server_sftp_push_success", server_id=server.id, name=server.name, tunnel=name)
         return ServerResult(server_id=server.id, server_name=server.name, success=True)
@@ -354,21 +439,44 @@ async def sftp_delete_tunnel_config(
     Returns:
         ServerResult with success=True on success (including file-not-found), or success=False with error.
     """
-    effective_timeout = timeout if timeout is not None else get_settings().ssh_command_timeout
+    settings = get_settings()
+    effective_timeout = timeout if timeout is not None else settings.ssh_command_timeout
     conf_path = _remote_conf_path(name, server.ipsec_engine)
     stroke_secrets_path = _remote_stroke_secrets_path(name)
+    backup_dir = settings.vpn_backup_dir
+    keep = settings.vpn_backup_retention
     transport = get_transport(server)
 
     async def _run() -> ServerResult:
+        backup_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
         if server.ipsec_engine == "swanctl":
-            # swanctl: single file — delete only conf, no secrets dir entry
-            await transport.delete_file(conf_path)
-            await transport.execute([_LOAD_ALL])
+            path_modes: list[tuple[str, str]] = [(conf_path, "600")]
+            reload_cmd = _LOAD_ALL
         else:
-            # stroke: remove both conf and secrets files
-            await transport.delete_file(conf_path)
-            await transport.delete_file(stroke_secrets_path)
-            await transport.execute([_IPSEC_RELOAD])
+            path_modes = [(conf_path, "644"), (stroke_secrets_path, "600")]
+            reload_cmd = _IPSEC_RELOAD
+
+        # Back up existing files before any delete; backup dir created with mode 700.
+        await transport.execute(_build_backup_commands(path_modes, backup_dir, backup_ts, keep))
+
+        try:
+            if server.ipsec_engine == "swanctl":
+                # swanctl: single file — delete only conf, no secrets dir entry
+                await transport.delete_file(conf_path)
+                await transport.execute([reload_cmd])
+            else:
+                # stroke: remove both conf and secrets files
+                await transport.delete_file(conf_path)
+                await transport.delete_file(stroke_secrets_path)
+                await transport.execute([reload_cmd])
+        except Exception as del_exc:
+            rb_error = await _attempt_rollback(transport, path_modes, backup_dir, backup_ts, reload_cmd)
+            if rb_error is None:
+                raise TransportError(f"{del_exc} — rolled back successfully") from del_exc
+            raise TransportError(
+                f"{del_exc} — rollback also failed: {rb_error}"
+            ) from del_exc
 
         logger.info("server_sftp_delete_success", server_id=server.id, name=server.name, tunnel=name)
         return ServerResult(server_id=server.id, server_name=server.name, success=True)

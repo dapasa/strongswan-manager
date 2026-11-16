@@ -99,10 +99,10 @@ class TestSftpPushTunnelConfig:
         mock_import_key.return_value = MagicMock()
 
         server = _make_server(ipsec_engine="stroke")
-        # With secrets: mkdir conf, tee conf, chmod conf, mkdir secrets, tee secrets, chmod secrets, ipsec reload
+        # backup (1) + mkdir conf, tee conf, chmod conf, mkdir secrets, tee secrets, chmod secrets, ipsec reload
         ok = _make_run_result()
         mock_conn_cm, mock_conn = _build_conn_mock(
-            run_side_effect=[ok, ok, ok, ok, ok, ok, ok]
+            run_side_effect=[ok, ok, ok, ok, ok, ok, ok, ok]
         )
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
@@ -116,22 +116,22 @@ class TestSftpPushTunnelConfig:
         assert result.success is True
         assert result.server_id == 1
         assert result.server_name == "vpn-1"
-        assert mock_conn.run.call_count == 7
+        assert mock_conn.run.call_count == 8
 
-        # Verify the exact commands sent (order matters)
+        # Verify the exact commands sent (order matters); calls[0] is the backup execute
         calls = [c.args[0] for c in mock_conn.run.call_args_list]
-        assert calls[0] == "sudo mkdir -p /opt/strongswan/config/connections"
-        assert calls[1] == "sudo tee /opt/strongswan/config/connections/my-tunnel.conf"
-        assert calls[2] == "sudo chmod 644 /opt/strongswan/config/connections/my-tunnel.conf"
-        assert calls[3] == "sudo mkdir -p /etc/ipsec.d/secrets"
-        assert calls[4] == "sudo tee /etc/ipsec.d/secrets/my-tunnel.secrets"
-        assert calls[5] == "sudo chmod 600 /etc/ipsec.d/secrets/my-tunnel.secrets"
-        assert calls[6] == "sudo ipsec reload"
+        assert calls[1] == "sudo mkdir -p /opt/strongswan/config/connections"
+        assert calls[2] == "sudo tee /opt/strongswan/config/connections/my-tunnel.conf"
+        assert calls[3] == "sudo chmod 644 /opt/strongswan/config/connections/my-tunnel.conf"
+        assert calls[4] == "sudo mkdir -p /etc/ipsec.d/secrets"
+        assert calls[5] == "sudo tee /etc/ipsec.d/secrets/my-tunnel.secrets"
+        assert calls[6] == "sudo chmod 600 /etc/ipsec.d/secrets/my-tunnel.secrets"
+        assert calls[7] == "sudo ipsec reload"
 
         # Verify file content was piped via input=
-        tee_conf_call = mock_conn.run.call_args_list[1]
+        tee_conf_call = mock_conn.run.call_args_list[2]
         assert tee_conf_call.kwargs.get("input") == "conn my-tunnel\n"
-        tee_secrets_call = mock_conn.run.call_args_list[4]
+        tee_secrets_call = mock_conn.run.call_args_list[5]
         assert tee_secrets_call.kwargs.get("input") == "10.0.0.1 : PSK secret\n"
 
     @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
@@ -153,10 +153,10 @@ class TestSftpPushTunnelConfig:
         mock_import_key.return_value = MagicMock()
 
         server = _make_server(ipsec_engine="stroke")
-        # Without secrets: mkdir conf, tee conf, chmod conf, ipsec reload
+        # backup (1) + mkdir conf, tee conf, chmod conf, ipsec reload
         ok = _make_run_result()
         mock_conn_cm, mock_conn = _build_conn_mock(
-            run_side_effect=[ok, ok, ok, ok]
+            run_side_effect=[ok, ok, ok, ok, ok]
         )
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
@@ -168,16 +168,16 @@ class TestSftpPushTunnelConfig:
             )
 
         assert result.success is True
-        assert mock_conn.run.call_count == 4
+        assert mock_conn.run.call_count == 5
 
         calls = [c.args[0] for c in mock_conn.run.call_args_list]
-        assert calls[0] == "sudo mkdir -p /opt/strongswan/config/connections"
-        assert calls[1] == "sudo tee /opt/strongswan/config/connections/my-tunnel.conf"
-        assert calls[2] == "sudo chmod 644 /opt/strongswan/config/connections/my-tunnel.conf"
-        assert calls[3] == "sudo ipsec reload"
+        assert calls[1] == "sudo mkdir -p /opt/strongswan/config/connections"
+        assert calls[2] == "sudo tee /opt/strongswan/config/connections/my-tunnel.conf"
+        assert calls[3] == "sudo chmod 644 /opt/strongswan/config/connections/my-tunnel.conf"
+        assert calls[4] == "sudo ipsec reload"
 
-        # No secrets-related commands
-        assert not any("secrets" in c for c in calls)
+        # No secrets-related commands (backup dir may appear in calls[0])
+        assert not any("secrets" in c for c in calls[1:])
 
     @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
     @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
@@ -200,8 +200,8 @@ class TestSftpPushTunnelConfig:
         server = _make_server(ipsec_engine="stroke")
         ok = _make_run_result()
         fail = _make_run_result(exit_status=1, stderr="Permission denied")
-        # mkdir ok, tee fails
-        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, fail])
+        # backup ok, mkdir ok, tee fails; rollback execute ok
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, fail, ok])
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_push_tunnel_config(
@@ -237,9 +237,9 @@ class TestSftpPushTunnelConfig:
         server = _make_server(ipsec_engine="swanctl")
         ok = _make_run_result()
         swanctl_fail = _make_run_result(exit_status=1, stderr="swanctl failed")
-        # swanctl path: mkdir conf, tee conf, chmod conf all ok — swanctl fails
+        # backup ok; mkdir conf, tee conf, chmod conf all ok; swanctl fails; rollback execute ok
         mock_conn_cm, mock_conn = _build_conn_mock(
-            run_side_effect=[ok, ok, ok, swanctl_fail]
+            run_side_effect=[ok, ok, ok, ok, swanctl_fail, ok]
         )
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
@@ -284,7 +284,8 @@ class TestSftpDeleteTunnelConfig:
 
         server = _make_server(ipsec_engine="stroke")
         ok = _make_run_result()
-        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok])
+        # backup (1) + rm conf, rm secrets, ipsec reload
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok])
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_delete_tunnel_config(server, name="my-tunnel")
@@ -292,12 +293,12 @@ class TestSftpDeleteTunnelConfig:
         assert result.success is True
         assert result.server_id == 1
         assert result.server_name == "vpn-1"
-        assert mock_conn.run.call_count == 3
+        assert mock_conn.run.call_count == 4
 
         calls = [c.args[0] for c in mock_conn.run.call_args_list]
-        assert calls[0] == "sudo rm -f /opt/strongswan/config/connections/my-tunnel.conf"
-        assert calls[1] == "sudo rm -f /etc/ipsec.d/secrets/my-tunnel.secrets"
-        assert calls[2] == "sudo ipsec reload"
+        assert calls[1] == "sudo rm -f /opt/strongswan/config/connections/my-tunnel.conf"
+        assert calls[2] == "sudo rm -f /etc/ipsec.d/secrets/my-tunnel.secrets"
+        assert calls[3] == "sudo ipsec reload"
 
     @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
     @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
@@ -318,9 +319,9 @@ class TestSftpDeleteTunnelConfig:
         mock_import_key.return_value = MagicMock()
 
         server = _make_server(ipsec_engine="stroke")
-        # rm -f exits 0 even when file doesn't exist — same mock as success
+        # backup (1) + rm -f exits 0 even when file doesn't exist
         ok = _make_run_result(exit_status=0)
-        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok])
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok])
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_delete_tunnel_config(server, name="my-tunnel")
@@ -554,8 +555,8 @@ class TestStrokeServerPush:
 
         server = _make_server(ipsec_engine="stroke")
         ok = _make_run_result()
-        # mkdir conf, tee conf, chmod 644 conf, mkdir secrets, tee secrets, chmod 600 secrets, ipsec reload
-        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok, ok, ok, ok])
+        # backup (1) + mkdir conf, tee conf, chmod 644 conf, mkdir secrets, tee secrets, chmod 600 secrets, ipsec reload
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok, ok, ok, ok, ok])
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_push_tunnel_config(
@@ -567,12 +568,12 @@ class TestStrokeServerPush:
             )
 
         assert result.success is True
-        assert mock_conn.run.call_count == 7
+        assert mock_conn.run.call_count == 8
         calls = [c.args[0] for c in mock_conn.run.call_args_list]
-        assert calls[2] == "sudo chmod 644 /etc/ipsec.d/connections/vpn-prod.conf"
-        assert calls[5] == "sudo chmod 600 /etc/ipsec.d/secrets/vpn-prod.secrets"
-        assert calls[6] == "sudo ipsec reload"
-        # No swanctl command
+        assert calls[3] == "sudo chmod 644 /etc/ipsec.d/connections/vpn-prod.conf"
+        assert calls[6] == "sudo chmod 600 /etc/ipsec.d/secrets/vpn-prod.secrets"
+        assert calls[7] == "sudo ipsec reload"
+        # No swanctl command (backup dir name may contain 'strongswan' but not 'swanctl')
         assert not any("swanctl" in c for c in calls)
 
 
@@ -604,8 +605,8 @@ class TestSwanctlServerPush:
 
         server = _make_server(ipsec_engine="swanctl")
         ok = _make_run_result()
-        # mkdir conf.d, tee conf, chmod 600 conf, swanctl --load-all
-        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok])
+        # backup (1) + mkdir conf.d, tee conf, chmod 600 conf, swanctl --load-all
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok, ok])
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_push_tunnel_config(
@@ -617,18 +618,18 @@ class TestSwanctlServerPush:
             )
 
         assert result.success is True
-        assert mock_conn.run.call_count == 4
+        assert mock_conn.run.call_count == 5
         calls = [c.args[0] for c in mock_conn.run.call_args_list]
-        assert calls[0] == "sudo mkdir -p /etc/swanctl/conf.d"
-        assert calls[1] == "sudo tee /etc/swanctl/conf.d/vpn-swanctl.conf"
-        assert calls[2] == "sudo chmod 600 /etc/swanctl/conf.d/vpn-swanctl.conf"
-        assert calls[3] == "sudo /usr/sbin/swanctl --load-all"
+        assert calls[1] == "sudo mkdir -p /etc/swanctl/conf.d"
+        assert calls[2] == "sudo tee /etc/swanctl/conf.d/vpn-swanctl.conf"
+        assert calls[3] == "sudo chmod 600 /etc/swanctl/conf.d/vpn-swanctl.conf"
+        assert calls[4] == "sudo /usr/sbin/swanctl --load-all"
         # Verify combined content was written
-        tee_call = mock_conn.run.call_args_list[1]
+        tee_call = mock_conn.run.call_args_list[2]
         assert "connections {" in tee_call.kwargs.get("input", "")
         assert "secrets {" in tee_call.kwargs.get("input", "")
-        # No secrets dir write
-        assert not any("secrets" in c and "chmod" in c for c in calls)
+        # No secrets dir write (backup dir may contain "strongswan" but not a secrets chmod)
+        assert not any("secrets" in c and "chmod" in c for c in calls[1:])
 
     @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
     @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
@@ -650,19 +651,19 @@ class TestSwanctlServerPush:
 
         server = _make_server(ipsec_engine="swanctl")
         ok = _make_run_result()
-        # rm -f conf, swanctl --load-all  (only 2 calls)
-        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok])
+        # backup (1) + rm -f conf, swanctl --load-all
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok])
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_delete_tunnel_config(server, name="vpn-swanctl")
 
         assert result.success is True
-        assert mock_conn.run.call_count == 2
+        assert mock_conn.run.call_count == 3
         calls = [c.args[0] for c in mock_conn.run.call_args_list]
-        assert calls[0] == "sudo rm -f /etc/swanctl/conf.d/vpn-swanctl.conf"
-        assert calls[1] == "sudo /usr/sbin/swanctl --load-all"
-        # No secrets dir removal
-        assert not any("secrets" in c for c in calls)
+        assert calls[1] == "sudo rm -f /etc/swanctl/conf.d/vpn-swanctl.conf"
+        assert calls[2] == "sudo /usr/sbin/swanctl --load-all"
+        # No secrets dir removal in write-phase commands
+        assert not any("secrets" in c for c in calls[1:])
 
 
 # ---------------------------------------------------------------------------
@@ -693,7 +694,8 @@ class TestReloadCommandByEngine:
 
         server = _make_server(ipsec_engine="swanctl")
         ok = _make_run_result()
-        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok])
+        # backup (1) + mkdir, tee, chmod, swanctl
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok, ok])
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_push_tunnel_config(
@@ -729,7 +731,8 @@ class TestReloadCommandByEngine:
 
         server = _make_server(ipsec_engine="stroke")
         ok = _make_run_result()
-        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok])
+        # backup (1) + mkdir, tee, chmod, ipsec reload
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok, ok])
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_push_tunnel_config(
@@ -773,7 +776,8 @@ class TestStrokeSecretsPath:
 
         server = _make_server(ipsec_engine="stroke")
         ok = _make_run_result()
-        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok, ok, ok, ok])
+        # backup (1) + mkdir conf, tee conf, chmod conf, mkdir secrets, tee secrets, chmod secrets, ipsec reload
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok, ok, ok, ok, ok])
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             await sftp_push_tunnel_config(
@@ -784,9 +788,9 @@ class TestStrokeSecretsPath:
             )
 
         calls = [c.args[0] for c in mock_conn.run.call_args_list]
-        # Secrets must go to stroke dir, not legacy secrets dir
-        assert any("/etc/ipsec.d/secrets/my-tunnel.secrets" in c for c in calls)
-        assert not any("/opt/strongswan/config/secrets" in c for c in calls)
+        # Secrets must go to stroke dir, not legacy secrets dir (check write-phase commands at calls[1:])
+        assert any("/etc/ipsec.d/secrets/my-tunnel.secrets" in c for c in calls[1:])
+        assert not any("/opt/strongswan/config/secrets" in c for c in calls[1:])
 
     @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
     @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
@@ -808,7 +812,8 @@ class TestStrokeSecretsPath:
 
         server = _make_server(ipsec_engine="stroke")
         ok = _make_run_result()
-        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok, ok, ok, ok])
+        # backup (1) + mkdir conf, tee conf, chmod conf, mkdir secrets, tee secrets, chmod secrets, ipsec reload
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok, ok, ok, ok, ok])
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             await sftp_push_tunnel_config(
@@ -819,7 +824,8 @@ class TestStrokeSecretsPath:
             )
 
         calls = [c.args[0] for c in mock_conn.run.call_args_list]
-        chmod_secrets = next(c for c in calls if "chmod" in c and "secrets" in c)
+        # Check the chmod for secrets in the write-phase commands (calls[1:])
+        chmod_secrets = next(c for c in calls[1:] if "chmod" in c and "secrets" in c)
         assert "chmod 600" in chmod_secrets
         assert "640" not in chmod_secrets
 
@@ -843,13 +849,14 @@ class TestStrokeSecretsPath:
 
         server = _make_server(ipsec_engine="stroke")
         ok = _make_run_result()
-        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok])
+        # backup (1) + rm conf, rm secrets, ipsec reload
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok])
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             await sftp_delete_tunnel_config(server, name="my-tunnel")
 
         calls = [c.args[0] for c in mock_conn.run.call_args_list]
-        rm_secrets = next(c for c in calls if "rm -f" in c and "secrets" in c)
+        rm_secrets = next(c for c in calls[1:] if "rm -f" in c and "secrets" in c)
         assert "/etc/ipsec.d/secrets/my-tunnel.secrets" in rm_secrets
         assert "/opt/strongswan/config/secrets" not in rm_secrets
 
@@ -882,7 +889,8 @@ class TestConfPathByEngine:
 
         server = _make_server(ipsec_engine="swanctl")
         ok = _make_run_result()
-        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok])
+        # backup (1) + mkdir, tee, chmod, swanctl
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok, ok])
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_push_tunnel_config(
@@ -895,10 +903,10 @@ class TestConfPathByEngine:
 
         assert result.success is True
         calls = [c.args[0] for c in mock_conn.run.call_args_list]
-        # File must be in vpn_swanctl_conf_dir
-        assert any("/etc/swanctl/conf.d/t-engine.conf" in c for c in calls)
+        # File must be in vpn_swanctl_conf_dir (check write-phase commands)
+        assert any("/etc/swanctl/conf.d/t-engine.conf" in c for c in calls[1:])
         # Must NOT write to vpn_conf_dir
-        assert not any("/opt/strongswan/config/connections" in c for c in calls)
+        assert not any("/opt/strongswan/config/connections" in c for c in calls[1:])
 
     @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
     @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
@@ -921,7 +929,8 @@ class TestConfPathByEngine:
 
         server = _make_server(ipsec_engine="stroke")
         ok = _make_run_result()
-        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok])
+        # backup (1) + mkdir, tee, chmod, ipsec reload
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok, ok, ok])
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_push_tunnel_config(
@@ -933,10 +942,10 @@ class TestConfPathByEngine:
 
         assert result.success is True
         calls = [c.args[0] for c in mock_conn.run.call_args_list]
-        # File must be in vpn_conf_dir
-        assert any("/opt/strongswan/config/connections/t-engine.conf" in c for c in calls)
+        # File must be in vpn_conf_dir (check write-phase commands)
+        assert any("/opt/strongswan/config/connections/t-engine.conf" in c for c in calls[1:])
         # Must NOT write to vpn_swanctl_conf_dir
-        assert not any("/etc/swanctl/conf.d" in c for c in calls)
+        assert not any("/etc/swanctl/conf.d" in c for c in calls[1:])
 
     @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
     @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
@@ -958,15 +967,16 @@ class TestConfPathByEngine:
 
         server = _make_server(ipsec_engine="swanctl")
         ok = _make_run_result()
-        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok])
+        # backup (1) + rm conf, swanctl
+        mock_conn_cm, mock_conn = _build_conn_mock(run_side_effect=[ok, ok, ok])
 
         with patch("app.services.transport.ssh_transport.asyncssh.connect", return_value=mock_conn_cm):
             result = await sftp_delete_tunnel_config(server, name="t-del")
 
         assert result.success is True
         calls = [c.args[0] for c in mock_conn.run.call_args_list]
-        assert any("/etc/swanctl/conf.d/t-del.conf" in c for c in calls)
-        assert not any("/opt/strongswan/config/connections" in c for c in calls)
+        assert any("/etc/swanctl/conf.d/t-del.conf" in c for c in calls[1:])
+        assert not any("/opt/strongswan/config/connections" in c for c in calls[1:])
 
     @patch("app.services.transport.ssh_transport.asyncssh.import_private_key")
     @patch("app.services.transport.ssh_transport.decrypt_ssh_key")
