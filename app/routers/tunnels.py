@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import require_operator, require_viewer
@@ -15,6 +15,8 @@ from app.schemas.operations import AsyncOperationRef
 from app.schemas.route import RouteCreate, RouteDetail
 from app.schemas.tunnel import (
     AllTunnelsLiveStatus,
+    RotatePskRequest,
+    RotatePskResponse,
     TunnelCheckStatusResult,
     TunnelCreate,
     TunnelDetail,
@@ -199,6 +201,49 @@ async def retry_tunnel_sync(
     # Re-fetch fresh from DB after commit to avoid expired state issues
     tunnel = await tunnel_service.get_tunnel(db, tunnel_id)
     return TunnelDetail.model_validate(tunnel)
+
+
+@router.post(
+    "/{tunnel_id}/rotate-psk",
+    response_model=RotatePskResponse,
+    summary="Rotate tunnel PSK",
+)
+async def rotate_tunnel_psk(
+    tunnel_id: int,
+    data: RotatePskRequest,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_operator),
+) -> RotatePskResponse:
+    """Rotate the PSK for a tunnel.
+
+    If the request body is omitted or ``psk`` is not set, a 48-char URL-safe
+    base64 PSK is generated server-side.
+
+    The new PSK is returned **once** in this response and never stored in
+    plaintext. The response carries ``Cache-Control: no-store`` so it is not
+    cached by intermediaries.
+
+    If the push to some nodes fails, ``sync_status`` will be ``partial`` or
+    ``failed``.  The DB always keeps the new encrypted PSK; the reconciler will
+    retry pushing it on the next cycle.
+    """
+    tunnel, new_psk = await tunnel_service.rotate_psk(
+        db,
+        tunnel_id,
+        psk=data.psk,
+        user=current_user,
+        request=request,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return RotatePskResponse(
+        tunnel_id=tunnel.id,
+        psk=new_psk,
+        psk_rotated_at=tunnel.psk_rotated_at,
+        sync_status=tunnel.sync_status,
+        sync_details=tunnel.sync_details,
+    )
 
 
 @router.get(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 from datetime import datetime, timezone
 from typing import Any
 
@@ -72,6 +73,7 @@ def _tunnel_to_dict(tunnel: Tunnel) -> dict[str, Any]:
         "created_by": tunnel.created_by,
         "created_at": tunnel.created_at.isoformat() if tunnel.created_at else None,
         "updated_at": tunnel.updated_at.isoformat() if tunnel.updated_at else None,
+        "psk_rotated_at": tunnel.psk_rotated_at.isoformat() if tunnel.psk_rotated_at else None,
     }
 
 
@@ -225,6 +227,7 @@ async def create_tunnel(
         status="active",
         sync_status="pending",
         psk_encrypted=psk_encrypted,
+        psk_rotated_at=datetime.now(timezone.utc),
         created_by=user.id,
     )
     session.add(tunnel)
@@ -349,6 +352,7 @@ async def update_tunnel(
             if "name" in update_data and update_data["name"] != old_name and psk is not None:
                 # Rename + PSK change: re-encrypt PSK, push new config, remove old.
                 tunnel.psk_encrypted = await kms.encrypt_psk(psk)
+                tunnel.psk_rotated_at = datetime.now(timezone.utc)
                 fan_out_result = await ipsec_config.rename_tunnel_config(
                     old_name, tunnel, psk, session
                 )
@@ -360,6 +364,7 @@ async def update_tunnel(
             elif psk is not None:
                 # PSK or config changed, same name: re-encrypt and full push.
                 tunnel.psk_encrypted = await kms.encrypt_psk(psk)
+                tunnel.psk_rotated_at = datetime.now(timezone.utc)
                 fan_out_result = await ipsec_config.sync_tunnel_config(tunnel, psk, session)
                 _apply_fan_out_result(tunnel, fan_out_result)
             else:
@@ -643,6 +648,86 @@ async def retry_tunnel_sync(
 
     await session.commit()
     return tunnel
+
+
+async def rotate_psk(
+    session: AsyncSession,
+    tunnel_id: int,
+    *,
+    psk: str | None = None,
+    user: User,
+    request: Request | None = None,
+) -> tuple[Tunnel, str]:
+    """Rotate the PSK for a tunnel.
+
+    If ``psk`` is None a 48-char URL-safe base64 PSK is generated via ``secrets``.
+    The plaintext PSK is returned to the caller exactly once and is never stored
+    in plaintext, never logged, and never included in AuditLog entries.
+
+    Push semantics are identical to an update with a new PSK: the DB always keeps
+    the new encrypted PSK after this call.  If the push fails on some/all nodes the
+    server rolls back its config file (via the existing backup/rollback mechanism),
+    so a rolled-back node keeps the old PSK while the DB holds the new one.  The
+    reconciler will retry pushing the new PSK on the next cycle — that is acceptable.
+
+    Args:
+        session: Active database session.
+        tunnel_id: Primary key of the tunnel to rotate.
+        psk: New PSK to set, or None to generate one.
+        user: Authenticated user performing the operation.
+        request: FastAPI request for audit context.
+
+    Returns:
+        ``(tunnel, plaintext_psk)`` — the plaintext is for the caller's one-time use.
+
+    Raises:
+        NotFoundError: If the tunnel does not exist.
+        LockConflictError: If the IPSEC_CONF_LOCK is held.
+    """
+    tunnel = await get_tunnel(session, tunnel_id)
+
+    # Generate a URL-safe base64 PSK when the caller did not supply one.
+    # URL-safe base64 uses A-Za-z0-9-_ — safe for both stroke and swanctl renderers.
+    if psk is None:
+        psk = secrets.token_urlsafe(36)  # 36 bytes → ~48 URL-safe base64 chars
+
+    # Acquire lock
+    await require_lock(session, LOCK_IPSEC_CONFIG)
+
+    from app.services import kms
+    tunnel.psk_encrypted = await kms.encrypt_psk(psk)
+    tunnel.psk_rotated_at = datetime.now(timezone.utc)
+    tunnel.sync_status = "pending"
+
+    try:
+        fan_out_result = await ipsec_config.sync_tunnel_config(tunnel, psk=psk, session=session)
+        _apply_fan_out_result(tunnel, fan_out_result)
+        logger.info("tunnel_psk_rotation_synced", tunnel_id=tunnel.id, sync_status=tunnel.sync_status)
+    except InfrastructureError as exc:
+        tunnel.sync_status = "failed"
+        tunnel.sync_error = exc.message
+        logger.error("tunnel_psk_rotation_sync_failed", tunnel_id=tunnel.id, error=exc.message)
+    except Exception as exc:
+        tunnel.sync_status = "failed"
+        tunnel.sync_error = f"Unexpected sync error: {exc}"
+        logger.error("tunnel_psk_rotation_sync_unexpected", tunnel_id=tunnel.id, error=str(exc))
+
+    await session.flush()
+    await session.refresh(tunnel)
+
+    # Audit log — deliberately omits the PSK value from both previous and new state.
+    await audit.log_action(
+        session,
+        user_id=user.id,
+        entity_type="tunnel",
+        entity_id=tunnel.id,
+        action="rotate_psk",
+        new_state=_tunnel_to_dict(tunnel),
+        request=request,
+    )
+
+    await session.commit()
+    return tunnel, psk
 
 
 async def get_tunnel_status(

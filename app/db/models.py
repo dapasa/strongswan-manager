@@ -77,6 +77,8 @@ class Tunnel(TimestampMixin, SoftDeleteMixin, Base):
     psk_secret_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     # KMS-encrypted PSK, base64-encoded (set on create/update, decrypted only when pushing config).
     psk_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Timestamp of last PSK set (create, update with new PSK, or rotate-psk). Never stores the PSK.
+    psk_rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # IKE identity for the local side (e.g. the node's EIP). When null,
     # strongSwan uses the source IP automatically. Renders as leftid (stroke)
     # or local { id = ... } (swanctl) — omitted entirely when null.
@@ -336,7 +338,7 @@ class AuditLog(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "action IN ('create', 'update', 'delete', 'retry', 'login')",
+            "action IN ('create', 'update', 'delete', 'retry', 'login', 'rotate_psk')",
             name="ck_audit_action",
         ),
         Index("idx_audit_entity", "entity_type", "entity_id"),

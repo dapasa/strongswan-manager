@@ -195,6 +195,7 @@ class TunnelSummary(BaseModel):
     sync_error: str | None = None
     route_count: int = Field(description="Number of active routes")
     iptables_rule_count: int = Field(description="Number of active iptables rules")
+    psk_rotated_at: datetime | None = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -222,6 +223,7 @@ class TunnelDetail(BaseModel):
     status: str
     sync_status: str
     sync_error: str | None = None
+    psk_rotated_at: datetime | None = None
     routes: list[RouteDetail]
     iptables_rules: list[IPTablesRuleDetail]
     creator: UserBrief | None = Field(None, alias="creator")
@@ -305,3 +307,31 @@ class AllTunnelsLiveStatus(BaseModel):
         default_factory=dict,
         description="server_id → error message for servers that could not be reached",
     )
+
+
+# ---------------------------------------------------------------------------
+# PSK rotation
+# ---------------------------------------------------------------------------
+
+
+class RotatePskRequest(BaseModel):
+    """Optional body for POST /api/v1/tunnels/{tunnel_id}/rotate-psk."""
+
+    psk: str | None = Field(
+        None,
+        min_length=1,
+        description="New PSK value. Omit to generate a 48-char URL-safe base64 PSK server-side.",
+    )
+
+
+class RotatePskResponse(BaseModel):
+    """Response from POST /api/v1/tunnels/{tunnel_id}/rotate-psk.
+
+    The PSK is returned exactly once. Store it securely — it is never returned again.
+    """
+
+    tunnel_id: int
+    psk: str = Field(description="New plaintext PSK — returned once, store it securely")
+    psk_rotated_at: datetime
+    sync_status: str
+    sync_details: dict | None = None
