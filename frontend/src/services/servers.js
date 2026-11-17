@@ -41,3 +41,10 @@ export async function checkServerStatus(serverId) {
   const { data } = await api.post(`/servers/${serverId}/status`)
   return data
 }
+
+export async function getServerDrift(serverId, tunnelId) {
+  const { data } = await api.get(`/servers/${serverId}/drift`, {
+    params: tunnelId != null ? { tunnel_id: tunnelId } : undefined,
+  })
+  return data
+}

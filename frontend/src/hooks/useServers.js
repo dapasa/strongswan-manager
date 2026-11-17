@@ -7,6 +7,7 @@ import {
   deleteServer,
   testServerConnection,
   checkServerStatus,
+  getServerDrift,
 } from '@/services/servers'
 import { toast, getErrorMessage } from '@/lib/toast'
 
@@ -106,6 +107,23 @@ export function useTestConnection() {
     onError: (error) => {
       toast.error('Failed to test connection', { description: getErrorMessage(error) })
     },
+  })
+}
+
+/**
+ * On-demand server config drift report.
+ * Disabled by default; pass enabled:true to trigger a fetch.
+ * staleTime:Infinity prevents background refetches — use refetch() for Re-check.
+ *
+ * @param {number|string} serverId
+ * @param {{ enabled?: boolean, tunnelId?: number }} options
+ */
+export function useServerDrift(serverId, { enabled = false, tunnelId } = {}) {
+  return useQuery({
+    queryKey: ['servers', serverId, 'drift', tunnelId ?? null],
+    queryFn: () => getServerDrift(serverId, tunnelId),
+    enabled: !!serverId && enabled,
+    staleTime: Infinity,
   })
 }
 
