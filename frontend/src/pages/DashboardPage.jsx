@@ -1,11 +1,14 @@
 import { RefreshCw } from 'lucide-react'
-import { useDashboard } from '@/hooks/useDashboard'
+import { useDashboard, useReconcilerStatus } from '@/hooks/useDashboard'
 import { useRecentActivity } from '@/hooks/useRecentActivity'
 import SummaryCards from '@/components/dashboard/SummaryCards'
+import LiveStatusCards from '@/components/dashboard/LiveStatusCards'
+import HealthCards from '@/components/dashboard/HealthCards'
 import RecentActivity from '@/components/dashboard/RecentActivity'
 
 export default function DashboardPage() {
   const dashboard = useDashboard()
+  const reconciler = useReconcilerStatus()
   const activity = useRecentActivity()
 
   const lastRefresh = dashboard.dataUpdatedAt
@@ -14,6 +17,7 @@ export default function DashboardPage() {
 
   const handleRefresh = () => {
     dashboard.refetch()
+    reconciler.refetch()
     activity.refetch()
   }
 
@@ -51,6 +55,15 @@ export default function DashboardPage() {
         isError={dashboard.isError}
         error={dashboard.error}
         refetch={dashboard.refetch}
+      />
+
+      <LiveStatusCards />
+
+      <HealthCards
+        dashboardData={dashboard.data}
+        isDashboardLoading={dashboard.isLoading}
+        reconcilerData={reconciler.data}
+        isReconcilerLoading={reconciler.isLoading}
       />
 
       <RecentActivity

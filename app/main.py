@@ -27,6 +27,7 @@ from app.routers import (
     health_router,
     iptables_router,
     operations_router,
+    reconciler_router,
     routes_router,
     servers_router,
     tunnels_router,
@@ -128,6 +129,7 @@ def create_app() -> FastAPI:
     app.include_router(routes_router)
     app.include_router(iptables_router)
     app.include_router(dashboard_router)
+    app.include_router(reconciler_router)
     app.include_router(audit_router)
     app.include_router(operations_router)
     app.include_router(users_router)

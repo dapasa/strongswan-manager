@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import require_viewer
+from app.config import get_settings
 from app.db.models import (
     AsyncOperation,
     AuditLog,
@@ -16,7 +19,7 @@ from app.db.models import (
     User,
 )
 from app.db.session import get_db
-from app.schemas.dashboard import DashboardSummary
+from app.schemas.dashboard import DashboardSummary, PskStaleTunnel
 
 router = APIRouter(prefix="/api/v1/dashboard", tags=["dashboard"])
 
@@ -91,6 +94,40 @@ async def get_dashboard_summary(
     )
     last_change = last_change_result.scalar_one()
 
+    # Tunnel sync problems (failed + partial + pending)
+    sync_problems_result = await db.execute(
+        select(func.count()).select_from(Tunnel).where(
+            Tunnel.deleted_at.is_(None),
+            Tunnel.sync_status.in_(["failed", "partial", "pending"]),
+        ),
+    )
+    sync_problems = sync_problems_result.scalar_one()
+
+    # PSK age — query id, name, psk_rotated_at, created_at for all non-deleted tunnels
+    settings = get_settings()
+    threshold_days = settings.psk_max_age_days
+    now = datetime.now(timezone.utc)
+
+    psk_rows_result = await db.execute(
+        select(Tunnel.id, Tunnel.name, Tunnel.psk_rotated_at, Tunnel.created_at).where(
+            Tunnel.deleted_at.is_(None),
+        ),
+    )
+    psk_rows = psk_rows_result.all()
+
+    stale_tunnels: list[PskStaleTunnel] = []
+    oldest_days: int | None = None
+
+    for row in psk_rows:
+        ref_dt = row.psk_rotated_at if row.psk_rotated_at is not None else row.created_at
+        age_days = max(0, (now - ref_dt).days)
+        if oldest_days is None or age_days > oldest_days:
+            oldest_days = age_days
+        if age_days > threshold_days:
+            stale_tunnels.append(PskStaleTunnel(id=row.id, name=row.name, psk_age_days=age_days))
+
+    stale_tunnels.sort(key=lambda x: x.psk_age_days, reverse=True)
+
     return DashboardSummary(
         active_tunnels=active_tunnels,
         active_routes=active_routes,
@@ -98,4 +135,8 @@ async def get_dashboard_summary(
         failed_syncs=failed_syncs,
         pending_operations=pending_operations,
         last_change=last_change,
+        sync_problems=sync_problems,
+        psk_stale_count=len(stale_tunnels),
+        psk_oldest_days=oldest_days,
+        psk_stale_tunnels=stale_tunnels,
     )

@@ -184,6 +184,16 @@ class Settings(BaseSettings):
         ),
     )
 
+    # PSK age alerting
+    psk_max_age_days: int = Field(
+        default=90,
+        ge=1,
+        description=(
+            "Tunnels whose PSK has not been rotated in this many days are flagged as stale "
+            "on the dashboard. Age is measured from psk_rotated_at (or created_at when unset)."
+        ),
+    )
+
     # CORS
     cors_origins: list[str] = Field(default=["http://localhost:3000"])
 

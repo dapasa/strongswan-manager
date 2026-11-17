@@ -7,7 +7,8 @@ import pytest
 from pydantic import ValidationError
 
 from app.schemas.common import PaginationParams, ErrorResponse, HealthResponse
-from app.schemas.dashboard import DashboardSummary
+from app.schemas.dashboard import DashboardSummary, PskStaleTunnel
+from app.schemas.reconciler import ReconcilerStatus, ReconcilerTunnelEntry
 from app.schemas.iptables import IPTablesRuleCreate, IPTablesRuleUpdate
 from app.schemas.route import RouteCreate
 from app.schemas.server import ServerCreate, ServerUpdate
@@ -382,6 +383,78 @@ def test_dashboard_summary_valid():
     )
     assert d.active_tunnels == 5
     assert d.last_change is None
+
+
+def test_dashboard_summary_new_fields_defaults():
+    """New operational fields default to zero/empty for backwards compatibility."""
+    d = DashboardSummary(
+        active_tunnels=1,
+        active_routes=0,
+        active_iptables_rules=0,
+        failed_syncs=0,
+        pending_operations=0,
+    )
+    assert d.sync_problems == 0
+    assert d.psk_stale_count == 0
+    assert d.psk_oldest_days is None
+    assert d.psk_stale_tunnels == []
+
+
+def test_dashboard_summary_with_operational_fields():
+    stale = [PskStaleTunnel(id=1, name="acme-vpn", psk_age_days=120)]
+    d = DashboardSummary(
+        active_tunnels=3,
+        active_routes=5,
+        active_iptables_rules=2,
+        failed_syncs=0,
+        pending_operations=0,
+        sync_problems=1,
+        psk_stale_count=1,
+        psk_oldest_days=120,
+        psk_stale_tunnels=stale,
+    )
+    assert d.sync_problems == 1
+    assert d.psk_stale_count == 1
+    assert d.psk_oldest_days == 120
+    assert len(d.psk_stale_tunnels) == 1
+    assert d.psk_stale_tunnels[0].name == "acme-vpn"
+
+
+def test_psk_stale_tunnel_valid():
+    t = PskStaleTunnel(id=42, name="prod-tunnel", psk_age_days=95)
+    assert t.id == 42
+    assert t.name == "prod-tunnel"
+    assert t.psk_age_days == 95
+
+
+# ---------------------------------------------------------------------------
+# ReconcilerStatus
+# ---------------------------------------------------------------------------
+
+
+def test_reconciler_status_defaults():
+    r = ReconcilerStatus(
+        enabled=True,
+        interval_seconds=300,
+        max_attempts=5,
+    )
+    assert r.enabled is True
+    assert r.last_run_at is None
+    assert r.retrying == []
+    assert r.maxed == []
+
+
+def test_reconciler_status_with_entries():
+    entry = ReconcilerTunnelEntry(tunnel_id=1, tunnel_name="vpn-acme", attempts=3)
+    r = ReconcilerStatus(
+        enabled=True,
+        interval_seconds=300,
+        max_attempts=5,
+        retrying=[entry],
+    )
+    assert len(r.retrying) == 1
+    assert r.retrying[0].tunnel_id == 1
+    assert r.retrying[0].attempts == 3
 
 
 # ---------------------------------------------------------------------------

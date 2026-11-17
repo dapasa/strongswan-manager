@@ -382,3 +382,89 @@ class TestLiveStatusRouter:
         assert row["overall"] == "UP"
         assert len(row["per_server"]) == 1
         assert data["summary"]["up"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Reconciler status endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestReconcilerRouter:
+    async def test_reconciler_status_empty_state(self):
+        """When reconciler has not run yet, returns config fields with empty lists."""
+        with (
+            patch("app.services.reconciler._state", {}),
+            patch("app.services.reconciler._last_run_at", None),
+        ):
+            client = await _get_client()
+            async with client:
+                resp = await client.get("/api/v1/reconciler/status")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "enabled" in data
+        assert "interval_seconds" in data
+        assert "max_attempts" in data
+        assert data["last_run_at"] is None
+        assert data["retrying"] == []
+        assert data["maxed"] == []
+
+    async def test_reconciler_status_viewer_role_allowed(self):
+        with (
+            patch("app.services.reconciler._state", {}),
+            patch("app.services.reconciler._last_run_at", None),
+        ):
+            client = await _get_client(user=_make_mock_user(role="viewer"))
+            async with client:
+                resp = await client.get("/api/v1/reconciler/status")
+
+        assert resp.status_code == 200
+
+    async def test_reconciler_status_with_state(self):
+        """Tunnels in state appear in retrying/maxed based on attempt count."""
+        from datetime import datetime, timezone
+        from app.auth.dependencies import get_current_user
+        from app.db.session import get_db
+        from app.main import app
+
+        # Mock DB to return a tunnel name for id=1
+        # Note: MagicMock(name=...) sets the mock display name, not an attribute.
+        # Set attributes explicitly to get a proper Row-like object.
+        mock_row = MagicMock()
+        mock_row.id = 1
+        mock_row.name = "acme-vpn"
+        mock_db = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.all.return_value = [mock_row]
+        mock_db.execute = AsyncMock(return_value=mock_result)
+
+        async def _override_get_db():
+            yield mock_db
+
+        async def _override_get_current_user():
+            return _make_mock_user()
+
+        app.dependency_overrides[get_db] = _override_get_db
+        app.dependency_overrides[get_current_user] = _override_get_current_user
+
+        last_run = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        try:
+            with (
+                patch("app.services.reconciler._state", {1: 2}),
+                patch("app.services.reconciler._last_run_at", last_run),
+            ):
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                    resp = await client.get("/api/v1/reconciler/status")
+        finally:
+            app.dependency_overrides.clear()
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["last_run_at"] is not None
+        # 2 attempts < default max_attempts(5) → retrying
+        assert len(data["retrying"]) == 1
+        assert data["retrying"][0]["tunnel_name"] == "acme-vpn"
+        assert data["retrying"][0]["attempts"] == 2
+        assert data["maxed"] == []

@@ -17,6 +17,7 @@ logic that manual retry uses.  Concurrency guards:
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
@@ -34,6 +35,14 @@ if TYPE_CHECKING:
     from app.config import Settings
 
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Module-level reconciler state — read-only via GET /api/v1/reconciler/status.
+# Mutated in-place by reconciler_loop; never replaced so external references
+# stay valid across loop iterations.
+# ---------------------------------------------------------------------------
+_state: dict[int, int] = {}  # tunnel_id → consecutive automated attempt count
+_last_run_at: datetime | None = None
 
 
 async def _process_tunnel(
@@ -177,11 +186,14 @@ async def reconciler_loop(session_factory: Callable, settings: Settings) -> None
     Runs until cancelled (on app shutdown).  If reconciler_enabled is False,
     returns immediately.
     """
+    global _last_run_at
+
     if not settings.reconciler_enabled:
         logger.info("reconciler_disabled")
         return
 
-    state: dict[int, int] = {}  # tunnel_id → consecutive automated attempt count
+    # Use the module-level _state so the reconciler endpoint can read it.
+    # It is mutated in-place; never replaced.
 
     logger.info(
         "reconciler_loop_started",
@@ -192,7 +204,8 @@ async def reconciler_loop(session_factory: Callable, settings: Settings) -> None
     while True:
         try:
             await asyncio.sleep(settings.reconciler_interval_seconds)
-            await reconcile_once(state, session_factory, settings)
+            await reconcile_once(_state, session_factory, settings)
+            _last_run_at = datetime.now(timezone.utc)
         except asyncio.CancelledError:
             logger.info("reconciler_loop_cancelled")
             raise
