@@ -1081,24 +1081,25 @@ def _parse_tunnel_state(tunnel_name: str, ipsec_output: str) -> str:
 def _aggregate_tunnel_states(states: list[str]) -> str:
     """Aggregate per-server tunnel states into a single state.
 
+    HA context: in an active/standby pair the standby server normally reports
+    DOWN because its tunnel is intentionally not up.  The aggregate must
+    therefore return UP whenever *any* server is UP — the tunnel is reachable.
+
     Rules:
-    - All UP → UP
-    - Mix of UP and DOWN/UNKNOWN → PARTIAL
-    - All DOWN (with or without UNKNOWN) → DOWN
+    - Any UP → UP  (HA active server is healthy; standby DOWN is expected)
+    - No UP, at least one reachable server reports DOWN → DOWN
     - All UNKNOWN or empty → UNKNOWN
 
     Args:
         states: List of per-server state strings ('UP', 'DOWN', 'UNKNOWN').
 
     Returns:
-        Aggregated state string: 'UP', 'PARTIAL', 'DOWN', or 'UNKNOWN'.
+        Aggregated state string: 'UP', 'DOWN', or 'UNKNOWN'.
     """
     if not states:
         return "UNKNOWN"
     if "UP" in states:
         return "UP"
-    if "CONNECTING" in states:
-        return "CONNECTING"
     # Any reachable (non-UNKNOWN) server reporting DOWN → DOWN
     if any(s != "UNKNOWN" for s in states):
         return "DOWN"

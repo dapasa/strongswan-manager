@@ -628,11 +628,6 @@ class TestAggregateTunnelStates:
 
         assert _aggregate_tunnel_states(["DOWN", "UNKNOWN"]) == "DOWN"
 
-    def test_connecting_with_no_up_returns_connecting(self):
-        from app.services.tunnel_service import _aggregate_tunnel_states
-
-        assert _aggregate_tunnel_states(["CONNECTING", "DOWN"]) == "CONNECTING"
-
     def test_up_takes_precedence_over_connecting(self):
         from app.services.tunnel_service import _aggregate_tunnel_states
 
