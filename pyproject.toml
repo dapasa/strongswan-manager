@@ -73,3 +73,7 @@ disallow_untyped_defs = false
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: marks tests as live integration tests (require SSM_IT_BASE_URL and SSM_IT_TOKEN; excluded from default run)",
+]
