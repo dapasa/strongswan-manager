@@ -47,3 +47,8 @@ export async function checkTunnelStatus(tunnelId) {
   const { data } = await api.post(`/tunnels/${tunnelId}/check-status`)
   return data
 }
+
+export async function getAllTunnelsLiveStatus() {
+  const { data } = await api.get('/tunnels/status/live')
+  return data
+}

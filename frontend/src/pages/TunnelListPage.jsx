@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { Plus, Eye, Pencil, Trash2, Search, Network, ChevronLeft, ChevronRight, CheckCircle2, XCircle, Clock, AlertTriangle, Activity } from 'lucide-react'
+import { Plus, Eye, Pencil, Trash2, Search, Network, ChevronLeft, ChevronRight, CheckCircle2, XCircle, Clock, AlertTriangle, Activity, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -23,8 +23,16 @@ import RoleGuard from '@/components/shared/RoleGuard'
 import ConfirmDialog from '@/components/shared/ConfirmDialog'
 import EmptyState from '@/components/shared/EmptyState'
 import TunnelStatusCell from '@/components/tunnels/TunnelStatusCell'
-import { useTunnels, useDeleteTunnel, useCheckTunnelStatus } from '@/hooks/useTunnels'
+import { useTunnels, useDeleteTunnel, useCheckTunnelStatus, useAllTunnelsLiveStatus } from '@/hooks/useTunnels'
 import { DEFAULT_PAGE_SIZE } from '@/lib/constants'
+
+function formatRelativeTime(isoString) {
+  if (!isoString) return null
+  const diff = Math.round((Date.now() - new Date(isoString).getTime()) / 1000)
+  if (diff < 60) return `${diff}s ago`
+  if (diff < 3600) return `${Math.round(diff / 60)}m ago`
+  return `${Math.round(diff / 3600)}h ago`
+}
 
 /**
  * Parse the sync_error to extract per-instance status.
@@ -113,8 +121,17 @@ export default function TunnelListPage() {
     search: search || undefined,
     status: statusFilter !== ALL ? statusFilter : undefined,
   })
+  const liveStatus = useAllTunnelsLiveStatus()
   const deleteMutation = useDeleteTunnel()
   const checkStatus = useCheckTunnelStatus()
+
+  // Build a map tunnelId → LiveTunnelRow for O(1) lookup in each row
+  const liveMap = Object.fromEntries(
+    (liveStatus.data?.tunnels ?? []).map((r) => [r.tunnel_id, r])
+  )
+  const serverErrors = liveStatus.data?.server_errors ?? {}
+  const hasServerErrors = Object.keys(serverErrors).length > 0
+  const checkedAt = formatRelativeTime(liveStatus.data?.checked_at)
 
   const items = tunnels.data?.items ?? []
   const totalPages = tunnels.data ? Math.ceil(tunnels.data.total / DEFAULT_PAGE_SIZE) : 0
@@ -183,15 +200,46 @@ export default function TunnelListPage() {
             Manage VPN tunnel configurations.
           </p>
         </div>
-        <RoleGuard requiredRole="operator">
-          <Button asChild>
-            <Link to="/tunnels/new">
-              <Plus className="h-4 w-4" />
-              Create Tunnel
-            </Link>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={liveStatus.isFetching}
+            onClick={() => liveStatus.refetch()}
+            title="Refresh live status"
+          >
+            <RefreshCw className={liveStatus.isFetching ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />
+            Live Status
           </Button>
-        </RoleGuard>
+          <RoleGuard requiredRole="operator">
+            <Button asChild>
+              <Link to="/tunnels/new">
+                <Plus className="h-4 w-4" />
+                Create Tunnel
+              </Link>
+            </Button>
+          </RoleGuard>
+        </div>
       </div>
+
+      {/* Live status meta */}
+      {(checkedAt || hasServerErrors) && (
+        <div className="flex flex-wrap items-center gap-3">
+          {checkedAt && (
+            <p className="text-xs text-muted-foreground">
+              Live status checked {checkedAt}
+            </p>
+          )}
+          {hasServerErrors && (
+            <div className="flex items-center gap-1.5 text-xs text-warning">
+              <AlertTriangle className="h-3.5 w-3.5" />
+              <span>
+                {Object.keys(serverErrors).length} VPN server{Object.keys(serverErrors).length > 1 ? 's' : ''} unreachable
+              </span>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Search & Filters */}
       <div className="flex flex-wrap items-end gap-3">
@@ -333,7 +381,11 @@ export default function TunnelListPage() {
                   </TableCell>
                   <TableCell className="font-mono text-sm">{tunnel.peer_ip}</TableCell>
                   <TableCell>
-                    <TunnelStatusCell tunnelId={tunnel.id} />
+                    <TunnelStatusCell
+                      liveRow={liveMap[tunnel.id]}
+                      isLoading={liveStatus.isLoading}
+                      isError={liveStatus.isError}
+                    />
                   </TableCell>
                   <TableCell>
                     <SyncStatusCell syncStatus={tunnel.sync_status} syncError={tunnel.sync_error} />

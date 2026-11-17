@@ -13,6 +13,11 @@ const statusConfig = {
     dotColor: 'bg-red-400',
     variant: 'error',
   },
+  PARTIAL: {
+    label: 'Partial',
+    dotColor: 'bg-amber-400',
+    variant: 'warning',
+  },
   UNKNOWN: {
     label: 'Unknown',
     dotColor: 'bg-gray-400',

@@ -8,6 +8,7 @@ import {
   getTunnelStatus,
   retryTunnelSync,
   checkTunnelStatus,
+  getAllTunnelsLiveStatus,
 } from '@/services/tunnels'
 import { toast, getErrorMessage } from '@/lib/toast'
 
@@ -130,6 +131,21 @@ export function useTunnelStatus(id, { enabled = true, refetchInterval = false } 
     queryKey: ['tunnels', id, 'status'],
     queryFn: () => getTunnelStatus(id),
     enabled: !!id && enabled,
+    refetchInterval,
+  })
+}
+
+/**
+ * Fetch live status of ALL tunnels in one SSM fan-out call.
+ * Returns { tunnels, summary, checked_at, server_errors }.
+ * Slow (seconds) — do not use to block the tunnel list render.
+ *
+ * @param {{ refetchInterval?: number }} options
+ */
+export function useAllTunnelsLiveStatus({ refetchInterval = 30_000 } = {}) {
+  return useQuery({
+    queryKey: ['tunnels', 'status', 'live'],
+    queryFn: getAllTunnelsLiveStatus,
     refetchInterval,
   })
 }
