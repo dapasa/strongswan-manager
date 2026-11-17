@@ -55,6 +55,8 @@ export function useCreateTunnel() {
       }
     },
     onError: (error) => {
+      // 422 field validation errors are shown inline by TunnelForm; skip toast.
+      if (error?.response?.status === 422 && Array.isArray(error?.response?.data?.detail)) return
       toast.error('Failed to create tunnel', { description: getErrorMessage(error) })
     },
   })
@@ -77,6 +79,8 @@ export function useUpdateTunnel() {
       }
     },
     onError: (error) => {
+      // 422 field validation errors are shown inline by TunnelForm; skip toast.
+      if (error?.response?.status === 422 && Array.isArray(error?.response?.data?.detail)) return
       toast.error('Failed to update tunnel', { description: getErrorMessage(error) })
     },
   })

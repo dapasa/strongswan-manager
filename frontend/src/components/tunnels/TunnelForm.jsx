@@ -17,6 +17,7 @@ import {
 } from '@/components/ui/select'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { useCreateTunnel, useUpdateTunnel } from '@/hooks/useTunnels'
+import { toast } from '@/lib/toast'
 
 const DPD_ACTIONS = ['none', 'clear', 'restart']
 const START_ACTIONS = [
@@ -164,6 +165,7 @@ export default function TunnelForm({ mode = 'create', tunnel }) {
     control,
     setValue,
     watch,
+    setError,
     formState: { errors, isSubmitting },
   } = useForm({
     resolver: zodResolver(schema),
@@ -224,9 +226,34 @@ export default function TunnelForm({ mode = 'create', tunnel }) {
         const created = await mutation.mutateAsync(payload)
         navigate(`/tunnels/${created.id}`)
       }
-    } catch {
-      // mutation.onError already shows a toast; stay on the form so the
-      // user can correct their input without losing what they typed.
+    } catch (error) {
+      const detail = error?.response?.data?.detail
+      if (error?.response?.status === 422 && Array.isArray(detail)) {
+        const knownFields = new Set([
+          'name', 'peer_ip', 'psk', 'ike_version', 'local_id', 'remote_id',
+          'start_action', 'ike_lifetime', 'ike_proposals', 'esp_proposals',
+          'dpd_action', 'dpd_delay', 'dpd_timeout', 'description',
+        ])
+        const unmapped = []
+        for (const err of detail) {
+          const field = err.loc?.find((seg) => knownFields.has(String(seg)))
+          if (field) {
+            setError(field, { message: err.msg })
+          } else {
+            unmapped.push(err)
+          }
+        }
+        // Auto-expand Advanced Settings when proposal fields have errors
+        if (detail.some((e) => e.loc?.some((seg) => seg === 'ike_proposals' || seg === 'esp_proposals'))) {
+          setAdvancedOpen(true)
+        }
+        if (unmapped.length > 0) {
+          toast.error(isEdit ? 'Failed to update tunnel' : 'Failed to create tunnel', {
+            description: unmapped.map((e) => `${e.loc?.slice(-1)[0] ?? 'field'}: ${e.msg}`).join('\n'),
+          })
+        }
+      }
+      // Other errors: hook's onError already showed the toast
     }
   }
 
@@ -576,7 +603,9 @@ export default function TunnelForm({ mode = 'create', tunnel }) {
         </Button>
       </div>
 
-      {mutation.isError && (
+      {mutation.isError &&
+        !(mutation.error?.response?.status === 422 &&
+          Array.isArray(mutation.error?.response?.data?.detail)) && (
         <div className="rounded-lg border border-destructive/50 bg-destructive/10 p-4">
           <p className="text-sm text-destructive">
             {mutation.error?.response?.data?.detail ?? mutation.error?.message ?? 'An error occurred'}
