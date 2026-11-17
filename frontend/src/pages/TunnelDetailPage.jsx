@@ -1,17 +1,26 @@
 import { useState } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { ArrowLeft, Pencil, RefreshCw, Trash2 } from 'lucide-react'
+import { ArrowLeft, Copy, Eye, EyeOff, Key, Pencil, RefreshCw, Trash2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import RoleGuard from '@/components/shared/RoleGuard'
 import ConfirmDialog from '@/components/shared/ConfirmDialog'
 import TunnelStatusCell from '@/components/tunnels/TunnelStatusCell'
 import RouteList from '@/components/routes/RouteList'
 import IPTablesRuleList from '@/components/iptables/IPTablesRuleList'
-import { useTunnel, useDeleteTunnel, useRetryTunnelSync } from '@/hooks/useTunnels'
+import { useTunnel, useDeleteTunnel, useRetryTunnelSync, useRotateTunnelPsk } from '@/hooks/useTunnels'
 import { useRoutes } from '@/hooks/useRoutes'
 
 function InfoField({ label, children }) {
@@ -93,6 +102,9 @@ function InfoTab({ tunnel }) {
           <InfoField label="Updated">
             {new Date(tunnel.updated_at).toLocaleString()}
           </InfoField>
+          <InfoField label="PSK Last Rotated">
+            {tunnel.psk_rotated_at ? new Date(tunnel.psk_rotated_at).toLocaleString() : 'Never'}
+          </InfoField>
           {tunnel.creator && (
             <InfoField label="Created By">{tunnel.creator.email ?? tunnel.creator.name}</InfoField>
           )}
@@ -114,14 +126,49 @@ export default function TunnelDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
   const [showDelete, setShowDelete] = useState(false)
+  const [showRotateConfirm, setShowRotateConfirm] = useState(false)
+  const [useCustomPsk, setUseCustomPsk] = useState(false)
+  const [customPsk, setCustomPsk] = useState('')
+  const [revealedPsk, setRevealedPsk] = useState(null)
+  const [rotateResult, setRotateResult] = useState(null)
+  const [showPsk, setShowPsk] = useState(false)
   const tunnel = useTunnel(id)
   const routes = useRoutes(id)
   const deleteMutation = useDeleteTunnel()
   const retrySync = useRetryTunnelSync()
+  const rotateMutation = useRotateTunnelPsk()
 
   async function handleDelete() {
     await deleteMutation.mutateAsync(Number(id))
     navigate('/tunnels')
+  }
+
+  function handleRotateConfirm() {
+    rotateMutation.mutate(
+      { tunnelId: Number(id), psk: useCustomPsk ? customPsk : undefined },
+      {
+        onSuccess: (data) => {
+          setRevealedPsk(data.psk)
+          setRotateResult({ sync_status: data.sync_status, sync_details: data.sync_details })
+          setShowRotateConfirm(false)
+          setUseCustomPsk(false)
+          setCustomPsk('')
+        },
+      }
+    )
+  }
+
+  function handleRevealClose() {
+    setRevealedPsk(null)
+    setRotateResult(null)
+    setShowPsk(false)
+    rotateMutation.reset()
+  }
+
+  function handleCopyPsk() {
+    if (revealedPsk) {
+      navigator.clipboard.writeText(revealedPsk).catch(() => {})
+    }
   }
 
   if (tunnel.isLoading) {
@@ -191,6 +238,10 @@ export default function TunnelDetailPage() {
                 Edit
               </Link>
             </Button>
+            <Button variant="outline" onClick={() => setShowRotateConfirm(true)}>
+              <Key className="h-4 w-4" />
+              Rotate PSK
+            </Button>
             <Button variant="destructive" onClick={() => setShowDelete(true)}>
               <Trash2 className="h-4 w-4" />
               Delete
@@ -232,6 +283,124 @@ export default function TunnelDetailPage() {
         loading={deleteMutation.isPending}
         onConfirm={handleDelete}
       />
+
+      {/* Rotate PSK — confirm */}
+      <Dialog
+        open={showRotateConfirm}
+        onOpenChange={(open) => {
+          if (!open) {
+            setShowRotateConfirm(false)
+            setUseCustomPsk(false)
+            setCustomPsk('')
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Rotate PSK</DialogTitle>
+            <DialogDescription>
+              The remote peer must be updated with the new PSK immediately or the tunnel will drop.
+              By default a new PSK is generated server-side.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-1">
+            <div className="flex items-center gap-2">
+              <input
+                id="use-custom-psk"
+                type="checkbox"
+                className="h-4 w-4 cursor-pointer"
+                checked={useCustomPsk}
+                onChange={(e) => { setUseCustomPsk(e.target.checked); setCustomPsk('') }}
+              />
+              <label htmlFor="use-custom-psk" className="text-sm cursor-pointer select-none">
+                Use a custom PSK
+              </label>
+            </div>
+            {useCustomPsk && (
+              <Input
+                type="text"
+                placeholder="Enter custom PSK (min 1 character)"
+                value={customPsk}
+                onChange={(e) => setCustomPsk(e.target.value)}
+                autoComplete="off"
+                autoCapitalize="none"
+                spellCheck={false}
+              />
+            )}
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              disabled={rotateMutation.isPending}
+              onClick={() => { setShowRotateConfirm(false); setUseCustomPsk(false); setCustomPsk('') }}
+            >
+              Cancel
+            </Button>
+            <Button
+              disabled={rotateMutation.isPending || (useCustomPsk && !customPsk.trim())}
+              onClick={handleRotateConfirm}
+            >
+              {rotateMutation.isPending ? 'Rotating…' : 'Rotate PSK'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Rotate PSK — reveal (shown once) */}
+      <Dialog
+        open={revealedPsk !== null}
+        onOpenChange={(open) => { if (!open) handleRevealClose() }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>New PSK — Save Now</DialogTitle>
+            <DialogDescription>
+              This PSK will not be shown again. Copy it and update your remote peer immediately.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            {rotateResult?.sync_status && rotateResult.sync_status !== 'synced' && (
+              <div className="rounded-md border border-warning/50 bg-warning/10 p-3 text-sm text-warning">
+                Sync status: <strong>{rotateResult.sync_status}</strong> — some nodes may not have
+                the new PSK yet. The reconciler will retry automatically.
+                {rotateResult.sync_details && (
+                  <pre className="mt-1 text-xs font-mono whitespace-pre-wrap break-all opacity-80">
+                    {JSON.stringify(rotateResult.sync_details, null, 2)}
+                  </pre>
+                )}
+              </div>
+            )}
+            <div className="flex items-center gap-2">
+              <Input
+                type={showPsk ? 'text' : 'password'}
+                value={revealedPsk ?? ''}
+                readOnly
+                className="font-mono text-sm"
+                autoComplete="off"
+              />
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label={showPsk ? 'Hide PSK' : 'Show PSK'}
+                onClick={() => setShowPsk((v) => !v)}
+              >
+                {showPsk ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label="Copy PSK to clipboard"
+                onClick={handleCopyPsk}
+              >
+                <Copy className="h-4 w-4" />
+              </Button>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button onClick={handleRevealClose}>Close</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

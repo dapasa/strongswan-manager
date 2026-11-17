@@ -9,6 +9,7 @@ import {
   retryTunnelSync,
   checkTunnelStatus,
   getAllTunnelsLiveStatus,
+  rotateTunnelPsk,
 } from '@/services/tunnels'
 import { toast, getErrorMessage } from '@/lib/toast'
 
@@ -147,6 +148,25 @@ export function useAllTunnelsLiveStatus({ refetchInterval = 30_000 } = {}) {
     queryKey: ['tunnels', 'status', 'live'],
     queryFn: getAllTunnelsLiveStatus,
     refetchInterval,
+  })
+}
+
+/**
+ * Rotate the PSK for a tunnel. Pushes to all VPN nodes.
+ * Returns the new PSK once — the caller must surface it in a dialog and clear it on close.
+ * Invalidates tunnel queries on success; never toasts the PSK.
+ */
+export function useRotateTunnelPsk() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ tunnelId, psk }) => rotateTunnelPsk(tunnelId, psk),
+    onSuccess: (data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['tunnels'] })
+      queryClient.invalidateQueries({ queryKey: ['tunnels', variables.tunnelId] })
+    },
+    onError: (error) => {
+      toast.error('Failed to rotate PSK', { description: getErrorMessage(error) })
+    },
   })
 }
 

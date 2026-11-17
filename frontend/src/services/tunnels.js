@@ -52,3 +52,11 @@ export async function getAllTunnelsLiveStatus() {
   const { data } = await api.get('/tunnels/status/live')
   return data
 }
+
+export async function rotateTunnelPsk(tunnelId, psk) {
+  const { data } = await api.post(
+    `/tunnels/${tunnelId}/rotate-psk`,
+    psk != null ? { psk } : {}
+  )
+  return data
+}
