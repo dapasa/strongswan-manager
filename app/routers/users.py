@@ -13,6 +13,8 @@ from app.schemas.common import PaginatedResponse
 from app.schemas.user import UserDetail, UserUpdate
 from app.services import user_service
 
+
+
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/users", tags=["users"])
@@ -82,6 +84,31 @@ async def update_user(
         user_id,
         data=data,
         current_user=current_user,
+        request=request,
+    )
+    return UserDetail.model_validate(user)
+
+
+@router.post(
+    "/{user_id}/revoke-sessions",
+    response_model=UserDetail,
+    summary="Revoke all active sessions for a user",
+)
+async def revoke_user_sessions(
+    user_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> UserDetail:
+    """Invalidate all outstanding tokens for a user. Admin only.
+
+    Sets tokens_valid_after = now(). The user is not deactivated — they
+    can log in again immediately to obtain a fresh token.
+    """
+    user = await user_service.revoke_user_sessions(
+        db,
+        user_id,
+        acting_user=current_user,
         request=request,
     )
     return UserDetail.model_validate(user)

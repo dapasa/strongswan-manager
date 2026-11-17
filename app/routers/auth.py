@@ -15,7 +15,7 @@ from app.db.session import get_db
 from app.exceptions import AuthenticationError
 from app.logging_config import get_logger
 from app.schemas.user import UserDetail
-from app.services import audit
+from app.services import audit, user_service
 
 logger = get_logger(__name__)
 
@@ -111,3 +111,29 @@ async def get_me(
 ) -> UserDetail:
     """Return the profile of the currently authenticated user."""
     return UserDetail.model_validate(current_user)
+
+
+@router.post(
+    "/logout-all",
+    response_model=UserDetail,
+    summary="Revoke all active sessions (self-service)",
+)
+async def logout_all(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> UserDetail:
+    """Invalidate all outstanding tokens for the current user.
+
+    Sets tokens_valid_after = now(). The caller's current token is still
+    accepted for this single request (get_current_user runs before the
+    update). The client should discard the token and log out locally after
+    this call.
+    """
+    user = await user_service.revoke_user_sessions(
+        db,
+        current_user.id,
+        acting_user=current_user,
+        request=request,
+    )
+    return UserDetail.model_validate(user)

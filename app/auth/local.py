@@ -66,14 +66,17 @@ def create_access_token(*, user_id: int, sub: str, role: str) -> str:
       - ``sub``: user identifier string (e.g. ``"local:user@example.com"``)
       - ``uid``: integer primary key (for fast DB lookup)
       - ``role``: current role at issuance time
+      - ``iat``: issued-at (UTC, epoch seconds) — used for session revocation checks
       - ``exp``: expiry (``JWT_EXPIRE_MINUTES`` from now, default 480 min)
     """
     settings = get_settings()
-    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_expire_minutes)
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(minutes=settings.jwt_expire_minutes)
     payload: dict[str, Any] = {
         "sub": sub,
         "uid": user_id,
         "role": role,
+        "iat": now,
         "exp": expire,
     }
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=_ALGORITHM)

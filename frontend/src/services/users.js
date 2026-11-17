@@ -16,3 +16,8 @@ export async function updateUser(userId, userData) {
   const { data } = await api.patch(`/users/${userId}`, userData)
   return data
 }
+
+export async function revokeUserSessions(userId) {
+  const { data } = await api.post(`/users/${userId}/revoke-sessions`)
+  return data
+}

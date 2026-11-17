@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { getUsers, getUser, updateUser } from '@/services/users'
+import { getUsers, getUser, updateUser, revokeUserSessions } from '@/services/users'
 import { toast, getErrorMessage } from '@/lib/toast'
 
 /**
@@ -42,6 +42,24 @@ export function useUpdateUser() {
     },
     onError: (error) => {
       toast.error('Failed to update user', { description: getErrorMessage(error) })
+    },
+  })
+}
+
+/**
+ * Revoke all active sessions for a user. Admin only.
+ */
+export function useRevokeUserSessions() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id }) => revokeUserSessions(id),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['users'] })
+      queryClient.invalidateQueries({ queryKey: ['users', variables.id] })
+      toast.success('Sessions revoked')
+    },
+    onError: (error) => {
+      toast.error('Failed to revoke sessions', { description: getErrorMessage(error) })
     },
   })
 }

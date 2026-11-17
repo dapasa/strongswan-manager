@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import Request
@@ -139,4 +140,47 @@ async def update_user(
     )
 
     await session.flush()
+    return user
+
+
+async def revoke_user_sessions(
+    session: AsyncSession,
+    user_id: int,
+    *,
+    acting_user: User,
+    request: Request | None = None,
+) -> User:
+    """Set tokens_valid_after = now(UTC) to invalidate all outstanding tokens.
+
+    Does NOT deactivate the account — the user can log in again immediately
+    to obtain a fresh token.
+
+    Args:
+        session: Active database session.
+        user_id: Primary key of the user whose sessions are revoked.
+        acting_user: The user performing the operation (admin or the user themselves).
+        request: FastAPI request for audit context.
+
+    Returns:
+        The updated User instance.
+
+    Raises:
+        NotFoundError: If the user does not exist.
+    """
+    user = await get_user(session, user_id)
+
+    now = datetime.now(timezone.utc)
+    user.tokens_valid_after = now
+
+    await audit.log_action(
+        session,
+        user_id=acting_user.id,
+        entity_type="user",
+        entity_id=user.id,
+        action="revoke_sessions",
+        new_state={"tokens_valid_after": now.isoformat()},
+        request=request,
+    )
+
+    await session.commit()
     return user

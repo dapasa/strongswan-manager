@@ -40,6 +40,9 @@ class User(TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # When set, tokens whose iat (issued-at) is earlier than this value are rejected.
+    # Set by revoke-sessions / logout-all to invalidate all outstanding tokens.
+    tokens_valid_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Relationships
     tunnels: Mapped[list[Tunnel]] = relationship(back_populates="creator", lazy="noload")
@@ -338,7 +341,7 @@ class AuditLog(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "action IN ('create', 'update', 'delete', 'retry', 'login', 'rotate_psk')",
+            "action IN ('create', 'update', 'delete', 'retry', 'login', 'rotate_psk', 'revoke_sessions')",
             name="ck_audit_action",
         ),
         Index("idx_audit_entity", "entity_type", "entity_id"),

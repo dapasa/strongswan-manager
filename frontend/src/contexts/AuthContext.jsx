@@ -84,6 +84,19 @@ function LocalAuthProvider({ children }) {
     setProfileError(null)
   }, [])
 
+  /**
+   * Revoke all sessions on the server, then perform a local logout.
+   * The current token is used for the backend call, then discarded.
+   */
+  const logoutAll = useCallback(async () => {
+    try {
+      await api.post('/auth/logout-all')
+    } catch {
+      // Ignore errors — the server call is best-effort; local logout still happens.
+    }
+    logout()
+  }, [logout])
+
   const value = useMemo(
     () => ({
       /** User profile from GET /auth/me */
@@ -98,10 +111,12 @@ function LocalAuthProvider({ children }) {
       profileError,
       /** login(username, password) — returns a Promise */
       login,
-      /** Clear session */
+      /** Clear session locally */
       logout,
+      /** Revoke all sessions on the server, then clear session locally */
+      logoutAll,
     }),
-    [user, isLoading, profileError, login, logout],
+    [user, isLoading, profileError, login, logout, logoutAll],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

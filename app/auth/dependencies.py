@@ -15,6 +15,16 @@ from app.db.session import get_db
 from app.exceptions import AuthenticationError, AuthorizationError
 from app.logging_config import get_logger
 
+# ---------------------------------------------------------------------------
+# Session revocation — second-precision rule
+#
+# Comparison: int(iat) >= int(tokens_valid_after.timestamp())
+# Both are truncated to whole seconds (epoch). A token issued in the same
+# second as the revocation is considered valid; at most a 1-second window
+# exists for a stale token to slip through. This prevents accidental
+# rejection of a fresh token obtained immediately after self-revocation.
+# ---------------------------------------------------------------------------
+
 logger = get_logger(__name__)
 
 # OAuth2 scheme extracts Bearer token from Authorization header.
@@ -29,8 +39,11 @@ _ROLE_HIERARCHY: dict[str, int] = {
 }
 
 
-async def _resolve_user_local(token: str, db: AsyncSession) -> User:
-    """Validate a local HS256 JWT and resolve to a User model instance."""
+async def _resolve_user_local(token: str, db: AsyncSession) -> tuple[User, dict[str, Any]]:
+    """Validate a local HS256 JWT and resolve to a User model instance.
+
+    Returns the user and the decoded token payload (for iat extraction).
+    """
     from app.auth.local import decode_access_token
 
     payload = decode_access_token(token)
@@ -49,11 +62,19 @@ async def _resolve_user_local(token: str, db: AsyncSession) -> User:
     if user is None:
         raise AuthenticationError("User not found — token may reference a deleted account")
 
-    return user
+    return user, payload
 
 
-async def _resolve_user_oidc(token: str, db: AsyncSession) -> User:
-    """Validate an OIDC JWT and resolve (or auto-create) a User model instance."""
+async def _resolve_user_oidc(token: str, db: AsyncSession) -> tuple[User, dict[str, Any]]:
+    """Validate an OIDC JWT and resolve (or auto-create) a User model instance.
+
+    Returns the user and the decoded token claims (for iat extraction).
+
+    Note on OIDC revocation: the app validates IdP-issued tokens directly (RS256).
+    Setting tokens_valid_after applies the same iat check to IdP tokens. The user
+    will be blocked until the IdP token expires and they re-authenticate — the app
+    cannot force the IdP to revoke the token early.
+    """
     from app.auth.oidc import validate_token
 
     claims = await validate_token(token)
@@ -84,7 +105,7 @@ async def _resolve_user_oidc(token: str, db: AsyncSession) -> User:
     user.last_login_at = func.now()
     await db.flush()
 
-    return user
+    return user, claims
 
 
 async def get_current_user(
@@ -106,12 +127,21 @@ async def get_current_user(
     settings = get_settings()
 
     if settings.auth_mode == "local":
-        user = await _resolve_user_local(token, db)
+        user, token_payload = await _resolve_user_local(token, db)
     else:
-        user = await _resolve_user_oidc(token, db)
+        user, token_payload = await _resolve_user_oidc(token, db)
 
     if not user.is_active:
         raise AuthorizationError("User account is deactivated")
+
+    # Session revocation check — compare iat (epoch seconds) to tokens_valid_after.
+    if user.tokens_valid_after is not None:
+        iat: int | None = token_payload.get("iat")
+        if iat is None:
+            raise AuthenticationError("Token missing 'iat' claim; session may have been revoked")
+        # Both sides truncated to whole seconds — see module-level rule comment.
+        if int(iat) < int(user.tokens_valid_after.timestamp()):
+            raise AuthenticationError("Session has been revoked; please log in again")
 
     return user
 

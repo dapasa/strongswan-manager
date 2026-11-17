@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Users } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
-import { useUsers, useUpdateUser } from '@/hooks/useUsers'
+import { useUsers, useUpdateUser, useRevokeUserSessions } from '@/hooks/useUsers'
 import ConfirmDialog from '@/components/shared/ConfirmDialog'
 import EmptyState from '@/components/shared/EmptyState'
 import { Badge } from '@/components/ui/badge'
@@ -83,6 +83,7 @@ export default function UserManagementPage() {
   const { user: currentUser } = useAuth()
   const { data, isLoading, isError, error } = useUsers()
   const updateUser = useUpdateUser()
+  const revokeUserSessions = useRevokeUserSessions()
 
   // Confirmation dialog state
   const [confirmDialog, setConfirmDialog] = useState({
@@ -109,6 +110,22 @@ export default function UserManagementPage() {
       onConfirm: () => {
         setConfirmDialog((prev) => ({ ...prev, open: false }))
         updateUser.mutate({ id: user.id, data: { role: newRole } })
+      },
+    })
+  }
+
+  /**
+   * Handle revoke sessions — opens confirmation dialog first.
+   */
+  function handleRevokeSessions(user) {
+    setConfirmDialog({
+      open: true,
+      title: 'Revoke Sessions',
+      description: `This will sign out ${user.display_name || user.email} from all devices immediately. They can log in again to get a new session.`,
+      variant: 'destructive',
+      onConfirm: () => {
+        setConfirmDialog((prev) => ({ ...prev, open: false }))
+        revokeUserSessions.mutate({ id: user.id })
       },
     })
   }
@@ -173,7 +190,7 @@ export default function UserManagementPage() {
                   <TableHead className="w-[150px]">Role</TableHead>
                   <TableHead className="w-[100px]">Status</TableHead>
                   <TableHead className="w-[160px]">Last Login</TableHead>
-                  <TableHead className="w-[140px]">Actions</TableHead>
+                  <TableHead className="w-[260px]">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -266,14 +283,24 @@ export default function UserManagementPage() {
                               </TooltipContent>
                             </Tooltip>
                           ) : (
-                            <Button
-                              variant={user.is_active ? 'outline' : 'default'}
-                              size="sm"
-                              onClick={() => handleToggleActive(user)}
-                              disabled={updateUser.isPending}
-                            >
-                              {user.is_active ? 'Deactivate' : 'Activate'}
-                            </Button>
+                            <>
+                              <Button
+                                variant={user.is_active ? 'outline' : 'default'}
+                                size="sm"
+                                onClick={() => handleToggleActive(user)}
+                                disabled={updateUser.isPending}
+                              >
+                                {user.is_active ? 'Deactivate' : 'Activate'}
+                              </Button>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => handleRevokeSessions(user)}
+                                disabled={revokeUserSessions.isPending}
+                              >
+                                Revoke sessions
+                              </Button>
+                            </>
                           )}
 
                         </div>
