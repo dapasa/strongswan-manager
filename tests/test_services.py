@@ -1,7 +1,6 @@
 """Tests for infrastructure services — all external calls mocked."""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -388,61 +387,6 @@ class TestIPSecConfigGenerator:
 
         mock_fan_out.assert_called_once()
         assert result.is_success is True
-
-
-# ---------------------------------------------------------------------------
-# Terragrunt service (file operations only — git/terragrunt mocked)
-# ---------------------------------------------------------------------------
-
-
-class TestTerragruntFileOps:
-    def test_read_routes_file(self, tmp_path):
-        from app.services.terragrunt import _read_routes_file
-
-        routes_file = tmp_path / "vpn_routes.json"
-        routes_file.write_text(json.dumps(["10.0.0.0/8", "172.16.0.0/12"]))
-
-        cidrs = _read_routes_file(routes_file)
-        assert cidrs == ["10.0.0.0/8", "172.16.0.0/12"]
-
-    def test_read_routes_file_missing(self, tmp_path):
-        from app.services.terragrunt import _read_routes_file
-
-        missing = tmp_path / "nonexistent.json"
-        cidrs = _read_routes_file(missing)
-        assert cidrs == []
-
-    def test_write_routes_file_sorted(self, tmp_path):
-        from app.services.terragrunt import _write_routes_file
-
-        routes_file = tmp_path / "vpn_routes.json"
-        _write_routes_file(routes_file, ["172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16"])
-
-        data = json.loads(routes_file.read_text())
-        assert data == ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
-
-    def test_write_routes_file_deduplication(self, tmp_path):
-        from app.services.terragrunt import _read_routes_file, _write_routes_file
-
-        routes_file = tmp_path / "vpn_routes.json"
-        # Write then read back
-        _write_routes_file(routes_file, ["10.0.0.0/8", "10.0.0.0/8"])
-        cidrs = _read_routes_file(routes_file)
-        # sorted() preserves dupes — but add_route checks before appending
-        assert len(cidrs) == 2  # _write_routes_file doesn't dedupe, add_route does
-
-    def test_authenticated_url(self):
-        from app.services.terragrunt import _authenticated_url
-
-        with patch("app.services.terragrunt.get_settings") as mock_settings:
-            settings = MagicMock()
-            settings.github_repo_url = "https://github.com/org/repo.git"
-            settings.github_token = "ghp_abc123"
-            mock_settings.return_value = settings
-
-            url = _authenticated_url()
-            assert url == "https://ghp_abc123@github.com/org/repo.git"
-
 
 
 # ---------------------------------------------------------------------------

@@ -24,8 +24,6 @@ services:
       - "8000:8000"
     env_file:
       - .env
-    volumes:
-      - repos:/repos
     restart: unless-stopped
 
   frontend:
@@ -39,4 +37,3 @@ services:
 
 volumes:
   pgdata:
-  repos:

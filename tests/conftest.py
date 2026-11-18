@@ -325,25 +325,3 @@ def mock_ssm_service():
             "resolve_instance_id": mock_resolve,
             "check_connectivity": mock_check,
         }
-
-
-@pytest.fixture
-def mock_terragrunt_service():
-    """Patch Terragrunt service functions with AsyncMock."""
-    mock_repo = MagicMock()
-    with (
-        patch("app.services.terragrunt.ensure_repo", new_callable=AsyncMock) as mock_ensure,
-        patch("app.services.terragrunt.add_route", new_callable=AsyncMock) as mock_add,
-        patch("app.services.terragrunt.remove_route", new_callable=AsyncMock) as mock_remove,
-        patch("app.services.terragrunt.check_connectivity", new_callable=AsyncMock) as mock_check,
-    ):
-        mock_ensure.return_value = mock_repo
-        mock_add.return_value = None
-        mock_remove.return_value = None
-        mock_check.return_value = True
-        yield {
-            "ensure_repo": mock_ensure,
-            "add_route": mock_add,
-            "remove_route": mock_remove,
-            "check_connectivity": mock_check,
-        }

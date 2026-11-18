@@ -40,7 +40,7 @@ class ValidationError(AppError):
 
 
 class InfrastructureError(AppError):
-    """External service failure (S3, SSM, Terragrunt)."""
+    """External service failure (S3, SSM)."""
 
     def __init__(self, service: str, message: str, *, detail: str | None = None) -> None:
         super().__init__(f"{service}: {message}", detail=detail)

@@ -12,7 +12,7 @@ logger = get_logger(__name__)
 
 # Well-known lock key constants
 LOCK_IPSEC_CONFIG: int = 1
-LOCK_TERRAGRUNT: int = 2
+# 2 was LOCK_TERRAGRUNT (route provisioning via Terragrunt, removed)
 LOCK_IPTABLES_PRIMARY: int = 3
 LOCK_IPTABLES_SECONDARY: int = 4
 

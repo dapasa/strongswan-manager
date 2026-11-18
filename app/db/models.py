@@ -126,7 +126,7 @@ class Tunnel(TimestampMixin, SoftDeleteMixin, Base):
 
 
 class Route(TimestampMixin, SoftDeleteMixin, Base):
-    """Static route managed via Terragrunt for a tunnel."""
+    """VPC route for a tunnel. Read-only until the provisioning redesign (sc-31774)."""
 
     __tablename__ = "routes"
 
@@ -285,7 +285,7 @@ class Server(TimestampMixin, SoftDeleteMixin, Base):
 
 
 class AsyncOperation(TimestampMixin, Base):
-    """Tracks async background operations (route create/delete via Terragrunt)."""
+    """Tracks async background operations (history of the removed Terragrunt route flow)."""
 
     __tablename__ = "async_operations"
 

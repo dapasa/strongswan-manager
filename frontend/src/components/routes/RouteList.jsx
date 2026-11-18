@@ -1,7 +1,6 @@
 import { useState } from 'react'
-import { Trash2, RotateCcw, Route, Loader2, ChevronDown, ChevronUp } from 'lucide-react'
+import { Route, Loader2, ChevronDown, ChevronUp } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -12,12 +11,8 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import RoleGuard from '@/components/shared/RoleGuard'
-import ConfirmDialog from '@/components/shared/ConfirmDialog'
-import AsyncOperationStatus from '@/components/shared/AsyncOperationStatus'
 import EmptyState from '@/components/shared/EmptyState'
-import { useRoutes, useDeleteRoute, useRetryRoute } from '@/hooks/useRoutes'
-import RouteForm from './RouteForm'
+import { useRoutes } from '@/hooks/useRoutes'
 
 const syncStatusConfig = {
   synced: { label: 'Applied', variant: 'success', inProgress: false },
@@ -70,33 +65,15 @@ function RouteErrorDetail({ error }) {
 }
 
 /**
- * Displays the route table for a tunnel with CRUD actions.
+ * Displays the route table for a tunnel (read-only).
+ *
+ * Route provisioning via Terragrunt was removed from the manager; create,
+ * delete and retry come back with the AWS-API-backed redesign (sc-31774).
  *
  * @param {{ tunnelId: number|string }} props
  */
 export default function RouteList({ tunnelId }) {
   const routes = useRoutes(tunnelId)
-  const deleteMutation = useDeleteRoute(tunnelId)
-  const retryMutation = useRetryRoute(tunnelId)
-  const [deleteTarget, setDeleteTarget] = useState(null)
-  const [activeOperationId, setActiveOperationId] = useState(null)
-
-  async function handleDelete() {
-    if (!deleteTarget) return
-    const result = await deleteMutation.mutateAsync(deleteTarget.id)
-    setActiveOperationId(result.operation_id)
-    setDeleteTarget(null)
-  }
-
-  async function handleRetry(routeId) {
-    const result = await retryMutation.mutateAsync(routeId)
-    setActiveOperationId(result.operation_id)
-  }
-
-  function handleOperationCompleted() {
-    setActiveOperationId(null)
-    routes.refetch()
-  }
 
   if (routes.isLoading) {
     return (
@@ -131,25 +108,13 @@ export default function RouteList({ tunnelId }) {
     <Card className="bg-surface border-surface-border">
       <CardHeader className="flex flex-row items-center justify-between space-y-0">
         <CardTitle>Routes ({data.length})</CardTitle>
-        <RoleGuard requiredRole="operator">
-          <RouteForm tunnelId={tunnelId} />
-        </RoleGuard>
       </CardHeader>
       <CardContent>
-        {activeOperationId && (
-          <div className="mb-4">
-            <AsyncOperationStatus
-              operationId={activeOperationId}
-              onCompleted={handleOperationCompleted}
-            />
-          </div>
-        )}
-
         {data.length === 0 ? (
           <EmptyState
             icon={Route}
             title="No routes for this tunnel"
-            description="Add a route to direct traffic through this VPN tunnel."
+            description="Route management is being redesigned and is read-only for now."
           />
         ) : (
           <Table>
@@ -158,7 +123,6 @@ export default function RouteList({ tunnelId }) {
                 <TableHead>Destination CIDR</TableHead>
                 <TableHead>Description</TableHead>
                 <TableHead>Status</TableHead>
-                <TableHead className="text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -174,50 +138,12 @@ export default function RouteList({ tunnelId }) {
                       <RouteErrorDetail error={route.sync_error} />
                     )}
                   </TableCell>
-                  <TableCell className="text-right">
-                    <RoleGuard requiredRole="operator">
-                      <div className="flex items-center justify-end gap-1">
-                        {route.sync_status === 'failed' && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            onClick={() => handleRetry(route.id)}
-                            disabled={retryMutation.isPending}
-                            title="Retry"
-                          >
-                            <RotateCcw className="h-4 w-4" />
-                          </Button>
-                        )}
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => setDeleteTarget(route)}
-                          disabled={deleteMutation.isPending || route.sync_status === 'pending_delete'}
-                          className="text-muted-foreground hover:text-destructive"
-                          title="Delete"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    </RoleGuard>
-                  </TableCell>
                 </TableRow>
               ))}
             </TableBody>
           </Table>
         )}
       </CardContent>
-
-      <ConfirmDialog
-        open={!!deleteTarget}
-        onOpenChange={(open) => { if (!open) setDeleteTarget(null) }}
-        title="Delete Route"
-        description={`Are you sure you want to delete the route "${deleteTarget?.cidr}"? This will remove the route from the VPN tunnel.`}
-        confirmLabel="Delete"
-        variant="destructive"
-        loading={deleteMutation.isPending}
-        onConfirm={handleDelete}
-      />
     </Card>
   )
 }

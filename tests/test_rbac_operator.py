@@ -1,7 +1,7 @@
 """Tests for operator RBAC on existing endpoints.
 
 Verifies:
-- Operator can POST/PATCH/DELETE tunnels, routes, iptables
+- Operator can POST/PATCH/DELETE tunnels, iptables
 - Viewer cannot POST/PATCH/DELETE (gets 403)
 - Admin retains full access
 - Operator CANNOT access user management endpoints
@@ -161,57 +161,6 @@ class TestOperatorTunnelAccess:
 
 
 # ---------------------------------------------------------------------------
-# Route write operations — operator access
-# ---------------------------------------------------------------------------
-
-class TestOperatorRouteAccess:
-    """Operator can create, delete, retry routes."""
-
-    @patch("app.services.route_service.create_route", new_callable=AsyncMock)
-    async def test_operator_can_create_route(self, mock_create):
-        mock_route = MagicMock()
-        mock_op = MagicMock()
-        mock_op.id = "00000000-0000-0000-0000-000000000001"
-        mock_op.status = "pending"
-        mock_create.return_value = (mock_route, mock_op)
-
-        operator = _make_mock_user("operator", user_id=3)
-        client = await _get_client(operator)
-        async with client:
-            resp = await client.post(
-                "/api/v1/routes/?tunnel_id=1",
-                json={"cidr": "10.0.1.0/24"},
-            )
-        assert resp.status_code == 202
-
-    @patch("app.services.route_service.delete_route", new_callable=AsyncMock)
-    async def test_operator_can_delete_route(self, mock_delete):
-        mock_op = MagicMock()
-        mock_op.id = "00000000-0000-0000-0000-000000000001"
-        mock_op.status = "pending"
-        mock_delete.return_value = mock_op
-
-        operator = _make_mock_user("operator", user_id=3)
-        client = await _get_client(operator)
-        async with client:
-            resp = await client.delete("/api/v1/routes/1")
-        assert resp.status_code == 202
-
-    @patch("app.services.route_service.retry_route", new_callable=AsyncMock)
-    async def test_operator_can_retry_route(self, mock_retry):
-        mock_op = MagicMock()
-        mock_op.id = "00000000-0000-0000-0000-000000000001"
-        mock_op.status = "pending"
-        mock_retry.return_value = mock_op
-
-        operator = _make_mock_user("operator", user_id=3)
-        client = await _get_client(operator)
-        async with client:
-            resp = await client.post("/api/v1/routes/1/retry")
-        assert resp.status_code == 202
-
-
-# ---------------------------------------------------------------------------
 # IPTables write operations — operator access
 # ---------------------------------------------------------------------------
 
@@ -364,23 +313,6 @@ class TestViewerCannotWrite:
         client = await _get_client(viewer)
         async with client:
             resp = await client.delete("/api/v1/tunnels/1")
-        assert resp.status_code == 403
-
-    async def test_viewer_cannot_create_route(self):
-        viewer = _make_mock_user("viewer", user_id=2)
-        client = await _get_client(viewer)
-        async with client:
-            resp = await client.post(
-                "/api/v1/routes/?tunnel_id=1",
-                json={"cidr": "10.0.1.0/24"},
-            )
-        assert resp.status_code == 403
-
-    async def test_viewer_cannot_delete_route(self):
-        viewer = _make_mock_user("viewer", user_id=2)
-        client = await _get_client(viewer)
-        async with client:
-            resp = await client.delete("/api/v1/routes/1")
         assert resp.status_code == 403
 
     async def test_viewer_cannot_create_iptables(self):

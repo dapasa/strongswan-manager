@@ -100,22 +100,6 @@ class Settings(BaseSettings):
     )
     ssm_command_timeout: int = Field(default=60, ge=10, le=300)
 
-    # Git / Terragrunt
-    github_repo_url: str = Field(..., description="GitHub HTTPS repo URL (without token)")
-    github_token: str = Field(..., description="GitHub PAT for repo push/pull")
-    git_repo_path: str = Field(..., description="Local path to git repo with vpn_routes.json")
-    git_branch: str = Field(default="main")
-    git_base_branch: str = Field(
-        default="master",
-        description="Branch where route commits are made before syncing to git_branch",
-    )
-    terragrunt_routes_path: str = Field(
-        ...,
-        description="Path to vpn_routes.json relative to git repo root",
-    )
-    terragrunt_working_dir: str = Field(..., description="Terragrunt working directory")
-    terragrunt_timeout: int = Field(default=300, ge=60, le=600)
-
     # SSH Key Encryption
     ssh_command_timeout: int = Field(default=30, ge=5, le=120)
     ssh_key_encryption_key: str = Field(

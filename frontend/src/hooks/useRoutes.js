@@ -1,9 +1,8 @@
 import { useRef } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { getRoutes, createRoute, deleteRoute, retryRoute } from '@/services/routes'
+import { useQuery } from '@tanstack/react-query'
+import { getRoutes } from '@/services/routes'
 import { getOperation } from '@/services/operations'
 import { POLL_INTERVAL, MAX_POLLS } from '@/lib/constants'
-import { toast, getErrorMessage } from '@/lib/toast'
 
 const IN_PROGRESS_STATUSES = new Set(['pending', 'cloning', 'planning', 'applying', 'pushing', 'pending_delete'])
 
@@ -24,66 +23,6 @@ export function useRoutes(tunnelId, { enabled = true } = {}) {
       if (!routes || !Array.isArray(routes)) return false
       const hasInProgress = routes.some((r) => IN_PROGRESS_STATUSES.has(r.sync_status))
       return hasInProgress ? POLL_INTERVAL : false
-    },
-  })
-}
-
-/**
- * Create a new route on a tunnel. Returns 202 with operation reference.
- * Invalidates route list on success.
- *
- * @param {number|string} tunnelId
- */
-export function useCreateRoute(tunnelId) {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (routeData) => createRoute(tunnelId, routeData),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['tunnels', tunnelId, 'routes'] })
-      toast.success('Route created')
-    },
-    onError: (error) => {
-      toast.error('Failed to create route', { description: getErrorMessage(error) })
-    },
-  })
-}
-
-/**
- * Delete a route. Returns 202 with operation reference.
- * Invalidates route list on success.
- *
- * @param {number|string} tunnelId
- */
-export function useDeleteRoute(tunnelId) {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (routeId) => deleteRoute(routeId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['tunnels', tunnelId, 'routes'] })
-      toast.success('Route deleted')
-    },
-    onError: (error) => {
-      toast.error('Failed to delete route', { description: getErrorMessage(error) })
-    },
-  })
-}
-
-/**
- * Retry a failed route operation. Returns 202 with operation reference.
- * Invalidates route list on success.
- *
- * @param {number|string} tunnelId
- */
-export function useRetryRoute(tunnelId) {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (routeId) => retryRoute(routeId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['tunnels', tunnelId, 'routes'] })
-      toast.info('Route retry initiated')
-    },
-    onError: (error) => {
-      toast.error('Failed to retry route', { description: getErrorMessage(error) })
     },
   })
 }

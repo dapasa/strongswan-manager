@@ -1,7 +1,6 @@
 """Tests for API routers — tunnels, routes, dashboard, health, operations."""
 from __future__ import annotations
 
-import uuid
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -263,38 +262,19 @@ class TestRouteRouter:
         assert resp.status_code == 200
         assert resp.json() == []
 
-    @patch("app.services.route_service.create_route", new_callable=AsyncMock)
-    async def test_create_route_returns_202(self, mock_create):
-        route = MagicMock()
-        operation = MagicMock()
-        operation.id = uuid.uuid4()
-        operation.status = "pending"
-        mock_create.return_value = (route, operation)
-
+    async def test_route_write_endpoints_removed(self):
+        """Route provisioning via Terragrunt was removed; writes must not be routable."""
         client = await _get_client()
         async with client:
-            resp = await client.post(
-                "/api/v1/routes/?tunnel_id=1",
-                json={"cidr": "172.16.0.0/16"},
-            )
+            create = await client.post("/api/v1/routes/?tunnel_id=1", json={"cidr": "172.16.0.0/16"})
+            delete = await client.delete("/api/v1/routes/1")
+            retry = await client.post("/api/v1/routes/1/retry")
+            nested = await client.post("/api/v1/tunnels/1/routes", json={"cidr": "172.16.0.0/16"})
 
-        assert resp.status_code == 202
-        data = resp.json()
-        assert data["status"] == "pending"
-        assert "poll_url" in data
-
-    @patch("app.services.route_service.delete_route", new_callable=AsyncMock)
-    async def test_delete_route_returns_202(self, mock_delete):
-        operation = MagicMock()
-        operation.id = uuid.uuid4()
-        operation.status = "pending"
-        mock_delete.return_value = operation
-
-        client = await _get_client()
-        async with client:
-            resp = await client.delete("/api/v1/routes/1")
-
-        assert resp.status_code == 202
+        assert create.status_code == 405
+        assert delete.status_code == 405
+        assert retry.status_code == 404
+        assert nested.status_code == 405
 
 
 # ---------------------------------------------------------------------------
