@@ -7,11 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import require_operator, require_viewer
 from app.db.models import User
-from app.db.session import async_session_factory, get_db
+from app.db.session import get_db
 from app.logging_config import get_logger
 from app.schemas.common import PaginatedResponse
 from app.schemas.iptables import IPTablesRuleCreate, IPTablesRuleDetail
-from app.schemas.operations import AsyncOperationRef
 from app.schemas.route import RouteCreate, RouteDetail
 from app.schemas.tunnel import (
     AllTunnelsLiveStatus,
@@ -299,9 +298,9 @@ async def list_tunnel_routes(
 
 @router.post(
     "/{tunnel_id}/routes",
-    response_model=AsyncOperationRef,
-    status_code=status.HTTP_202_ACCEPTED,
-    summary="Create route for a tunnel (async)",
+    response_model=RouteDetail,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a VPC route for a tunnel",
     tags=["routes"],
 )
 async def create_tunnel_route(
@@ -310,22 +309,20 @@ async def create_tunnel_route(
     request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_operator),
-) -> AsyncOperationRef:
-    """Create a route on a tunnel and launch async terragrunt operation."""
-    route, operation = await route_service.create_route(
+) -> RouteDetail:
+    """Create a VPC route for a tunnel via the AWS EC2 API.
+
+    Convenience alias for POST /api/v1/routes/?tunnel_id={tunnel_id}.
+    """
+    route = await route_service.create_route(
         db,
         tunnel_id=tunnel_id,
-        data=data,
+        cidr=data.cidr,
+        description=data.description,
         user=current_user,
         request=request,
-        db_factory=async_session_factory,
     )
-    poll_url = f"/api/v1/operations/{operation.id}"
-    return AsyncOperationRef(
-        operation_id=operation.id,
-        status=operation.status,
-        poll_url=poll_url,
-    )
+    return RouteDetail.model_validate(route)
 
 
 # ---------------------------------------------------------------------------

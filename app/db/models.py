@@ -126,7 +126,7 @@ class Tunnel(TimestampMixin, SoftDeleteMixin, Base):
 
 
 class Route(TimestampMixin, SoftDeleteMixin, Base):
-    """Static route managed via Terragrunt for a tunnel."""
+    """VPC route for a tunnel — managed via the AWS EC2 API (sc-31774)."""
 
     __tablename__ = "routes"
 
@@ -136,6 +136,10 @@ class Route(TimestampMixin, SoftDeleteMixin, Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     sync_status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
     sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ENI targeted by this route (resolved from EIP holder at creation time)
+    target_eni: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Per-route-table outcome: {rtb_id: {"status": "ok"|"failed"|"already_exists_same_target", "error": "..."}}
+    table_outcomes: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
 
     # Relationships
@@ -143,7 +147,7 @@ class Route(TimestampMixin, SoftDeleteMixin, Base):
 
     __table_args__ = (
         CheckConstraint(
-            "sync_status IN ('synced', 'pending', 'failed', 'pending_delete', 'cloning', 'planning', 'applying', 'pushing')",
+            "sync_status IN ('synced', 'pending', 'failed', 'pending_delete')",
             name="ck_routes_sync_status",
         ),
         Index(
@@ -285,7 +289,7 @@ class Server(TimestampMixin, SoftDeleteMixin, Base):
 
 
 class AsyncOperation(TimestampMixin, Base):
-    """Tracks async background operations (route create/delete via Terragrunt)."""
+    """Tracks async background operations (history of the removed Terragrunt route flow)."""
 
     __tablename__ = "async_operations"
 

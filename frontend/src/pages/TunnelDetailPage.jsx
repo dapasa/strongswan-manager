@@ -114,8 +114,8 @@ function InfoTab({ tunnel }) {
   )
 }
 
-function RoutesTab({ tunnelId }) {
-  return <RouteList tunnelId={tunnelId} />
+function RoutesTab({ tunnelId, remoteCidrs }) {
+  return <RouteList tunnelId={tunnelId} remoteCidrs={remoteCidrs} />
 }
 
 function IPTablesTab({ tunnelId }) {
@@ -265,7 +265,7 @@ export default function TunnelDetailPage() {
           <InfoTab tunnel={data} />
         </TabsContent>
         <TabsContent value="routes">
-          <RoutesTab tunnelId={data.id} />
+          <RoutesTab tunnelId={data.id} remoteCidrs={data.remote_cidrs} />
         </TabsContent>
         <TabsContent value="iptables">
           <IPTablesTab tunnelId={data.id} />

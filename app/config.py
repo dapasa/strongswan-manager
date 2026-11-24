@@ -5,7 +5,7 @@ from functools import lru_cache
 import boto3
 from botocore.exceptions import ClientError
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -100,22 +100,6 @@ class Settings(BaseSettings):
     )
     ssm_command_timeout: int = Field(default=60, ge=10, le=300)
 
-    # Git / Terragrunt
-    github_repo_url: str = Field(..., description="GitHub HTTPS repo URL (without token)")
-    github_token: str = Field(..., description="GitHub PAT for repo push/pull")
-    git_repo_path: str = Field(..., description="Local path to git repo with vpn_routes.json")
-    git_branch: str = Field(default="main")
-    git_base_branch: str = Field(
-        default="master",
-        description="Branch where route commits are made before syncing to git_branch",
-    )
-    terragrunt_routes_path: str = Field(
-        ...,
-        description="Path to vpn_routes.json relative to git repo root",
-    )
-    terragrunt_working_dir: str = Field(..., description="Terragrunt working directory")
-    terragrunt_timeout: int = Field(default=300, ge=60, le=600)
-
     # SSH Key Encryption
     ssh_command_timeout: int = Field(default=30, ge=5, le=120)
     ssh_key_encryption_key: str = Field(
@@ -196,6 +180,42 @@ class Settings(BaseSettings):
 
     # CORS
     cors_origins: list[str] = Field(default=["http://localhost:3000"])
+
+    # VPC Route Management (sc-31774)
+    strongswan_config_bucket: str = Field(
+        default="",
+        description=(
+            "Name of the S3 bucket that holds the StrongSwan cluster config, "
+            "including failover/config.yaml (eip_allocation_id, route_table_ids, etc.). "
+            "Empty disables the route-write feature."
+        ),
+    )
+    managed_route_table_ids: list[str] = Field(
+        default=[],
+        description=(
+            "Comma-separated list of VPC route table IDs this manager is allowed to modify "
+            "(e.g. 'rtb-aaa111,rtb-bbb222'). Routes are written to ALL listed tables. "
+            "Empty list disables the route-write feature entirely."
+        ),
+    )
+
+    @field_validator("managed_route_table_ids", mode="before")
+    @classmethod
+    def parse_managed_route_table_ids(cls, v: object) -> list[str]:
+        """Accept comma-separated string or JSON array for MANAGED_ROUTE_TABLE_IDS."""
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return []
+            # JSON array format: ["rtb-aaa","rtb-bbb"]
+            if v.startswith("["):
+                import json
+                return [t.strip() for t in json.loads(v) if t.strip()]
+            # Comma-separated format: rtb-aaa,rtb-bbb
+            return [t.strip() for t in v.split(",") if t.strip()]
+        if isinstance(v, list):
+            return v
+        return []
 
     @field_validator("database_url")
     @classmethod

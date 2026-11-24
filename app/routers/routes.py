@@ -1,4 +1,4 @@
-"""Route router — CRUD for VPN routes with async terragrunt operations."""
+"""Route router — CRUD for VPC routes via the AWS EC2 API (sc-31774)."""
 
 from __future__ import annotations
 
@@ -7,9 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import require_operator, require_viewer
 from app.db.models import User
-from app.db.session import async_session_factory, get_db
+from app.db.session import get_db
 from app.logging_config import get_logger
-from app.schemas.operations import AsyncOperationRef
 from app.schemas.route import RouteCreate, RouteDetail
 
 logger = get_logger(__name__)
@@ -53,97 +52,94 @@ async def get_route(
 
 @router.post(
     "/",
-    response_model=AsyncOperationRef,
-    status_code=status.HTTP_202_ACCEPTED,
-    summary="Create route (async)",
+    response_model=RouteDetail,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a VPC route for a tunnel",
 )
 async def create_route(
-    data: RouteCreate,
-    request: Request,
-    tunnel_id: int = Query(..., description="Tunnel to add the route to"),
+    tunnel_id: int = Query(..., description="Tunnel to associate the route with"),
+    data: RouteCreate = ...,
+    request: Request = ...,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_operator),
-) -> AsyncOperationRef:
-    """Create a route and launch async terragrunt operation.
+) -> RouteDetail:
+    """Create a VPC route via the AWS EC2 API.
 
-    Returns 202 with an operation reference for polling.
+    The route is written to every allowlisted route table
+    (MANAGED_ROUTE_TABLE_IDS). The target ENI is resolved from the
+    current EIP holder (the active VPN node).
+
+    Validation rules:
+    - CIDR must be inside one of the tunnel's remote CIDRs.
+    - CIDR prefix length must not be 0 (default route).
+    - CIDR must not overlap any VPC CIDR block.
+    - No duplicate route for the same tunnel+CIDR may exist in the DB.
+    - Every managed table must be listed in failover/config.yaml.
+
+    Returns the route record — sync_status is 'synced' if all tables
+    succeeded, 'failed' if any table failed (retry is available).
     """
     from app.services import route_service
 
-    route, operation = await route_service.create_route(
+    route = await route_service.create_route(
         db,
         tunnel_id=tunnel_id,
-        data=data,
+        cidr=data.cidr,
+        description=data.description,
         user=current_user,
         request=request,
-        db_factory=async_session_factory,
     )
-    poll_url = f"/api/v1/operations/{operation.id}"
-    return AsyncOperationRef(
-        operation_id=operation.id,
-        status=operation.status,
-        poll_url=poll_url,
-    )
-
-
-@router.post(
-    "/{route_id}/retry",
-    response_model=AsyncOperationRef,
-    status_code=status.HTTP_202_ACCEPTED,
-    summary="Retry failed route operation",
-)
-async def retry_route(
-    route_id: int,
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
-) -> AsyncOperationRef:
-    """Retry a failed route operation. Only works when sync_status='failed'."""
-    from app.services import route_service
-
-    operation = await route_service.retry_route(
-        db,
-        route_id,
-        user=current_user,
-        request=request,
-        db_factory=async_session_factory,
-    )
-    poll_url = f"/api/v1/operations/{operation.id}"
-    return AsyncOperationRef(
-        operation_id=operation.id,
-        status=operation.status,
-        poll_url=poll_url,
-    )
+    return RouteDetail.model_validate(route)
 
 
 @router.delete(
     "/{route_id}",
-    response_model=AsyncOperationRef,
-    status_code=status.HTTP_202_ACCEPTED,
-    summary="Delete route (async)",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a VPC route",
 )
 async def delete_route(
     route_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_operator),
-) -> AsyncOperationRef:
-    """Soft-delete a route and launch async terragrunt teardown.
+) -> None:
+    """Delete a VPC route via the AWS EC2 API.
 
-    Returns 202 with an operation reference for polling.
+    Removes the route from every allowlisted table ('route not found'
+    counts as success). Soft-deletes the DB record regardless.
     """
     from app.services import route_service
 
-    operation = await route_service.delete_route(
+    await route_service.delete_route(
         db,
-        route_id,
+        route_id=route_id,
         user=current_user,
         request=request,
-        db_factory=async_session_factory,
     )
-    poll_url = f"/api/v1/operations/{operation.id}"
-    return AsyncOperationRef(
-        operation_id=operation.id,
-        status=operation.status,
-        poll_url=poll_url,
+
+
+@router.post(
+    "/{route_id}/retry",
+    response_model=RouteDetail,
+    summary="Retry a failed route",
+)
+async def retry_route(
+    route_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_operator),
+) -> RouteDetail:
+    """Retry AWS route provisioning for a route in 'failed' state.
+
+    Only the tables that did not succeed in the previous attempt are retried.
+    The target ENI is re-resolved at retry time.
+    """
+    from app.services import route_service
+
+    route = await route_service.retry_route(
+        db,
+        route_id=route_id,
+        user=current_user,
+        request=request,
     )
+    return RouteDetail.model_validate(route)

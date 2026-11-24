@@ -2,10 +2,10 @@ import { useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { getRoutes, createRoute, deleteRoute, retryRoute } from '@/services/routes'
 import { getOperation } from '@/services/operations'
-import { POLL_INTERVAL, MAX_POLLS } from '@/lib/constants'
 import { toast, getErrorMessage } from '@/lib/toast'
+import { POLL_INTERVAL, MAX_POLLS } from '@/lib/constants'
 
-const IN_PROGRESS_STATUSES = new Set(['pending', 'cloning', 'planning', 'applying', 'pushing', 'pending_delete'])
+const IN_PROGRESS_STATUSES = new Set(['pending', 'pending_delete'])
 
 /**
  * Fetch routes for a specific tunnel.
@@ -29,8 +29,8 @@ export function useRoutes(tunnelId, { enabled = true } = {}) {
 }
 
 /**
- * Create a new route on a tunnel. Returns 202 with operation reference.
- * Invalidates route list on success.
+ * Create a new route on a tunnel via the AWS EC2 API.
+ * Returns the created RouteDetail (sync_status may be 'synced' or 'failed').
  *
  * @param {number|string} tunnelId
  */
@@ -38,9 +38,15 @@ export function useCreateRoute(tunnelId) {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (routeData) => createRoute(tunnelId, routeData),
-    onSuccess: () => {
+    onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['tunnels', tunnelId, 'routes'] })
-      toast.success('Route created')
+      if (data.sync_status === 'failed') {
+        toast.warning('Route created with sync errors', {
+          description: data.sync_error ?? undefined,
+        })
+      } else {
+        toast.success('Route created')
+      }
     },
     onError: (error) => {
       toast.error('Failed to create route', { description: getErrorMessage(error) })
@@ -49,8 +55,7 @@ export function useCreateRoute(tunnelId) {
 }
 
 /**
- * Delete a route. Returns 202 with operation reference.
- * Invalidates route list on success.
+ * Delete a route and remove it from all AWS route tables.
  *
  * @param {number|string} tunnelId
  */
@@ -69,8 +74,7 @@ export function useDeleteRoute(tunnelId) {
 }
 
 /**
- * Retry a failed route operation. Returns 202 with operation reference.
- * Invalidates route list on success.
+ * Retry a failed route — only retries the tables that did not succeed.
  *
  * @param {number|string} tunnelId
  */
@@ -78,9 +82,13 @@ export function useRetryRoute(tunnelId) {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (routeId) => retryRoute(routeId),
-    onSuccess: () => {
+    onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['tunnels', tunnelId, 'routes'] })
-      toast.info('Route retry initiated')
+      if (data.sync_status === 'failed') {
+        toast.warning('Retry completed with errors')
+      } else {
+        toast.success('Route synced successfully')
+      }
     },
     onError: (error) => {
       toast.error('Failed to retry route', { description: getErrorMessage(error) })
@@ -93,7 +101,7 @@ export function useRetryRoute(tunnelId) {
  * Stops polling when status is 'completed' or 'failed', or after MAX_POLLS attempts.
  *
  * @param {string|null} operationId - UUID of the operation to poll
- * @param {{ enabled?: boolean, refetchInterval?: number, onSuccess?: (data) => void }} options
+ * @param {{ enabled?: boolean, refetchInterval?: number }} options
  * @returns {{ ...queryResult, isTimedOut: boolean }}
  */
 export function useOperation(operationId, { enabled = true, refetchInterval = POLL_INTERVAL } = {}) {

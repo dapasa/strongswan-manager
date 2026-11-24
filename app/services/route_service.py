@@ -1,86 +1,49 @@
-"""Route orchestration service — coordinates DB + Terragrunt for async route operations."""
+"""Route service — AWS EC2 API backed VPC route management (sc-31774).
+
+Each create/delete/retry operation:
+  1. Validates the request (CIDR rules, duplicate check, VPC overlap).
+  2. Resolves the active ENI from the EIP holder in failover/config.yaml.
+  3. Writes / deletes the route in every allowlisted route table.
+  4. Records per-table outcomes in the DB; writes an audit log entry.
+  5. Commits atomically.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import re
-from datetime import datetime, timezone
+import io
+from ipaddress import IPv4Network, ip_network
 from typing import Any
-from uuid import uuid4
+from uuid import UUID
 
+import yaml
+from botocore.exceptions import ClientError
 from fastapi import Request
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import AsyncOperation, Route, Tunnel, User
-from app.exceptions import ConflictError, InfrastructureError, NotFoundError, ValidationError
+from app.config import Settings, get_settings
+from app.db.models import AsyncOperation, Route, Server, Tunnel, User
+from app.exceptions import (
+    ConflictError,
+    InfrastructureError,
+    NotFoundError,
+    ValidationError,
+)
 from app.logging_config import get_logger
-from app.services import audit, terragrunt
-from app.services.locks import LOCK_TERRAGRUNT, acquire_advisory_lock
+from app.services import audit
+from app.services.aws_client import get_client_for_server
 
 logger = get_logger(__name__)
 
-_BACKOFF_BASE_SECONDS: float = 1.0
-_BACKOFF_MAX_SECONDS: float = 30.0
-_MAX_LOCK_RETRIES: int = 5
-
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+# Key in failover/config.yaml that lists the route table IDs failover controls
+_FAILOVER_CONFIG_KEY_TABLES = "route_table_ids"
+_FAILOVER_CONFIG_KEY_EIP = "eip_allocation_id"
 
 
-def _strip_ansi(text: str) -> str:
-    """Remove ANSI escape codes from text."""
-    return _ANSI_ESCAPE_RE.sub("", text)
-
-
-def _extract_error_summary(exc: Exception, max_length: int = 500) -> str:
-    """Extract a concise, ANSI-free error summary from an exception.
-
-    For InfrastructureError with detail (stderr output), extracts the key
-    error lines. Otherwise falls back to str(exc).
-    """
-    if isinstance(exc, InfrastructureError) and exc.detail:
-        raw = _strip_ansi(exc.detail)
-        # Look for lines containing "Error" or "error" as they are most informative
-        error_lines = [
-            line.strip()
-            for line in raw.splitlines()
-            if line.strip() and ("error" in line.lower() or "Error" in line)
-        ]
-        if error_lines:
-            summary = "\n".join(error_lines[:5])
-        else:
-            # Fall back to last non-empty lines (often the most relevant)
-            non_empty = [line.strip() for line in raw.splitlines() if line.strip()]
-            summary = "\n".join(non_empty[-5:]) if non_empty else raw
-        return summary[:max_length]
-    return _strip_ansi(str(exc))[:max_length]
-
-
-async def _update_route_stage(
-    session: AsyncSession,
-    route_id: int,
-    stage: str,
-) -> None:
-    """Update a route's sync_status to the given stage and commit."""
-    route = await session.get(Route, route_id)
-    if route is not None:
-        route.sync_status = stage
-        await session.commit()
-
-
-def _route_to_dict(route: Route) -> dict[str, Any]:
-    """Serialize a Route model to a dict for audit JSONB storage."""
-    return {
-        "id": route.id,
-        "tunnel_id": route.tunnel_id,
-        "cidr": str(route.cidr),
-        "description": route.description,
-        "sync_status": route.sync_status,
-        "sync_error": route.sync_error,
-        "created_by": route.created_by,
-        "created_at": route.created_at.isoformat() if route.created_at else None,
-        "updated_at": route.updated_at.isoformat() if route.updated_at else None,
-    }
+# ---------------------------------------------------------------------------
+# DB read helpers (unchanged from prior version)
+# ---------------------------------------------------------------------------
 
 
 async def list_routes(
@@ -131,295 +94,6 @@ async def get_route(session: AsyncSession, route_id: int) -> Route:
     return route
 
 
-async def create_route(
-    session: AsyncSession,
-    *,
-    tunnel_id: int,
-    data: Any,
-    user: User,
-    request: Request | None = None,
-    db_factory: async_sessionmaker | None = None,
-) -> tuple[Route, AsyncOperation]:
-    """Create a route and launch async terragrunt operation.
-
-    1. Verify tunnel exists and is active.
-    2. Verify CIDR is unique for that tunnel among active routes.
-    3. Insert route with sync_status='pending'.
-    4. Create AsyncOperation (status='pending').
-    5. Create audit log entry.
-    6. Commit transaction.
-    7. Launch background task for terragrunt apply.
-
-    Args:
-        session: Active database session.
-        tunnel_id: Tunnel to add the route to.
-        data: RouteCreate schema instance.
-        user: Authenticated user performing the operation.
-        request: FastAPI request for audit context.
-        db_factory: Session factory for background task. Required for
-            launching the background task.
-
-    Returns:
-        Tuple of (Route, AsyncOperation) for the 202 response.
-
-    Raises:
-        NotFoundError: If the tunnel does not exist.
-        ValidationError: If the tunnel is not active.
-        ConflictError: If the CIDR already exists on this tunnel.
-    """
-    # Verify tunnel exists and is active
-    tunnel = await _get_active_tunnel(session, tunnel_id)
-
-    # Verify CIDR uniqueness
-    cidr_str = str(data.cidr)
-    existing = await session.execute(
-        select(Route.id).where(
-            Route.tunnel_id == tunnel_id,
-            Route.cidr == cidr_str,
-            Route.deleted_at.is_(None),
-        ),
-    )
-    if existing.scalar_one_or_none() is not None:
-        raise ConflictError(f"Route with CIDR '{cidr_str}' already exists on tunnel {tunnel_id}")
-
-    # Insert route
-    route = Route(
-        tunnel_id=tunnel_id,
-        cidr=cidr_str,
-        description=data.description,
-        sync_status="pending",
-        created_by=user.id,
-    )
-    session.add(route)
-    await session.flush()
-
-    # Create async operation
-    operation = AsyncOperation(
-        id=uuid4(),
-        entity_type="route",
-        entity_id=route.id,
-        operation="create",
-        status="pending",
-        created_by=user.id,
-    )
-    session.add(operation)
-    await session.flush()
-
-    # Refresh route to eagerly load server-generated columns (e.g. updated_at)
-    # that were expired by flush — avoids MissingGreenlet with asyncpg driver.
-    await session.refresh(route)
-
-    # Audit log
-    await audit.log_action(
-        session,
-        user_id=user.id,
-        entity_type="route",
-        entity_id=route.id,
-        action="create",
-        new_state=_route_to_dict(route),
-        request=request,
-    )
-
-    await session.commit()
-
-    # Launch background task AFTER commit
-    if db_factory is not None:
-        asyncio.create_task(
-            _execute_route_create(
-                db_factory=db_factory,
-                route_id=route.id,
-                operation_id=str(operation.id),
-                cidr=cidr_str,
-                tunnel_name=tunnel.name,
-            ),
-        )
-    else:
-        logger.warning(
-            "route_create_no_db_factory",
-            route_id=route.id,
-            msg="Background task not launched — no db_factory provided",
-        )
-
-    return route, operation
-
-
-async def delete_route(
-    session: AsyncSession,
-    route_id: int,
-    *,
-    user: User,
-    request: Request | None = None,
-    db_factory: async_sessionmaker | None = None,
-) -> AsyncOperation:
-    """Soft-delete a route and launch async terragrunt teardown.
-
-    1. Get route and its tunnel.
-    2. Soft-delete route (deleted_at, sync_status='pending_delete').
-    3. Create AsyncOperation (status='pending').
-    4. Create audit log entry.
-    5. Commit.
-    6. Launch background task for terragrunt removal.
-
-    Args:
-        session: Active database session.
-        route_id: Primary key of the route to delete.
-        user: Authenticated user performing the operation.
-        request: FastAPI request for audit context.
-        db_factory: Session factory for background task.
-
-    Returns:
-        AsyncOperation for the 202 response.
-
-    Raises:
-        NotFoundError: If the route does not exist.
-    """
-    route = await get_route(session, route_id)
-    previous_state = _route_to_dict(route)
-
-    # Load the tunnel name for terragrunt commit message
-    tunnel_result = await session.execute(
-        select(Tunnel.name).where(Tunnel.id == route.tunnel_id),
-    )
-    tunnel_name = tunnel_result.scalar_one()
-
-    now = datetime.now(timezone.utc)
-    route.deleted_at = now
-    route.sync_status = "pending_delete"
-
-    # Create async operation
-    operation = AsyncOperation(
-        id=uuid4(),
-        entity_type="route",
-        entity_id=route.id,
-        operation="delete",
-        status="pending",
-        created_by=user.id,
-    )
-    session.add(operation)
-    await session.flush()
-
-    # Audit log
-    await audit.log_action(
-        session,
-        user_id=user.id,
-        entity_type="route",
-        entity_id=route.id,
-        action="delete",
-        previous_state=previous_state,
-        request=request,
-    )
-
-    await session.commit()
-
-    # Launch background task AFTER commit
-    if db_factory is not None:
-        asyncio.create_task(
-            _execute_route_delete(
-                db_factory=db_factory,
-                route_id=route.id,
-                operation_id=str(operation.id),
-                cidr=str(route.cidr),
-                tunnel_name=tunnel_name,
-            ),
-        )
-    else:
-        logger.warning(
-            "route_delete_no_db_factory",
-            route_id=route.id,
-            msg="Background task not launched — no db_factory provided",
-        )
-
-    return operation
-
-
-async def retry_route(
-    session: AsyncSession,
-    route_id: int,
-    *,
-    user: User,
-    request: Request | None = None,
-    db_factory: async_sessionmaker | None = None,
-) -> AsyncOperation:
-    """Retry a failed route operation.
-
-    Only works when the route's sync_status is 'failed'. Creates a new
-    AsyncOperation and launches a background terragrunt apply.
-
-    Args:
-        session: Active database session.
-        route_id: Primary key of the route to retry.
-        user: Authenticated user performing the operation.
-        request: FastAPI request for audit context.
-        db_factory: Session factory for background task.
-
-    Returns:
-        AsyncOperation for the 202 response.
-
-    Raises:
-        NotFoundError: If the route does not exist.
-        ConflictError: If sync_status is not 'failed'.
-    """
-    route = await get_route(session, route_id)
-
-    if route.sync_status != "failed":
-        raise ConflictError(
-            f"Route {route_id} sync_status is '{route.sync_status}', not 'failed'. Retry only works on failed syncs."
-        )
-
-    # Load tunnel name for terragrunt commit message
-    tunnel_result = await session.execute(
-        select(Tunnel.name).where(Tunnel.id == route.tunnel_id),
-    )
-    tunnel_name = tunnel_result.scalar_one()
-
-    # Reset sync status
-    route.sync_status = "pending"
-    route.sync_error = None
-
-    # Create async operation
-    operation = AsyncOperation(
-        id=uuid4(),
-        entity_type="route",
-        entity_id=route.id,
-        operation="create",
-        status="pending",
-        created_by=user.id,
-    )
-    session.add(operation)
-    await session.flush()
-
-    # Refresh route to eagerly load server-generated columns (e.g. updated_at)
-    # that were expired by flush — avoids MissingGreenlet with asyncpg driver.
-    await session.refresh(route)
-
-    # Audit log
-    await audit.log_action(
-        session,
-        user_id=user.id,
-        entity_type="route",
-        entity_id=route.id,
-        action="retry",
-        new_state=_route_to_dict(route),
-        request=request,
-    )
-
-    await session.commit()
-
-    # Launch background task AFTER commit
-    if db_factory is not None:
-        asyncio.create_task(
-            _execute_route_create(
-                db_factory=db_factory,
-                route_id=route.id,
-                operation_id=str(operation.id),
-                cidr=str(route.cidr),
-                tunnel_name=tunnel_name,
-            ),
-        )
-
-    return operation
-
-
 async def get_operation(
     session: AsyncSession,
     operation_id: str,
@@ -436,8 +110,6 @@ async def get_operation(
     Raises:
         NotFoundError: If the operation does not exist.
     """
-    from uuid import UUID
-
     try:
         op_uuid = UUID(operation_id)
     except ValueError as exc:
@@ -453,279 +125,787 @@ async def get_operation(
 
 
 # ---------------------------------------------------------------------------
-# Background tasks
+# Private helpers
 # ---------------------------------------------------------------------------
 
 
-async def _execute_route_create(
-    *,
-    db_factory: async_sessionmaker,
-    route_id: int,
-    operation_id: str,
-    cidr: str,
-    tunnel_name: str,
-) -> None:
-    """Background task: apply a new route via terragrunt.
+async def _get_active_server(session: AsyncSession) -> Server:
+    """Return the first active non-deleted server.
 
-    Uses its own DB session (the request session is already closed).
-    Acquires TERRAGRUNT_LOCK with exponential backoff retry.
+    Used to get AWS credentials (aws_role_arn, aws_region_override) for EC2
+    and S3 API calls.  All servers in a VPN HA pair share the same account.
 
-    Args:
-        db_factory: Async session factory for creating a fresh session.
-        route_id: ID of the route to apply.
-        operation_id: ID of the AsyncOperation to update.
-        cidr: CIDR string for the route.
-        tunnel_name: Tunnel name for commit message.
+    Raises:
+        InfrastructureError: If no active server exists.
     """
-    logger.info("bg_route_create_start", route_id=route_id, operation_id=operation_id)
-
-    async with db_factory() as session:
-        try:
-            # Update operation to running
-            operation = await _load_operation(session, operation_id)
-            operation.status = "running"
-            operation.started_at = datetime.now(timezone.utc)
-            await session.commit()
-
-            # Acquire lock with backoff
-            await _acquire_lock_with_backoff(session)
-
-            # Stage: cloning (git clone/pull)
-            await _update_route_stage(session, route_id, "cloning")
-            repo = await terragrunt.ensure_repo()
-
-            # Stage: pushing (modify file, commit, push to remote)
-            await _update_route_stage(session, route_id, "pushing")
-            await terragrunt.add_route_file(cidr, tunnel_name, repo)
-            await terragrunt.commit_and_push(repo, f"vpn-manager: add route {cidr} for tunnel {tunnel_name}")
-
-            # Stage: planning (terragrunt plan)
-            await _update_route_stage(session, route_id, "planning")
-            await terragrunt.run_plan()
-
-            # Stage: applying (terragrunt apply)
-            await _update_route_stage(session, route_id, "applying")
-            await terragrunt.run_apply_plan()
-
-            # Done — mark synced
-            route = await session.get(Route, route_id)
-            if route is not None:
-                route.sync_status = "synced"
-                route.sync_error = None
-
-            # Update operation
-            operation = await _load_operation(session, operation_id)
-            operation.status = "completed"
-            operation.completed_at = datetime.now(timezone.utc)
-            operation.result = {"cidr": cidr, "action": "added"}
-            await session.commit()
-
-            logger.info("bg_route_create_complete", route_id=route_id, operation_id=operation_id)
-
-        except Exception as exc:
-            logger.error(
-                "bg_route_create_failed",
-                route_id=route_id,
-                operation_id=operation_id,
-                error=str(exc),
-            )
-            error_summary = _extract_error_summary(exc)
-            await _mark_operation_failed(
-                db_factory=db_factory,
-                operation_id=operation_id,
-                route_id=route_id,
-                error=error_summary,
-            )
+    result = await session.execute(
+        select(Server).where(
+            Server.is_active.is_(True),
+            Server.deleted_at.is_(None),
+        ).limit(1),
+    )
+    server = result.scalar_one_or_none()
+    if server is None:
+        raise InfrastructureError("servers", "No active server registered; cannot call AWS API")
+    return server
 
 
-async def _execute_route_delete(
-    *,
-    db_factory: async_sessionmaker,
-    route_id: int,
-    operation_id: str,
-    cidr: str,
-    tunnel_name: str,
-) -> None:
-    """Background task: remove a route via terragrunt.
+def _read_failover_config_sync(s3_client: Any, bucket: str) -> dict:
+    """Synchronous S3 read of failover/config.yaml — run via run_in_executor."""
+    try:
+        obj = s3_client.get_object(Bucket=bucket, Key="failover/config.yaml")
+        return yaml.safe_load(obj["Body"].read())
+    except ClientError as exc:
+        code = exc.response["Error"]["Code"]
+        raise InfrastructureError(
+            "S3",
+            f"Cannot read failover/config.yaml from bucket '{bucket}': {code}",
+        ) from exc
 
-    Same pattern as _execute_route_create but calls remove_route.
 
-    Args:
-        db_factory: Async session factory for creating a fresh session.
-        route_id: ID of the route being removed.
-        operation_id: ID of the AsyncOperation to update.
-        cidr: CIDR string for the route.
-        tunnel_name: Tunnel name for commit message.
+async def _read_failover_config(s3_client: Any, bucket: str) -> dict:
+    """Read failover/config.yaml from the StrongSwan config S3 bucket."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: _read_failover_config_sync(s3_client, bucket),
+    )
+
+
+def _resolve_target_eni_sync(
+    ec2_client: Any,
+    failover_config: dict,
+    managed_tables: list[str],
+) -> str:
+    """Synchronous ENI resolution — run via run_in_executor.
+
+    Resolution order:
+      1. DescribeAddresses(AllocationIds=[eip_allocation_id]) — if the EIP is
+         associated, use that NetworkInterfaceId.
+      2. If the EIP is not associated: scan all managed route tables for
+         ENI-targeted routes.  If all such routes across all tables target
+         exactly one distinct ENI, use it.  Otherwise fail.
+
+    Raises:
+        InfrastructureError: When the ENI cannot be unambiguously determined.
     """
-    logger.info("bg_route_delete_start", route_id=route_id, operation_id=operation_id)
+    eip_alloc_id: str | None = failover_config.get(_FAILOVER_CONFIG_KEY_EIP)
+    if not eip_alloc_id:
+        raise InfrastructureError(
+            "failover_config",
+            f"failover/config.yaml missing '{_FAILOVER_CONFIG_KEY_EIP}' key",
+        )
 
-    async with db_factory() as session:
+    # --- Try EIP association first ---
+    try:
+        resp = ec2_client.describe_addresses(AllocationIds=[eip_alloc_id])
+        addrs = resp.get("Addresses", [])
+        if addrs:
+            eni_id: str | None = addrs[0].get("NetworkInterfaceId")
+            if eni_id:
+                logger.info("route_eni_resolved_via_eip", eni=eni_id, eip=eip_alloc_id)
+                return eni_id
+    except ClientError as exc:
+        raise InfrastructureError(
+            "EC2",
+            f"DescribeAddresses({eip_alloc_id}) failed: {exc.response['Error']['Code']}",
+        ) from exc
+
+    # EIP is not currently associated — fall back to inspecting the tables
+    logger.warning(
+        "route_eip_not_associated",
+        eip=eip_alloc_id,
+        message="EIP not associated; scanning managed route tables for ENI consensus",
+    )
+
+    candidate_enis: set[str] = set()
+    for rtb_id in managed_tables:
         try:
-            # Update operation to running
-            operation = await _load_operation(session, operation_id)
-            operation.status = "running"
-            operation.started_at = datetime.now(timezone.utc)
-            await session.commit()
+            rt_resp = ec2_client.describe_route_tables(RouteTableIds=[rtb_id])
+            tables = rt_resp.get("RouteTables", [])
+            if not tables:
+                continue
+            for route in tables[0].get("Routes", []):
+                eni = route.get("NetworkInterfaceId")
+                if eni:
+                    candidate_enis.add(eni)
+        except ClientError as exc:
+            raise InfrastructureError(
+                "EC2",
+                f"DescribeRouteTables({rtb_id}) failed: {exc.response['Error']['Code']}",
+            ) from exc
 
-            # Acquire lock with backoff
-            await _acquire_lock_with_backoff(session)
+    if len(candidate_enis) == 1:
+        eni_id = next(iter(candidate_enis))
+        logger.info(
+            "route_eni_resolved_via_route_scan",
+            eni=eni_id,
+            tables=managed_tables,
+        )
+        return eni_id
 
-            # Stage: cloning (git clone/pull)
-            await _update_route_stage(session, route_id, "cloning")
-            repo = await terragrunt.ensure_repo()
+    if len(candidate_enis) == 0:
+        raise InfrastructureError(
+            "EC2",
+            "EIP is not associated and no ENI-targeted routes exist in the managed "
+            "route tables; cannot determine the target ENI. Associate the EIP first.",
+        )
 
-            # Stage: pushing (modify file, commit, push to remote)
-            await _update_route_stage(session, route_id, "pushing")
-            await terragrunt.remove_route_file(cidr, tunnel_name, repo)
-            await terragrunt.commit_and_push(repo, f"vpn-manager: remove route {cidr} from tunnel {tunnel_name}")
+    raise InfrastructureError(
+        "EC2",
+        f"EIP is not associated and multiple candidate ENIs found across managed "
+        f"route tables ({sorted(candidate_enis)}). Cannot determine the active node. "
+        "Associate the EIP first.",
+    )
 
-            # Stage: planning (terragrunt plan)
-            await _update_route_stage(session, route_id, "planning")
-            await terragrunt.run_plan()
 
-            # Stage: applying (terragrunt apply)
-            await _update_route_stage(session, route_id, "applying")
-            await terragrunt.run_apply_plan()
+async def _resolve_target_eni(
+    ec2_client: Any,
+    failover_config: dict,
+    managed_tables: list[str],
+) -> str:
+    """Async wrapper for ENI resolution."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: _resolve_target_eni_sync(ec2_client, failover_config, managed_tables),
+    )
 
-            # Update operation
-            operation = await _load_operation(session, operation_id)
-            operation.status = "completed"
-            operation.completed_at = datetime.now(timezone.utc)
-            operation.result = {"cidr": cidr, "action": "removed"}
-            await session.commit()
 
-            logger.info("bg_route_delete_complete", route_id=route_id, operation_id=operation_id)
+def _validate_cidr_rules(tunnel: Tunnel, cidr_net: IPv4Network) -> None:
+    """Validate CIDR against tunnel rules.
 
-        except Exception as exc:
-            logger.error(
-                "bg_route_delete_failed",
-                route_id=route_id,
-                operation_id=operation_id,
-                error=str(exc),
+    Rules:
+    - Prefix length 0 (/0) is always rejected.
+    - CIDR must be a subnet of (or equal to) at least one of the tunnel's remote_cidrs.
+
+    Raises:
+        ValidationError
+    """
+    if cidr_net.prefixlen == 0:
+        raise ValidationError("CIDR with prefix length 0 (default route) is not allowed")
+
+    for remote_str in tunnel.remote_cidrs:
+        try:
+            remote_net = IPv4Network(str(remote_str), strict=False)
+            if cidr_net.subnet_of(remote_net):
+                return  # Passes
+        except ValueError:
+            continue
+
+    raise ValidationError(
+        f"{cidr_net} is not inside any of the tunnel's remote CIDRs "
+        f"({[str(c) for c in tunnel.remote_cidrs]})"
+    )
+
+
+async def _validate_no_duplicate(
+    session: AsyncSession,
+    tunnel_id: int,
+    cidr_str: str,
+) -> None:
+    """Raise ConflictError if an active route with the same CIDR already exists on this tunnel."""
+    result = await session.execute(
+        select(Route).where(
+            Route.tunnel_id == tunnel_id,
+            Route.cidr == cidr_str,
+            Route.deleted_at.is_(None),
+        ),
+    )
+    existing = result.scalar_one_or_none()
+    if existing is not None:
+        raise ConflictError(
+            f"Route {cidr_str} already exists on tunnel {tunnel_id} (id={existing.id})"
+        )
+
+
+def _validate_vpc_overlap_sync(
+    ec2_client: Any,
+    managed_tables: list[str],
+    cidr_net: IPv4Network,
+) -> None:
+    """Check CIDR does not overlap any CIDR block of the VPC that owns the route tables.
+
+    Uses the first managed table to identify the VpcId, then checks all
+    CidrBlockAssociationSet entries.
+
+    Raises:
+        ValidationError: If the CIDR overlaps a VPC CIDR.
+        InfrastructureError: On AWS API error.
+    """
+    rtb_id = managed_tables[0]
+    try:
+        rt_resp = ec2_client.describe_route_tables(RouteTableIds=[rtb_id])
+        tables = rt_resp.get("RouteTables", [])
+        if not tables:
+            raise InfrastructureError("EC2", f"Route table {rtb_id} not found")
+        vpc_id = tables[0].get("VpcId")
+        if not vpc_id:
+            raise InfrastructureError("EC2", f"Route table {rtb_id} has no VpcId")
+    except ClientError as exc:
+        raise InfrastructureError(
+            "EC2",
+            f"DescribeRouteTables({rtb_id}) failed: {exc.response['Error']['Code']}",
+        ) from exc
+
+    try:
+        vpc_resp = ec2_client.describe_vpcs(VpcIds=[vpc_id])
+        vpcs = vpc_resp.get("Vpcs", [])
+        if not vpcs:
+            raise InfrastructureError("EC2", f"VPC {vpc_id} not found")
+        for assoc in vpcs[0].get("CidrBlockAssociationSet", []):
+            cidr_block = assoc.get("CidrBlock")
+            if not cidr_block:
+                continue
+            vpc_net = IPv4Network(cidr_block, strict=False)
+            if cidr_net.overlaps(vpc_net):
+                raise ValidationError(
+                    f"{cidr_net} overlaps VPC CIDR {vpc_net} (VPC {vpc_id})"
+                )
+    except ClientError as exc:
+        raise InfrastructureError(
+            "EC2",
+            f"DescribeVpcs({vpc_id}) failed: {exc.response['Error']['Code']}",
+        ) from exc
+
+
+async def _validate_vpc_overlap(
+    ec2_client: Any,
+    managed_tables: list[str],
+    cidr_net: IPv4Network,
+) -> None:
+    """Async wrapper for VPC overlap validation."""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: _validate_vpc_overlap_sync(ec2_client, managed_tables, cidr_net),
+    )
+
+
+def _validate_tables_in_failover(
+    managed_tables: list[str],
+    failover_config: dict,
+) -> None:
+    """Ensure every managed route table is listed in failover/config.yaml route_table_ids.
+
+    If a table is not under failover control, routes written to it will not be
+    moved to the active node after a failover, breaking connectivity.
+
+    Raises:
+        ValidationError: If any managed table is absent from the failover config.
+    """
+    failover_tables: list[str] = failover_config.get(_FAILOVER_CONFIG_KEY_TABLES, []) or []
+    failover_set = set(failover_tables)
+
+    missing = [t for t in managed_tables if t not in failover_set]
+    if missing:
+        raise ValidationError(
+            f"Managed route table(s) not in failover/config.yaml route_table_ids: {missing}. "
+            "Routes written to these tables would not be moved after a failover."
+        )
+
+
+def _write_routes_to_tables_sync(
+    ec2_client: Any,
+    managed_tables: list[str],
+    cidr: str,
+    eni_id: str,
+) -> dict[str, dict[str, str]]:
+    """Write a route to every managed table synchronously.
+
+    Returns table_outcomes dict: {rtb_id: {"status": ..., "error": ...}}
+    Status values: "ok", "already_exists_same_target", "failed"
+    """
+    outcomes: dict[str, dict[str, str]] = {}
+
+    for rtb_id in managed_tables:
+        # Check if the route already exists in this table
+        try:
+            rt_resp = ec2_client.describe_route_tables(RouteTableIds=[rtb_id])
+            tables = rt_resp.get("RouteTables", [])
+            existing_eni: str | None = None
+            if tables:
+                for route in tables[0].get("Routes", []):
+                    if route.get("DestinationCidrBlock") == cidr:
+                        existing_eni = route.get("NetworkInterfaceId")
+                        break
+        except ClientError as exc:
+            outcomes[rtb_id] = {
+                "status": "failed",
+                "error": f"DescribeRouteTables: {exc.response['Error']['Code']}",
+            }
+            continue
+
+        if existing_eni is not None:
+            if existing_eni == eni_id:
+                outcomes[rtb_id] = {"status": "already_exists_same_target"}
+                continue
+            else:
+                outcomes[rtb_id] = {
+                    "status": "failed",
+                    "error": (
+                        f"Route already exists in {rtb_id} targeting a different ENI "
+                        f"({existing_eni} != {eni_id}). Will not replace."
+                    ),
+                }
+                continue
+
+        # Route does not exist — create it
+        try:
+            ec2_client.create_route(
+                RouteTableId=rtb_id,
+                DestinationCidrBlock=cidr,
+                NetworkInterfaceId=eni_id,
             )
-            error_summary = _extract_error_summary(exc)
-            await _mark_operation_failed(
-                db_factory=db_factory,
-                operation_id=operation_id,
-                route_id=route_id,
-                error=error_summary,
+            outcomes[rtb_id] = {"status": "ok"}
+        except ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            # AWS sometimes returns RouteAlreadyExists for a concurrent create
+            if code == "RouteAlreadyExists":
+                # Describe again to check the target
+                try:
+                    rt2 = ec2_client.describe_route_tables(RouteTableIds=[rtb_id])
+                    t2 = rt2.get("RouteTables", [])
+                    race_eni: str | None = None
+                    if t2:
+                        for r2 in t2[0].get("Routes", []):
+                            if r2.get("DestinationCidrBlock") == cidr:
+                                race_eni = r2.get("NetworkInterfaceId")
+                                break
+                    if race_eni == eni_id:
+                        outcomes[rtb_id] = {"status": "already_exists_same_target"}
+                    else:
+                        outcomes[rtb_id] = {
+                            "status": "failed",
+                            "error": (
+                                f"RouteAlreadyExists in {rtb_id} targeting a different ENI "
+                                f"({race_eni} != {eni_id})."
+                            ),
+                        }
+                except ClientError:
+                    outcomes[rtb_id] = {
+                        "status": "failed",
+                        "error": f"RouteAlreadyExists and re-describe failed",
+                    }
+            else:
+                outcomes[rtb_id] = {
+                    "status": "failed",
+                    "error": f"CreateRoute: {code}",
+                }
+
+    return outcomes
+
+
+async def _write_routes_to_tables(
+    ec2_client: Any,
+    managed_tables: list[str],
+    cidr: str,
+    eni_id: str,
+) -> dict[str, dict[str, str]]:
+    """Async wrapper for route writing."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: _write_routes_to_tables_sync(ec2_client, managed_tables, cidr, eni_id),
+    )
+
+
+def _delete_routes_from_tables_sync(
+    ec2_client: Any,
+    managed_tables: list[str],
+    cidr: str,
+) -> dict[str, dict[str, str]]:
+    """Delete a route from every managed table synchronously.
+
+    Returns table_outcomes dict. "route_not_found" counts as success.
+    """
+    outcomes: dict[str, dict[str, str]] = {}
+
+    for rtb_id in managed_tables:
+        try:
+            ec2_client.delete_route(
+                RouteTableId=rtb_id,
+                DestinationCidrBlock=cidr,
             )
+            outcomes[rtb_id] = {"status": "ok"}
+        except ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            if code in ("InvalidRoute.NotFound", "RouteNotFound"):
+                # Already gone — count as success
+                outcomes[rtb_id] = {"status": "not_found_ok"}
+            else:
+                outcomes[rtb_id] = {
+                    "status": "failed",
+                    "error": f"DeleteRoute: {code}",
+                }
+
+    return outcomes
+
+
+async def _delete_routes_from_tables(
+    ec2_client: Any,
+    managed_tables: list[str],
+    cidr: str,
+) -> dict[str, dict[str, str]]:
+    """Async wrapper for route deletion."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: _delete_routes_from_tables_sync(ec2_client, managed_tables, cidr),
+    )
+
+
+def _outcomes_sync_status(outcomes: dict[str, dict[str, str]]) -> str:
+    """Derive sync_status from per-table outcomes.
+
+    Returns 'synced' only if every table is 'ok' or 'already_exists_same_target'.
+    Otherwise returns 'failed'.
+    """
+    success_states = {"ok", "already_exists_same_target", "not_found_ok"}
+    all_ok = all(v.get("status") in success_states for v in outcomes.values())
+    return "synced" if all_ok else "failed"
+
+
+def _outcomes_error_summary(outcomes: dict[str, dict[str, str]]) -> str | None:
+    """Build a human-readable error summary from failed table outcomes."""
+    failures = {
+        rtb_id: v["error"]
+        for rtb_id, v in outcomes.items()
+        if v.get("status") == "failed"
+    }
+    if not failures:
+        return None
+    parts = [f"{rtb}: {msg}" for rtb, msg in sorted(failures.items())]
+    return "; ".join(parts)
+
+
+def _route_to_dict(route: Route) -> dict[str, Any]:
+    """Serialize a Route model to a dict for audit JSONB storage."""
+    return {
+        "id": route.id,
+        "tunnel_id": route.tunnel_id,
+        "cidr": str(route.cidr) if route.cidr else None,
+        "description": route.description,
+        "sync_status": route.sync_status,
+        "sync_error": route.sync_error,
+        "target_eni": route.target_eni,
+        "table_outcomes": route.table_outcomes,
+        "created_by": route.created_by,
+        "created_at": route.created_at.isoformat() if route.created_at else None,
+        "updated_at": route.updated_at.isoformat() if route.updated_at else None,
+    }
+
+
+def _require_managed_tables(settings: Settings) -> list[str]:
+    """Return non-empty managed table list or raise ValidationError."""
+    tables = [t.strip() for t in settings.managed_route_table_ids if t.strip()]
+    if not tables:
+        raise ValidationError(
+            "MANAGED_ROUTE_TABLE_IDS is empty; route-write feature is disabled"
+        )
+    if not settings.strongswan_config_bucket.strip():
+        raise ValidationError(
+            "STRONGSWAN_CONFIG_BUCKET is empty; route-write feature is disabled"
+        )
+    return tables
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Public write operations
 # ---------------------------------------------------------------------------
 
 
-async def _get_active_tunnel(session: AsyncSession, tunnel_id: int) -> Tunnel:
-    """Get a tunnel that is active (not deleted, status='active').
+async def create_route(
+    session: AsyncSession,
+    *,
+    tunnel_id: int,
+    cidr: IPv4Network,
+    description: str | None,
+    user: User,
+    request: Request | None = None,
+) -> Route:
+    """Create a VPC route for a tunnel via the AWS EC2 API.
+
+    Validates:
+    - MANAGED_ROUTE_TABLE_IDS is non-empty.
+    - CIDR is not /0.
+    - CIDR is inside one of the tunnel's remote CIDRs.
+    - No duplicate active route for the same tunnel+CIDR in the DB.
+    - CIDR does not overlap any VPC CIDR block.
+    - Every managed table is listed in failover/config.yaml route_table_ids.
+
+    Then resolves the target ENI (from the EIP holder), writes the route
+    to every table, and records per-table outcomes.
 
     Args:
         session: Active database session.
-        tunnel_id: Primary key of the tunnel.
+        tunnel_id: Tunnel to associate the route with.
+        cidr: Destination CIDR for the route.
+        description: Optional human-readable label.
+        user: Operator or admin performing the action.
+        request: FastAPI request for audit context.
 
     Returns:
-        The Tunnel instance.
+        The created Route model (sync_status may be 'synced' or 'failed').
 
     Raises:
-        NotFoundError: If the tunnel does not exist.
-        ValidationError: If the tunnel is not active.
+        NotFoundError: Tunnel does not exist.
+        ValidationError: Any of the CIDR validation rules failed.
+        ConflictError: Duplicate route in the DB.
+        InfrastructureError: AWS API or S3 failure.
     """
+    settings = get_settings()
+    managed_tables = _require_managed_tables(settings)
+
+    # --- Load tunnel ---
     result = await session.execute(
-        select(Tunnel).where(
-            Tunnel.id == tunnel_id,
-            Tunnel.deleted_at.is_(None),
-        ),
+        select(Tunnel).where(Tunnel.id == tunnel_id, Tunnel.deleted_at.is_(None)),
     )
     tunnel = result.scalar_one_or_none()
     if tunnel is None:
         raise NotFoundError("Tunnel", tunnel_id)
-    if tunnel.status != "active":
-        raise ValidationError(f"Tunnel {tunnel_id} is not active (status='{tunnel.status}')")
-    return tunnel
 
+    cidr_str = str(cidr)
 
-async def _load_operation(session: AsyncSession, operation_id: str) -> AsyncOperation:
-    """Load an AsyncOperation by ID, refreshing from DB."""
-    from uuid import UUID
+    # --- Validation (before any AWS calls or DB writes) ---
+    _validate_cidr_rules(tunnel, cidr)
+    await _validate_no_duplicate(session, tunnel_id, cidr_str)
 
-    result = await session.execute(
-        select(AsyncOperation).where(AsyncOperation.id == UUID(operation_id)),
+    # --- Get server for AWS credentials ---
+    server = await _get_active_server(session)
+    ec2 = get_client_for_server(server, "ec2")
+    s3 = get_client_for_server(server, "s3")
+
+    # --- Failover config + VPC overlap (AWS calls, can raise) ---
+    failover_config = await _read_failover_config(s3, settings.strongswan_config_bucket)
+    _validate_tables_in_failover(managed_tables, failover_config)
+    await _validate_vpc_overlap(ec2, managed_tables, cidr)
+
+    # --- Resolve target ENI ---
+    target_eni = await _resolve_target_eni(ec2, failover_config, managed_tables)
+
+    # --- Create Route record (pending) ---
+    route = Route(
+        tunnel_id=tunnel_id,
+        cidr=cidr_str,
+        description=description,
+        sync_status="pending",
+        created_by=user.id,
     )
-    operation = result.scalar_one_or_none()
-    if operation is None:
-        raise NotFoundError("AsyncOperation", operation_id)
-    return operation
+    session.add(route)
+    await session.flush()  # Assign PK before AWS calls
+
+    # --- Write routes to all tables ---
+    table_outcomes = await _write_routes_to_tables(ec2, managed_tables, cidr_str, target_eni)
+
+    sync_status = _outcomes_sync_status(table_outcomes)
+    sync_error = _outcomes_error_summary(table_outcomes)
+
+    route.sync_status = sync_status
+    route.sync_error = sync_error
+    route.target_eni = target_eni
+    route.table_outcomes = table_outcomes
+
+    await audit.log_action(
+        session,
+        user_id=user.id,
+        entity_type="route",
+        entity_id=route.id,
+        action="create",
+        new_state={
+            **_route_to_dict(route),
+            "tunnel_id": tunnel_id,
+            "cidr": cidr_str,
+            "target_eni": target_eni,
+            "managed_tables": managed_tables,
+        },
+        request=request,
+    )
+
+    await session.commit()
+    await session.refresh(route)
+
+    logger.info(
+        "route_created",
+        route_id=route.id,
+        tunnel_id=tunnel_id,
+        cidr=cidr_str,
+        target_eni=target_eni,
+        sync_status=sync_status,
+        tables=list(table_outcomes.keys()),
+    )
+    return route
 
 
-async def _acquire_lock_with_backoff(session: AsyncSession) -> None:
-    """Attempt to acquire TERRAGRUNT_LOCK with exponential backoff.
+async def delete_route(
+    session: AsyncSession,
+    *,
+    route_id: int,
+    user: User,
+    request: Request | None = None,
+) -> None:
+    """Delete a VPC route via the AWS EC2 API and soft-delete the DB record.
 
-    Retries up to _MAX_LOCK_RETRIES times with exponential backoff
-    (1s, 2s, 4s, 8s, 16s, capped at 30s).
+    Removes the route from every allowlisted table. 'Route not found' in a
+    table counts as success (idempotent). Soft-deletes the DB record after
+    all tables are processed (regardless of per-table results).
 
     Args:
         session: Active database session.
+        route_id: Primary key of the route to delete.
+        user: Operator or admin performing the action.
+        request: FastAPI request for audit context.
 
     Raises:
-        InfrastructureError: If the lock cannot be acquired after all retries.
+        NotFoundError: Route does not exist.
+        InfrastructureError: AWS API failure.
     """
-    delay = _BACKOFF_BASE_SECONDS
+    settings = get_settings()
+    managed_tables = _require_managed_tables(settings)
 
-    for attempt in range(_MAX_LOCK_RETRIES):
-        acquired = await acquire_advisory_lock(session, LOCK_TERRAGRUNT)
-        if acquired:
-            logger.info("terragrunt_lock_acquired", attempt=attempt + 1)
-            return
+    route = await get_route(session, route_id)
+    cidr_str = str(route.cidr)
+    previous_state = _route_to_dict(route)
 
-        logger.info(
-            "terragrunt_lock_retry",
-            attempt=attempt + 1,
-            delay=delay,
-        )
-        await asyncio.sleep(delay)
-        delay = min(delay * 2, _BACKOFF_MAX_SECONDS)
+    server = await _get_active_server(session)
+    ec2 = get_client_for_server(server, "ec2")
 
-    raise InfrastructureError(
-        service="Terragrunt",
-        message=f"Could not acquire terragrunt lock after {_MAX_LOCK_RETRIES} retries",
+    # Mark as pending_delete before AWS calls
+    route.sync_status = "pending_delete"
+
+    table_outcomes = await _delete_routes_from_tables(ec2, managed_tables, cidr_str)
+
+    # Soft-delete regardless of per-table results
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    route.deleted_at = now
+    route.sync_status = "pending_delete"  # retained on deleted record
+    route.table_outcomes = table_outcomes
+
+    await audit.log_action(
+        session,
+        user_id=user.id,
+        entity_type="route",
+        entity_id=route.id,
+        action="delete",
+        previous_state=previous_state,
+        new_state={
+            **_route_to_dict(route),
+            "managed_tables": managed_tables,
+            "table_outcomes": table_outcomes,
+        },
+        request=request,
+    )
+
+    await session.commit()
+
+    logger.info(
+        "route_deleted",
+        route_id=route_id,
+        cidr=cidr_str,
+        table_outcomes=table_outcomes,
     )
 
 
-async def _mark_operation_failed(
+async def retry_route(
+    session: AsyncSession,
     *,
-    db_factory: async_sessionmaker,
-    operation_id: str,
     route_id: int,
-    error: str,
-) -> None:
-    """Mark an async operation and its route as failed.
+    user: User,
+    request: Request | None = None,
+) -> Route:
+    """Retry AWS route provisioning for a route in 'failed' state.
 
-    Opens a fresh session to ensure the failure is persisted even
-    if the original session encountered errors.
+    Only redoes the tables that are still missing (not 'ok' or
+    'already_exists_same_target').  Re-resolves the target ENI at retry
+    time (the active node may have changed since the original attempt).
 
     Args:
-        db_factory: Session factory for a fresh session.
-        operation_id: ID of the AsyncOperation to mark failed.
-        route_id: ID of the Route to mark sync_status='failed'.
-        error: Error message to store.
+        session: Active database session.
+        route_id: Primary key of the failed route.
+        user: Operator or admin performing the action.
+        request: FastAPI request for audit context.
+
+    Returns:
+        Updated Route instance.
+
+    Raises:
+        NotFoundError: Route does not exist.
+        ValidationError: Route is not in 'failed' state.
+        InfrastructureError: AWS API or S3 failure.
     """
-    try:
-        async with db_factory() as session:
-            operation = await _load_operation(session, operation_id)
-            operation.status = "failed"
-            operation.error_message = error[:2000]  # Truncate to reasonable length
-            operation.completed_at = datetime.now(timezone.utc)
+    settings = get_settings()
+    managed_tables = _require_managed_tables(settings)
 
-            route = await session.get(Route, route_id)
-            if route is not None:
-                route.sync_status = "failed"
-                route.sync_error = error[:2000]
-
-            await session.commit()
-    except Exception as inner_exc:
-        logger.error(
-            "bg_mark_failed_error",
-            operation_id=operation_id,
-            error=str(inner_exc),
+    route = await get_route(session, route_id)
+    if route.sync_status != "failed":
+        raise ValidationError(
+            f"Route {route_id} is in '{route.sync_status}' state; retry only allowed for 'failed'"
         )
+
+    cidr_str = str(route.cidr)
+    previous_state = _route_to_dict(route)
+
+    server = await _get_active_server(session)
+    ec2 = get_client_for_server(server, "ec2")
+    s3 = get_client_for_server(server, "s3")
+
+    failover_config = await _read_failover_config(s3, settings.strongswan_config_bucket)
+    target_eni = await _resolve_target_eni(ec2, failover_config, managed_tables)
+
+    # Determine which tables still need to be written (missing or failed)
+    success_states = {"ok", "already_exists_same_target"}
+    existing_outcomes: dict[str, dict[str, str]] = route.table_outcomes or {}
+    tables_to_retry = [
+        t for t in managed_tables
+        if existing_outcomes.get(t, {}).get("status") not in success_states
+    ]
+
+    if not tables_to_retry:
+        # Everything already succeeded — mark as synced
+        route.sync_status = "synced"
+        route.sync_error = None
+        await session.commit()
+        await session.refresh(route)
+        return route
+
+    new_outcomes = await _write_routes_to_tables(ec2, tables_to_retry, cidr_str, target_eni)
+
+    # Merge with existing outcomes
+    merged_outcomes = {**existing_outcomes, **new_outcomes}
+    sync_status = _outcomes_sync_status(merged_outcomes)
+    sync_error = _outcomes_error_summary(merged_outcomes)
+
+    route.sync_status = sync_status
+    route.sync_error = sync_error
+    route.target_eni = target_eni
+    route.table_outcomes = merged_outcomes
+
+    await audit.log_action(
+        session,
+        user_id=user.id,
+        entity_type="route",
+        entity_id=route.id,
+        action="retry",
+        previous_state=previous_state,
+        new_state={
+            **_route_to_dict(route),
+            "target_eni": target_eni,
+            "tables_retried": tables_to_retry,
+            "managed_tables": managed_tables,
+        },
+        request=request,
+    )
+
+    await session.commit()
+    await session.refresh(route)
+
+    logger.info(
+        "route_retried",
+        route_id=route_id,
+        cidr=cidr_str,
+        target_eni=target_eni,
+        sync_status=sync_status,
+        tables_retried=tables_to_retry,
+    )
+    return route

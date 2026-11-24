@@ -5,14 +5,15 @@ export async function getRoutes(tunnelId) {
   return data
 }
 
-export async function createRoute(tunnelId, routeData) {
-  const { data } = await api.post(`/tunnels/${tunnelId}/routes`, routeData)
+export async function createRoute(tunnelId, { cidr, description }) {
+  const { data } = await api.post('/routes/', { cidr, description }, {
+    params: { tunnel_id: tunnelId },
+  })
   return data
 }
 
 export async function deleteRoute(routeId) {
-  const { data } = await api.delete(`/routes/${routeId}`)
-  return data
+  await api.delete(`/routes/${routeId}`)
 }
 
 export async function retryRoute(routeId) {
