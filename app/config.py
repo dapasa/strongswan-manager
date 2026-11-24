@@ -5,7 +5,7 @@ from functools import lru_cache
 import boto3
 from botocore.exceptions import ClientError
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -180,6 +180,41 @@ class Settings(BaseSettings):
 
     # CORS
     cors_origins: list[str] = Field(default=["http://localhost:3000"])
+
+    # VPC Route Management (sc-31774)
+    strongswan_config_bucket: str = Field(
+        ...,
+        description=(
+            "Name of the S3 bucket that holds the StrongSwan cluster config, "
+            "including failover/config.yaml (eip_allocation_id, route_table_ids, etc.)."
+        ),
+    )
+    managed_route_table_ids: list[str] = Field(
+        default=[],
+        description=(
+            "Comma-separated list of VPC route table IDs this manager is allowed to modify "
+            "(e.g. 'rtb-aaa111,rtb-bbb222'). Routes are written to ALL listed tables. "
+            "Empty list disables the route-write feature entirely."
+        ),
+    )
+
+    @field_validator("managed_route_table_ids", mode="before")
+    @classmethod
+    def parse_managed_route_table_ids(cls, v: object) -> list[str]:
+        """Accept comma-separated string or JSON array for MANAGED_ROUTE_TABLE_IDS."""
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return []
+            # JSON array format: ["rtb-aaa","rtb-bbb"]
+            if v.startswith("["):
+                import json
+                return [t.strip() for t in json.loads(v) if t.strip()]
+            # Comma-separated format: rtb-aaa,rtb-bbb
+            return [t.strip() for t in v.split(",") if t.strip()]
+        if isinstance(v, list):
+            return v
+        return []
 
     @field_validator("database_url")
     @classmethod

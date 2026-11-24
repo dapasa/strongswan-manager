@@ -22,8 +22,10 @@ class RouteDetail(BaseModel):
     tunnel_id: int
     cidr: Any
     description: str | None = None
-    sync_status: str = Field(description="Sync state: synced, pending, cloning, planning, applying, pushing, failed, pending_delete")
+    sync_status: str = Field(description="Sync state: synced, pending, failed, pending_delete")
     sync_error: str | None = None
+    target_eni: str | None = None
+    table_outcomes: dict | None = None
     created_by: int | None = None
     created_at: datetime
     updated_at: datetime

@@ -11,7 +11,7 @@ from app.db.session import get_db
 from app.logging_config import get_logger
 from app.schemas.common import PaginatedResponse
 from app.schemas.iptables import IPTablesRuleCreate, IPTablesRuleDetail
-from app.schemas.route import RouteDetail
+from app.schemas.route import RouteCreate, RouteDetail
 from app.schemas.tunnel import (
     AllTunnelsLiveStatus,
     RotatePskRequest,
@@ -294,6 +294,35 @@ async def list_tunnel_routes(
     """List all active routes for a specific tunnel."""
     routes = await route_service.list_routes(db, tunnel_id=tunnel_id)
     return [RouteDetail.model_validate(r) for r in routes]
+
+
+@router.post(
+    "/{tunnel_id}/routes",
+    response_model=RouteDetail,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a VPC route for a tunnel",
+    tags=["routes"],
+)
+async def create_tunnel_route(
+    tunnel_id: int,
+    data: RouteCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_operator),
+) -> RouteDetail:
+    """Create a VPC route for a tunnel via the AWS EC2 API.
+
+    Convenience alias for POST /api/v1/routes/?tunnel_id={tunnel_id}.
+    """
+    route = await route_service.create_route(
+        db,
+        tunnel_id=tunnel_id,
+        cidr=data.cidr,
+        description=data.description,
+        user=current_user,
+        request=request,
+    )
+    return RouteDetail.model_validate(route)
 
 
 # ---------------------------------------------------------------------------

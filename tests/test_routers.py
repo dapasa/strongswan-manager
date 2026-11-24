@@ -262,19 +262,35 @@ class TestRouteRouter:
         assert resp.status_code == 200
         assert resp.json() == []
 
-    async def test_route_write_endpoints_removed(self):
-        """Route provisioning via Terragrunt was removed; writes must not be routable."""
-        client = await _get_client()
-        async with client:
-            create = await client.post("/api/v1/routes/?tunnel_id=1", json={"cidr": "172.16.0.0/16"})
-            delete = await client.delete("/api/v1/routes/1")
-            retry = await client.post("/api/v1/routes/1/retry")
-            nested = await client.post("/api/v1/tunnels/1/routes", json={"cidr": "172.16.0.0/16"})
+    async def test_route_write_endpoints_are_routable(self):
+        """Route write endpoints exist and require authentication (not 405/404)."""
+        from unittest.mock import patch as _patch
 
-        assert create.status_code == 405
-        assert delete.status_code == 405
-        assert retry.status_code == 404
-        assert nested.status_code == 405
+        from app.exceptions import ValidationError as _VE
+
+        # Patch the service so we don't hit AWS or DB
+        with _patch(
+            "app.services.route_service.create_route",
+            side_effect=_VE("feature disabled"),
+        ), _patch(
+            "app.services.route_service.delete_route",
+            side_effect=_VE("not found"),
+        ), _patch(
+            "app.services.route_service.retry_route",
+            side_effect=_VE("not failed"),
+        ):
+            client = await _get_client()
+            async with client:
+                create = await client.post("/api/v1/routes/", params={"tunnel_id": 1}, json={"cidr": "172.16.0.0/16"})
+                delete = await client.delete("/api/v1/routes/1")
+                retry = await client.post("/api/v1/routes/1/retry")
+                nested = await client.post("/api/v1/tunnels/1/routes", json={"cidr": "172.16.0.0/16"})
+
+        # Routes exist — should NOT be 405 (Method Not Allowed) or 404 (Not Found)
+        assert create.status_code not in (404, 405)
+        assert delete.status_code not in (404, 405)
+        assert retry.status_code not in (404, 405)
+        assert nested.status_code not in (404, 405)
 
 
 # ---------------------------------------------------------------------------
