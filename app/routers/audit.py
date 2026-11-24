@@ -7,6 +7,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.auth import require_viewer
 from app.db.models import AuditLog, User
@@ -58,10 +59,12 @@ async def list_audit_logs(
     total_result = await db.execute(count_stmt)
     total = total_result.scalar_one()
 
-    # Paginated results ordered by most recent first
+    # Paginated results ordered by most recent first, with user relationship loaded
+    # so AuditLogEntry.user is populated (rows with user_id NULL keep user=None).
     offset = (page - 1) * page_size
     items_stmt = (
         base_stmt
+        .options(selectinload(AuditLog.user))
         .order_by(AuditLog.created_at.desc())
         .offset(offset)
         .limit(page_size)

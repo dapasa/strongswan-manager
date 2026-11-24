@@ -1158,6 +1158,29 @@ _MAX_OUTPUT_CHARS: int = 2000
 # Timeout passed to swanctl via --timeout flag (seconds).
 _SWANCTL_TIMEOUT: int = 30
 
+# Lines emitted by strongSwan plugin loading that add noise but carry no
+# operational information — stripped from swanctl output before display/audit.
+# Pattern 1: "plugin 'X': failed to load - <reason>"
+# Pattern 2: "X plugin requires CAP_SETUID/CAP_SETGID capability"
+_SWANCTL_NOISE_LINE_RE = re.compile(
+    r"^plugin '[^']*': failed to load[^\n]*$"
+    r"|^[^\n]* plugin requires CAP_SET\w+/CAP_SET\w+ capability[^\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _filter_swanctl_output(text: str) -> str:
+    """Remove strongSwan plugin-load noise lines from swanctl output.
+
+    Strips lines like ``plugin 'aes': failed to load - aes_plugin_create not found``
+    and ``agent plugin requires CAP_SETUID/CAP_SETGID capability`` while keeping
+    the real operational content (e.g. ``initiate failed: CHILD_SA ...``).
+    """
+    filtered = _SWANCTL_NOISE_LINE_RE.sub("", text)
+    # Drop blank lines created by noise removal; re-join the rest.
+    lines = [line for line in filtered.splitlines() if line.strip()]
+    return "\n".join(lines)
+
 # Timeout passed to execute_command's asyncio.wait_for wrapper (seconds).
 # Must be strictly greater than _SWANCTL_TIMEOUT so the wrapper does not
 # cut off swanctl before swanctl's own timeout fires and returns its output.
@@ -1482,9 +1505,17 @@ async def _control_tunnel(
     #    and would cut off swanctl before its own timeout fires).
     result = await execute_command(session, active_server.id, [cmd], timeout=_WRAPPER_TIMEOUT)
 
-    # 8. Trim output (stdout on success, error string on failure)
-    raw = (result.output if result.success else result.error) or ""
-    output = raw[:_MAX_OUTPUT_CHARS].strip()
+    # 8. Build output for audit and API response.
+    # On success: stdout from execute_command (swanctl's real output).
+    # On failure: prefer the transport's raw stderr (populated by execute_command
+    #   from TransportError.stderr), which carries the actual swanctl output.
+    #   Fall back to the transport-layer error message when no stderr was captured
+    #   (e.g. asyncio timeout before the command finished).
+    if result.success:
+        raw = result.output or ""
+    else:
+        raw = result.output or result.error or ""
+    output = _filter_swanctl_output(raw)[:_MAX_OUTPUT_CHARS].strip()
 
     # 9. Write audit for every outcome (success or swanctl failure) and commit.
     await _write_audit({
