@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { Plus, Eye, Pencil, Trash2, Search, Network, ChevronLeft, ChevronRight, CheckCircle2, XCircle, Clock, AlertTriangle, Activity, RefreshCw } from 'lucide-react'
+import { Plus, Eye, Pencil, Trash2, Search, Network, ChevronLeft, ChevronRight, CheckCircle2, XCircle, Clock, AlertTriangle, Activity, RefreshCw, Zap, ZapOff } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -23,7 +23,7 @@ import RoleGuard from '@/components/shared/RoleGuard'
 import ConfirmDialog from '@/components/shared/ConfirmDialog'
 import EmptyState from '@/components/shared/EmptyState'
 import TunnelStatusCell from '@/components/tunnels/TunnelStatusCell'
-import { useTunnels, useDeleteTunnel, useCheckTunnelStatus, useAllTunnelsLiveStatus } from '@/hooks/useTunnels'
+import { useTunnels, useDeleteTunnel, useCheckTunnelStatus, useAllTunnelsLiveStatus, useInitiateTunnel, useTerminateTunnel } from '@/hooks/useTunnels'
 import { DEFAULT_PAGE_SIZE } from '@/lib/constants'
 
 function formatRelativeTime(isoString) {
@@ -110,8 +110,11 @@ export default function TunnelListPage() {
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState(ALL)
   const [deleteTarget, setDeleteTarget] = useState(null)
+  const [bringDownTarget, setBringDownTarget] = useState(null)
   const [selected, setSelected] = useState(new Set())
   const [checking, setChecking] = useState(new Set())
+  const [initiating, setInitiating] = useState(new Set())
+  const [terminating, setTerminating] = useState(new Set())
 
   const page = Number(searchParams.get('page')) || 1
 
@@ -124,6 +127,8 @@ export default function TunnelListPage() {
   const liveStatus = useAllTunnelsLiveStatus()
   const deleteMutation = useDeleteTunnel()
   const checkStatus = useCheckTunnelStatus()
+  const initiateMutation = useInitiateTunnel()
+  const terminateMutation = useTerminateTunnel()
 
   // Build a map tunnelId → LiveTunnelRow for O(1) lookup in each row
   const liveMap = Object.fromEntries(
@@ -183,6 +188,27 @@ export default function TunnelListPage() {
       }
       return next
     })
+  }
+
+  async function handleBringUp(tunnel) {
+    setInitiating((prev) => new Set(prev).add(tunnel.id))
+    try {
+      await initiateMutation.mutateAsync(tunnel.id)
+    } finally {
+      setInitiating((prev) => { const next = new Set(prev); next.delete(tunnel.id); return next })
+    }
+  }
+
+  async function handleBringDown() {
+    if (!bringDownTarget) return
+    setTerminating((prev) => new Set(prev).add(bringDownTarget.id))
+    const id = bringDownTarget.id
+    setBringDownTarget(null)
+    try {
+      await terminateMutation.mutateAsync(id)
+    } finally {
+      setTerminating((prev) => { const next = new Set(prev); next.delete(id); return next })
+    }
   }
 
   async function handleDelete() {
@@ -401,6 +427,26 @@ export default function TunnelListPage() {
                         </Link>
                       </Button>
                       <RoleGuard requiredRole="operator">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="text-muted-foreground hover:text-success"
+                          disabled={initiating.has(tunnel.id) || terminating.has(tunnel.id)}
+                          title="Bring up"
+                          onClick={() => handleBringUp(tunnel)}
+                        >
+                          <Zap className={initiating.has(tunnel.id) ? 'h-4 w-4 animate-pulse' : 'h-4 w-4'} />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="text-muted-foreground hover:text-warning"
+                          disabled={initiating.has(tunnel.id) || terminating.has(tunnel.id)}
+                          title="Bring down"
+                          onClick={() => setBringDownTarget(tunnel)}
+                        >
+                          <ZapOff className={terminating.has(tunnel.id) ? 'h-4 w-4 animate-pulse' : 'h-4 w-4'} />
+                        </Button>
                         <Button variant="ghost" size="icon" asChild>
                           <Link to={`/tunnels/${tunnel.id}/edit`}>
                             <Pencil className="h-4 w-4" />
@@ -458,6 +504,18 @@ export default function TunnelListPage() {
         )}
         </>
       )}
+
+      {/* Bring down confirmation */}
+      <ConfirmDialog
+        open={!!bringDownTarget}
+        onOpenChange={(open) => !open && setBringDownTarget(null)}
+        title="Bring Down Tunnel"
+        description={`Bringing down "${bringDownTarget?.name}" will cut the customer's traffic immediately. Continue?`}
+        confirmLabel="Bring Down"
+        variant="destructive"
+        loading={false}
+        onConfirm={handleBringDown}
+      />
 
       {/* Delete confirmation */}
       <ConfirmDialog

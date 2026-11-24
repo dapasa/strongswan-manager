@@ -60,3 +60,13 @@ export async function rotateTunnelPsk(tunnelId, psk) {
   )
   return data
 }
+
+export async function initiateTunnel(tunnelId) {
+  const { data } = await api.post(`/tunnels/${tunnelId}/initiate`)
+  return data
+}
+
+export async function terminateTunnel(tunnelId) {
+  const { data } = await api.post(`/tunnels/${tunnelId}/terminate`)
+  return data
+}
