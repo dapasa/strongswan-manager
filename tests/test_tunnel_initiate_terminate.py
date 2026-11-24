@@ -29,6 +29,7 @@ from app.services.tunnel_service import (
     _SWANCTL_TIMEOUT,
     _WRAPPER_TIMEOUT,
     _control_tunnel,
+    _filter_swanctl_output,
     _find_server_by_instance_id,
     _resolve_active_node_sync,
     _validate_tunnel_name_safe,
@@ -540,6 +541,115 @@ class TestControlTunnel:
         )
 
         assert len(result["output"]) <= 2000
+
+    @pytest.mark.anyio
+    @patch("app.services.tunnel_service._read_failover_config_for_control", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service._resolve_active_node", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.execute_command", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.get_client_for_server")
+    @patch("app.services.tunnel_service.get_settings")
+    @patch("app.services.tunnel_service.audit.log_action", new_callable=AsyncMock)
+    async def test_failed_ssm_audit_contains_swanctl_stderr_not_noise(
+        self,
+        mock_audit,
+        mock_settings,
+        mock_get_client,
+        mock_execute,
+        mock_resolve,
+        mock_read_failover,
+    ):
+        """Failed SSM: audit output has real swanctl error, not plugin-load noise."""
+        mock_settings.return_value.strongswan_config_bucket = "test-bucket"
+        mock_read_failover.return_value = FAILOVER_CONFIG
+        mock_resolve.return_value = (PRIMARY_INSTANCE, "primary")
+        # Simulate execute_command carrying TransportError.stderr in result.output
+        swanctl_stderr = (
+            "plugin 'aes': failed to load - aes_plugin_create not found and no plugin file available\n"
+            "agent plugin requires CAP_SETUID/CAP_SETGID capability\n"
+            "plugin 'agent': failed to load - agent_plugin_create returned NULL\n"
+            "initiate failed: CHILD_SA 'daniel-local-test' not established after 30000ms\n"
+            "failed to run commands: exit status 1"
+        )
+        mock_execute.return_value = ServerResult(
+            server_id=1,
+            server_name="primary",
+            success=False,
+            output=swanctl_stderr,
+            error="Transport error: SSM command abc on i-0xyz finished with status 'Failed'",
+        )
+
+        tunnel = _make_tunnel(name="daniel-local-test")
+        session, t, any_srv, tgt_srv = self._make_session_mock(tunnel=tunnel)
+
+        result = await _control_tunnel(
+            session, 42, action="initiate", user=_make_user(), request=_make_request()
+        )
+
+        assert result["success"] is False
+        # Real swanctl output must be present
+        assert "initiate failed: CHILD_SA" in result["output"]
+        assert "failed to run commands" in result["output"]
+        # Plugin-load noise must be stripped
+        assert "aes_plugin_create" not in result["output"]
+        assert "plugin 'aes'" not in result["output"]
+        assert "CAP_SETUID" not in result["output"]
+
+        # Audit new_state.output must also contain the real output
+        mock_audit.assert_called_once()
+        new_state = mock_audit.call_args.kwargs["new_state"]
+        assert "initiate failed: CHILD_SA" in new_state["output"]
+
+
+# ---------------------------------------------------------------------------
+# _filter_swanctl_output — noise filter unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestFilterSwanctlOutput:
+    """Unit tests for the strongSwan plugin-load noise filter."""
+
+    def test_removes_plugin_failed_to_load_lines(self):
+        raw = (
+            "plugin 'aes': failed to load - aes_plugin_create not found\n"
+            "initiate failed: CHILD_SA 'test' not established after 30000ms"
+        )
+        filtered = _filter_swanctl_output(raw)
+        assert "aes_plugin_create" not in filtered
+        assert "initiate failed: CHILD_SA" in filtered
+
+    def test_removes_cap_setuid_lines(self):
+        raw = (
+            "agent plugin requires CAP_SETUID/CAP_SETGID capability\n"
+            "initiate failed: CHILD_SA 'test' not established after 30000ms"
+        )
+        filtered = _filter_swanctl_output(raw)
+        assert "CAP_SETUID" not in filtered
+        assert "initiate failed: CHILD_SA" in filtered
+
+    def test_removes_plugin_returned_null_lines(self):
+        raw = (
+            "plugin 'agent': failed to load - agent_plugin_create returned NULL\n"
+            "some real output"
+        )
+        filtered = _filter_swanctl_output(raw)
+        assert "agent_plugin_create" not in filtered
+        assert "some real output" in filtered
+
+    def test_non_noise_lines_pass_through(self):
+        raw = "CHILD_SA established successfully\nIKE_SA up"
+        filtered = _filter_swanctl_output(raw)
+        assert filtered == raw
+
+    def test_empty_string_returns_empty(self):
+        assert _filter_swanctl_output("") == ""
+
+    def test_all_noise_returns_empty(self):
+        raw = (
+            "plugin 'aes': failed to load - reason\n"
+            "agent plugin requires CAP_SETUID/CAP_SETGID capability"
+        )
+        filtered = _filter_swanctl_output(raw)
+        assert filtered == ""
 
 
 # ---------------------------------------------------------------------------

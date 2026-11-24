@@ -163,6 +163,35 @@ class TestSsmTransportExecute:
         assert exc_info.value.kind == TransportErrorKind.COMMAND_FAILED
 
     @pytest.mark.asyncio
+    async def test_execute_failed_carries_stderr_and_exit_code(self):
+        """Failed status → TransportError carries StandardErrorContent and exit code 1."""
+        server = _make_server()
+        transport = SsmTransport(server)
+        mock_ssm = MagicMock()
+        mock_ssm.send_command.return_value = {"Command": {"CommandId": "cmd-fail-stderr"}}
+        mock_ssm.get_command_invocation.return_value = {
+            "Status": "Failed",
+            "StandardOutputContent": "",
+            "StandardErrorContent": (
+                "plugin 'aes': failed to load - aes_plugin_create not found\n"
+                "initiate failed: CHILD_SA 'daniel-local-test' not established after 30000ms\n"
+                "failed to run commands: exit status 1"
+            ),
+        }
+
+        with patch(
+            "app.services.transport.ssm_transport.get_client_for_server",
+            return_value=mock_ssm,
+        ), patch("asyncio.sleep", new_callable=AsyncMock), pytest.raises(TransportError) as exc_info:
+            await transport.execute(["sudo swanctl --initiate --child daniel-local-test"])
+
+        exc = exc_info.value
+        assert exc.kind == TransportErrorKind.COMMAND_FAILED
+        assert exc.exit_code == 1
+        assert "initiate failed: CHILD_SA" in exc.stderr
+        assert "failed to run commands" in exc.stderr
+
+    @pytest.mark.asyncio
     async def test_execute_failed_with_permission_denied_in_stderr(self):
         server = _make_server()
         transport = SsmTransport(server)

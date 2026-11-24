@@ -160,6 +160,10 @@ async def execute_command(
             server_name=server.name,
             success=False,
             error=f"Transport error: {exc}",
+            # Carry through the raw command output (stderr from SSM/SSH) so that
+            # callers can display the actual remote command output rather than
+            # the generic transport-layer error message.
+            output=exc.stderr,
         )
     except Exception as exc:
         logger.error(

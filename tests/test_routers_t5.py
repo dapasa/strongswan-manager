@@ -239,6 +239,129 @@ class TestAuthRouter:
 
 
 # ---------------------------------------------------------------------------
+# Audit router
+# ---------------------------------------------------------------------------
+
+
+class TestAuditRouter:
+    @pytest.mark.anyio
+    async def test_list_audit_returns_user_populated_when_user_id_set(self):
+        """GET /api/v1/audit/ — entries with user_id return a populated user object."""
+        from app.auth.dependencies import get_current_user
+        from app.db.session import get_db
+        from app.main import app
+
+        now = datetime.now(timezone.utc)
+
+        # Build a mock user object (simulates the loaded relationship)
+        mock_user_obj = MagicMock()
+        mock_user_obj.id = 5
+        mock_user_obj.email = "daniel@example.com"
+        mock_user_obj.display_name = "Daniel"
+
+        mock_log = MagicMock()
+        mock_log.id = 1
+        mock_log.user = mock_user_obj  # relationship loaded (selectinload would do this)
+        mock_log.user_id = 5
+        mock_log.action = "create"
+        mock_log.entity_type = "tunnel"
+        mock_log.entity_id = 42
+        mock_log.previous_state = None
+        mock_log.new_state = None
+        mock_log.ip_address = None
+        mock_log.created_at = now
+
+        db_mock = AsyncMock()
+        count_result = MagicMock()
+        count_result.scalar_one.return_value = 1
+        items_result = MagicMock()
+        items_result.scalars.return_value.all.return_value = [mock_log]
+        db_mock.execute.side_effect = [count_result, items_result]
+
+        viewer = _make_mock_user(role="viewer")
+
+        async def _override_db():
+            yield db_mock
+
+        async def _override_user():
+            return viewer
+
+        app.dependency_overrides[get_db] = _override_db
+        app.dependency_overrides[get_current_user] = _override_user
+
+        try:
+            import httpx as _httpx
+            transport = _httpx.ASGITransport(app=app)
+            async with _httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.get("/api/v1/audit/")
+        finally:
+            app.dependency_overrides.clear()
+
+        assert resp.status_code == 200
+        data = resp.json()
+        items = data["items"]
+        assert len(items) == 1
+        user_data = items[0]["user"]
+        assert user_data is not None, "user field must be populated, not null"
+        assert user_data["id"] == 5
+        assert user_data["email"] == "daniel@example.com"
+        assert user_data["display_name"] == "Daniel"
+
+    @pytest.mark.anyio
+    async def test_list_audit_null_user_id_returns_null_user(self):
+        """GET /api/v1/audit/ — entries with NULL user_id return user=null ('System')."""
+        from app.auth.dependencies import get_current_user
+        from app.db.session import get_db
+        from app.main import app
+
+        now = datetime.now(timezone.utc)
+
+        mock_log = MagicMock()
+        mock_log.id = 2
+        mock_log.user = None  # NULL user_id row
+        mock_log.user_id = None
+        mock_log.action = "create"
+        mock_log.entity_type = "tunnel"
+        mock_log.entity_id = 1
+        mock_log.previous_state = None
+        mock_log.new_state = None
+        mock_log.ip_address = None
+        mock_log.created_at = now
+
+        db_mock = AsyncMock()
+        count_result = MagicMock()
+        count_result.scalar_one.return_value = 1
+        items_result = MagicMock()
+        items_result.scalars.return_value.all.return_value = [mock_log]
+        db_mock.execute.side_effect = [count_result, items_result]
+
+        viewer = _make_mock_user(role="viewer")
+
+        async def _override_db():
+            yield db_mock
+
+        async def _override_user():
+            return viewer
+
+        app.dependency_overrides[get_db] = _override_db
+        app.dependency_overrides[get_current_user] = _override_user
+
+        try:
+            import httpx as _httpx
+            transport = _httpx.ASGITransport(app=app)
+            async with _httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.get("/api/v1/audit/")
+        finally:
+            app.dependency_overrides.clear()
+
+        assert resp.status_code == 200
+        data = resp.json()
+        items = data["items"]
+        assert len(items) == 1
+        assert items[0]["user"] is None, "null user_id must produce null user in response"
+
+
+# ---------------------------------------------------------------------------
 # Operations router
 # ---------------------------------------------------------------------------
 
