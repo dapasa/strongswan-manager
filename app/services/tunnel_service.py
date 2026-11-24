@@ -3,23 +3,33 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import secrets
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
+import yaml
+from botocore.exceptions import ClientError
 from fastapi import Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.config import get_settings
 from app.db.models import IPTablesRule, Route, Server, Tunnel, User
 from app.exceptions import ConflictError, InfrastructureError, NotFoundError
 from app.logging_config import get_logger
 from app.services import audit, ipsec_config
+from app.services.aws_client import get_client_for_server
 from app.services.iptables_service import build_iptables_command
 from app.services.locks import LOCK_IPSEC_CONFIG, require_lock
 from app.services.server_service import execute_command, execute_on_all_servers
 from app.utils.fan_out import FanOutResult, ServerResult
+
+# Safe name pattern for swanctl connection/child names.
+# Tunnel names are manager-generated and stored in DB, but we validate before
+# embedding in a shell command to catch corrupt state early.
+_SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9_.@-]+$')
 
 logger = get_logger(__name__)
 
@@ -1137,3 +1147,377 @@ def _route_to_dict(route: Route) -> dict[str, Any]:
         "sync_error": route.sync_error,
         "created_by": route.created_by,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tunnel control — initiate / terminate via swanctl on the active HA node
+# ---------------------------------------------------------------------------
+
+_MAX_OUTPUT_CHARS: int = 2000
+
+
+def _validate_tunnel_name_safe(name: str) -> None:
+    """Ensure the tunnel name is safe to embed in a swanctl shell command.
+
+    The name is manager-generated and stored in the DB, so this guards against
+    corrupt state only — it is never raw user input at the shell level.
+
+    Raises:
+        InfrastructureError: When the name contains characters that are unsafe
+            for embedding in a shell command argument.
+    """
+    if not _SAFE_NAME_RE.match(name):
+        raise InfrastructureError(
+            "config",
+            f"Tunnel name {name!r} contains characters that are unsafe for shell use. "
+            "This indicates a corrupt DB record — contact an administrator.",
+        )
+
+
+def _read_failover_config_for_control_sync(s3_client: Any, bucket: str) -> dict:
+    """Synchronous S3 read of failover/config.yaml for tunnel control.
+
+    Intentionally separate from route_service's private helper so the two
+    subsystems remain decoupled.
+
+    Raises:
+        InfrastructureError: On S3 error.
+    """
+    try:
+        obj = s3_client.get_object(Bucket=bucket, Key="failover/config.yaml")
+        return yaml.safe_load(obj["Body"].read())
+    except ClientError as exc:
+        code = exc.response["Error"]["Code"]
+        raise InfrastructureError(
+            "S3",
+            f"Cannot read failover/config.yaml from bucket {bucket!r}: {code}",
+        ) from exc
+
+
+async def _read_failover_config_for_control(s3_client: Any, bucket: str) -> dict:
+    """Async wrapper for failover config read."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: _read_failover_config_for_control_sync(s3_client, bucket),
+    )
+
+
+def _resolve_active_node_sync(
+    ec2_client: Any,
+    failover_config: dict,
+) -> tuple[str, str]:
+    """Resolve the active VPN node from the EIP holder.
+
+    Uses the same approach as route_service: reads primary_ip / secondary_ip
+    from failover_config, calls DescribeNetworkInterfaces to map private IPs
+    to EC2 instance IDs, then DescribeAddresses to find the EIP holder.
+
+    Args:
+        ec2_client: Boto3 EC2 client.
+        failover_config: Parsed failover/config.yaml dict.
+
+    Returns:
+        (instance_id, node_label) where node_label is "primary" or "secondary".
+
+    Raises:
+        InfrastructureError: When the EIP is not associated, the holder is not
+            a known VPN node, or any AWS API call fails.
+    """
+    eip_alloc_id: str | None = failover_config.get("eip_allocation_id")
+    if not eip_alloc_id:
+        raise InfrastructureError(
+            "failover_config",
+            "failover/config.yaml missing 'eip_allocation_id'",
+        )
+
+    primary_ip: str | None = failover_config.get("primary_ip")
+    secondary_ip: str | None = failover_config.get("secondary_ip")
+    if not primary_ip or not secondary_ip:
+        raise InfrastructureError(
+            "failover_config",
+            "failover/config.yaml missing 'primary_ip' or 'secondary_ip'",
+        )
+
+    # Map VPN node private IPs → EC2 instance IDs → "primary"|"secondary" label
+    vpn_ip_values = [primary_ip, secondary_ip]
+    try:
+        ni_resp = ec2_client.describe_network_interfaces(
+            Filters=[{"Name": "private-ip-address", "Values": vpn_ip_values}]
+        )
+        vpn_enis_raw = ni_resp.get("NetworkInterfaces", [])
+    except ClientError as exc:
+        raise InfrastructureError(
+            "EC2",
+            f"DescribeNetworkInterfaces(private-ip-address in {vpn_ip_values}) failed: "
+            f"{exc.response['Error']['Code']}",
+        ) from exc
+
+    instance_to_node: dict[str, str] = {}
+    for ni in vpn_enis_raw:
+        inst = ni.get("Attachment", {}).get("InstanceId")
+        priv_ip = ni.get("PrivateIpAddress")
+        if inst and priv_ip:
+            if priv_ip == primary_ip:
+                instance_to_node[inst] = "primary"
+            elif priv_ip == secondary_ip:
+                instance_to_node[inst] = "secondary"
+
+    # Determine which instance currently holds the EIP
+    try:
+        resp = ec2_client.describe_addresses(AllocationIds=[eip_alloc_id])
+        addrs = resp.get("Addresses", [])
+        holder_instance_id: str | None = addrs[0].get("InstanceId") if addrs else None
+    except ClientError as exc:
+        raise InfrastructureError(
+            "EC2",
+            f"DescribeAddresses({eip_alloc_id}) failed: {exc.response['Error']['Code']}",
+        ) from exc
+
+    if not holder_instance_id:
+        raise InfrastructureError(
+            "EC2",
+            f"EIP {eip_alloc_id} is not currently associated with any instance. "
+            "Cannot determine the active node — associate the EIP first.",
+        )
+
+    node_label: str | None = instance_to_node.get(holder_instance_id)
+    if node_label is None:
+        raise InfrastructureError(
+            "EC2",
+            f"EIP holder {holder_instance_id} is not a known VPN node "
+            f"(primary_ip={primary_ip}, secondary_ip={secondary_ip}). "
+            "Check failover/config.yaml.",
+        )
+
+    return holder_instance_id, node_label
+
+
+async def _resolve_active_node(
+    ec2_client: Any,
+    failover_config: dict,
+) -> tuple[str, str]:
+    """Async wrapper for _resolve_active_node_sync."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: _resolve_active_node_sync(ec2_client, failover_config),
+    )
+
+
+async def _get_any_active_server(session: AsyncSession) -> Server:
+    """Return the first active non-deleted server for AWS credential resolution.
+
+    All servers in the HA pair share the same AWS account / role ARN, so any
+    one of them provides the credentials needed for EC2 and S3 API calls.
+
+    Raises:
+        InfrastructureError: If no active server is registered.
+    """
+    result = await session.execute(
+        select(Server).where(
+            Server.is_active.is_(True),
+            Server.deleted_at.is_(None),
+        ).limit(1)
+    )
+    server = result.scalar_one_or_none()
+    if server is None:
+        raise InfrastructureError("servers", "No active server registered; cannot call AWS API")
+    return server
+
+
+async def _find_server_by_instance_id(session: AsyncSession, instance_id: str) -> Server:
+    """Look up the Server record matching an EC2 instance ID.
+
+    Args:
+        session: Active database session.
+        instance_id: EC2 instance ID of the active VPN node.
+
+    Returns:
+        The matching Server ORM instance.
+
+    Raises:
+        InfrastructureError: When no active server with that instance ID exists.
+    """
+    result = await session.execute(
+        select(Server).where(
+            Server.ec2_instance_id == instance_id,
+            Server.is_active.is_(True),
+            Server.deleted_at.is_(None),
+        )
+    )
+    server = result.scalar_one_or_none()
+    if server is None:
+        raise InfrastructureError(
+            "servers",
+            f"EC2 instance {instance_id!r} (active EIP holder) is not registered as an "
+            "active server in this manager. Register it as an SSM server to use tunnel control.",
+        )
+    return server
+
+
+async def _control_tunnel(
+    session: AsyncSession,
+    tunnel_id: int,
+    *,
+    action: Literal["initiate", "terminate"],
+    user: User,
+    request: Request | None = None,
+) -> dict[str, Any]:
+    """Common implementation for initiate and terminate tunnel actions.
+
+    Active node = the EC2 instance that currently holds the VPN EIP, as
+    resolved from failover/config.yaml (same approach as route_service).
+
+    Args:
+        session: Active database session.
+        tunnel_id: Tunnel to control.
+        action: "initiate" (bring up) or "terminate" (bring down).
+        user: Operator or admin performing the action.
+        request: FastAPI request for audit IP/UA context.
+
+    Returns:
+        Dict with keys: tunnel_id, action, node, instance_id, success, output.
+
+    Raises:
+        NotFoundError: Tunnel not found.
+        InfrastructureError: Config bucket absent, EIP not associated, server
+            not registered, or SSM infrastructure failure.
+    """
+    settings = get_settings()
+    if not settings.strongswan_config_bucket.strip():
+        raise InfrastructureError(
+            "config",
+            "STRONGSWAN_CONFIG_BUCKET is empty; tunnel control requires failover/config.yaml",
+        )
+
+    # 1. Load and validate tunnel
+    tunnel = await get_tunnel(session, tunnel_id)
+    _validate_tunnel_name_safe(tunnel.name)
+
+    # 2. Get any active server for AWS credential resolution
+    any_server = await _get_any_active_server(session)
+    ec2_client = get_client_for_server(any_server, "ec2")
+    s3_client = get_client_for_server(any_server, "s3")
+
+    # 3. Read failover config from S3
+    failover_config = await _read_failover_config_for_control(
+        s3_client, settings.strongswan_config_bucket
+    )
+
+    # 4. Resolve the active node (EIP holder)
+    holder_instance_id, node_label = await _resolve_active_node(ec2_client, failover_config)
+
+    # 5. Find the registered server for the active instance
+    active_server = await _find_server_by_instance_id(session, holder_instance_id)
+
+    # 6. Build swanctl command with the manager-validated tunnel name
+    if action == "initiate":
+        cmd = f"sudo /usr/sbin/swanctl --initiate --child {tunnel.name} --timeout 30"
+    else:
+        cmd = f"sudo /usr/sbin/swanctl --terminate --ike {tunnel.name} --timeout 30"
+
+    # 7. Execute on the active node via the existing transport layer
+    result = await execute_command(session, active_server.id, [cmd])
+
+    # 8. Trim output (stdout on success, error string on failure)
+    raw = (result.output if result.success else result.error) or ""
+    output = raw[:_MAX_OUTPUT_CHARS].strip()
+
+    # 9. Write audit log and commit
+    await audit.log_action(
+        session,
+        user_id=user.id,
+        entity_type="tunnel",
+        entity_id=tunnel_id,
+        action=action,
+        new_state={
+            "node": node_label,
+            "instance_id": holder_instance_id,
+            "success": result.success,
+            "output": output,
+        },
+        request=request,
+    )
+    await session.commit()
+
+    logger.info(
+        "tunnel_control_done",
+        action=action,
+        tunnel_id=tunnel_id,
+        tunnel_name=tunnel.name,
+        node=node_label,
+        instance_id=holder_instance_id,
+        success=result.success,
+    )
+
+    return {
+        "tunnel_id": tunnel_id,
+        "action": action,
+        "node": node_label,
+        "instance_id": holder_instance_id,
+        "success": result.success,
+        "output": output,
+    }
+
+
+async def initiate_tunnel(
+    session: AsyncSession,
+    tunnel_id: int,
+    *,
+    user: User,
+    request: Request | None = None,
+) -> dict[str, Any]:
+    """Bring a tunnel up on the active VPN node via ``swanctl --initiate``.
+
+    The active node is the EC2 instance that currently holds the VPN EIP,
+    resolved from ``failover/config.yaml`` in the StrongSwan config bucket.
+
+    Args:
+        session: Active database session.
+        tunnel_id: Tunnel to bring up.
+        user: Operator or admin performing the action.
+        request: FastAPI request for audit IP/UA context.
+
+    Returns:
+        Dict with keys: tunnel_id, action, node, instance_id, success, output.
+        ``success`` is True when swanctl exited successfully; False when it
+        failed on the node (SSM ran but swanctl reported an error).
+
+    Raises:
+        NotFoundError: Tunnel not found.
+        InfrastructureError: Config bucket absent, EIP not associated, server
+            not registered, or SSM infrastructure failure.
+    """
+    return await _control_tunnel(session, tunnel_id, action="initiate", user=user, request=request)
+
+
+async def terminate_tunnel(
+    session: AsyncSession,
+    tunnel_id: int,
+    *,
+    user: User,
+    request: Request | None = None,
+) -> dict[str, Any]:
+    """Bring a tunnel down on the active VPN node via ``swanctl --terminate``.
+
+    The active node is the EC2 instance that currently holds the VPN EIP,
+    resolved from ``failover/config.yaml`` in the StrongSwan config bucket.
+
+    Args:
+        session: Active database session.
+        tunnel_id: Tunnel to bring down.
+        user: Operator or admin performing the action.
+        request: FastAPI request for audit IP/UA context.
+
+    Returns:
+        Dict with keys: tunnel_id, action, node, instance_id, success, output.
+        ``success`` is True when swanctl exited successfully; False when it
+        failed on the node (SSM ran but swanctl reported an error).
+
+    Raises:
+        NotFoundError: Tunnel not found.
+        InfrastructureError: Config bucket absent, EIP not associated, server
+            not registered, or SSM infrastructure failure.
+    """
+    return await _control_tunnel(session, tunnel_id, action="terminate", user=user, request=request)

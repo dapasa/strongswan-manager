@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { ArrowLeft, Copy, Eye, EyeOff, Key, Pencil, RefreshCw, Trash2 } from 'lucide-react'
+import { ArrowLeft, Copy, Eye, EyeOff, Key, Pencil, RefreshCw, Trash2, Zap, ZapOff } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -20,7 +20,7 @@ import ConfirmDialog from '@/components/shared/ConfirmDialog'
 import TunnelStatusCell from '@/components/tunnels/TunnelStatusCell'
 import RouteList from '@/components/routes/RouteList'
 import IPTablesRuleList from '@/components/iptables/IPTablesRuleList'
-import { useTunnel, useDeleteTunnel, useRetryTunnelSync, useRotateTunnelPsk, useAllTunnelsLiveStatus } from '@/hooks/useTunnels'
+import { useTunnel, useDeleteTunnel, useRetryTunnelSync, useRotateTunnelPsk, useAllTunnelsLiveStatus, useInitiateTunnel, useTerminateTunnel } from '@/hooks/useTunnels'
 import { useRoutes } from '@/hooks/useRoutes'
 import { useIptablesRules } from '@/hooks/useIptablesRules'
 
@@ -127,6 +127,7 @@ export default function TunnelDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
   const [showDelete, setShowDelete] = useState(false)
+  const [showBringDown, setShowBringDown] = useState(false)
   const [showRotateConfirm, setShowRotateConfirm] = useState(false)
   const [useCustomPsk, setUseCustomPsk] = useState(false)
   const [customPsk, setCustomPsk] = useState('')
@@ -140,6 +141,8 @@ export default function TunnelDetailPage() {
   const deleteMutation = useDeleteTunnel()
   const retrySync = useRetryTunnelSync()
   const rotateMutation = useRotateTunnelPsk()
+  const initiateMutation = useInitiateTunnel()
+  const terminateMutation = useTerminateTunnel()
 
   async function handleDelete() {
     await deleteMutation.mutateAsync(Number(id))
@@ -240,6 +243,22 @@ export default function TunnelDetailPage() {
         </div>
         <RoleGuard requiredRole="operator">
           <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              disabled={initiateMutation.isPending || terminateMutation.isPending}
+              onClick={() => initiateMutation.mutate(Number(id))}
+            >
+              <Zap className={cn('h-4 w-4', initiateMutation.isPending && 'animate-pulse')} />
+              {initiateMutation.isPending ? 'Bringing up…' : 'Bring up'}
+            </Button>
+            <Button
+              variant="outline"
+              disabled={initiateMutation.isPending || terminateMutation.isPending}
+              onClick={() => setShowBringDown(true)}
+            >
+              <ZapOff className={cn('h-4 w-4', terminateMutation.isPending && 'animate-pulse')} />
+              {terminateMutation.isPending ? 'Bringing down…' : 'Bring down'}
+            </Button>
             <Button variant="outline" asChild>
               <Link to={`/tunnels/${id}/edit`}>
                 <Pencil className="h-4 w-4" />
@@ -279,6 +298,21 @@ export default function TunnelDetailPage() {
           <IPTablesTab tunnelId={data.id} />
         </TabsContent>
       </Tabs>
+
+      {/* Bring down confirmation */}
+      <ConfirmDialog
+        open={showBringDown}
+        onOpenChange={setShowBringDown}
+        title="Bring Down Tunnel"
+        description={`Bringing down "${data.name}" will cut the customer's traffic immediately. Continue?`}
+        confirmLabel="Bring Down"
+        variant="destructive"
+        loading={terminateMutation.isPending}
+        onConfirm={() => {
+          setShowBringDown(false)
+          terminateMutation.mutate(Number(id))
+        }}
+      />
 
       {/* Delete confirmation */}
       <ConfirmDialog

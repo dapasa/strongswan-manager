@@ -10,6 +10,8 @@ import {
   checkTunnelStatus,
   getAllTunnelsLiveStatus,
   rotateTunnelPsk,
+  initiateTunnel,
+  terminateTunnel,
 } from '@/services/tunnels'
 import { toast, getErrorMessage } from '@/lib/toast'
 
@@ -170,6 +172,60 @@ export function useRotateTunnelPsk() {
     },
     onError: (error) => {
       toast.error('Failed to rotate PSK', { description: getErrorMessage(error) })
+    },
+  })
+}
+
+/**
+ * Bring a tunnel up (initiate) via swanctl on the VPN node.
+ * Returns { tunnel_id, action, node, instance_id, success, output }.
+ * success=false means swanctl ran but reported failure — shown as an error toast.
+ * Invalidates the live-status query so the Status badge refreshes.
+ */
+export function useInitiateTunnel() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: initiateTunnel,
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['tunnels', 'status', 'live'] })
+      if (data.success) {
+        toast.success(`Tunnel brought up on ${data.node}`)
+      } else {
+        const out = data.output ?? 'Unknown error'
+        toast.error('Bring up failed', {
+          description: out.length > 200 ? out.slice(0, 200) + '…' : out,
+        })
+      }
+    },
+    onError: (error) => {
+      toast.error('Failed to bring up tunnel', { description: getErrorMessage(error) })
+    },
+  })
+}
+
+/**
+ * Bring a tunnel down (terminate) via swanctl on the VPN node.
+ * Returns { tunnel_id, action, node, instance_id, success, output }.
+ * success=false means swanctl ran but reported failure — shown as an error toast.
+ * Invalidates the live-status query so the Status badge refreshes.
+ */
+export function useTerminateTunnel() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: terminateTunnel,
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['tunnels', 'status', 'live'] })
+      if (data.success) {
+        toast.success(`Tunnel brought down on ${data.node}`)
+      } else {
+        const out = data.output ?? 'Unknown error'
+        toast.error('Bring down failed', {
+          description: out.length > 200 ? out.slice(0, 200) + '…' : out,
+        })
+      }
+    },
+    onError: (error) => {
+      toast.error('Failed to bring down tunnel', { description: getErrorMessage(error) })
     },
   })
 }
