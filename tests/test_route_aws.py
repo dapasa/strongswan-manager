@@ -32,9 +32,17 @@ from app.exceptions import ConflictError, InfrastructureError, ValidationError
 
 MANAGED_TABLES = ["rtb-aaaa1111bbbb2222c", "rtb-cccc3333dddd4444e"]
 CONFIG_BUCKET = "test-strongswan-config"
+# TARGET_ENI is the eth0 / primary-IP ENI of the primary node — the ENI that
+# failover_routes() recognises because it holds primary_ip.
 TARGET_ENI = "eni-0a1b2c3d4e5f67890"
+# ALT_ENI is the eth0 / secondary-IP ENI of the secondary node.
 ALT_ENI = "eni-ffffffffffffffff0"
+# EIP_ENI simulates the case where the EIP is attached to a *different* ENI
+# (e.g. eth1) on the same instance — the route manager must NOT use this one.
+EIP_ENI = "eni-023a49f2c8e684393"
 EIP_ALLOC = "eipalloc-0abc1234def56789"
+PRIMARY_INSTANCE = "i-07654321abcdef01"
+SECONDARY_INSTANCE = "i-07654321abcdef02"
 
 FAILOVER_CONFIG = {
     "eip_allocation_id": EIP_ALLOC,
@@ -42,6 +50,29 @@ FAILOVER_CONFIG = {
     "primary_ip": "10.0.1.10",
     "secondary_ip": "10.0.2.10",
 }
+
+
+def _describe_network_interfaces_vpn(
+    primary_eni: str = TARGET_ENI,
+    primary_instance: str = PRIMARY_INSTANCE,
+    secondary_eni: str = ALT_ENI,
+    secondary_instance: str = SECONDARY_INSTANCE,
+) -> dict:
+    """Simulate DescribeNetworkInterfaces returning the two VPN node ENIs."""
+    return {
+        "NetworkInterfaces": [
+            {
+                "NetworkInterfaceId": primary_eni,
+                "PrivateIpAddress": FAILOVER_CONFIG["primary_ip"],
+                "Attachment": {"InstanceId": primary_instance, "DeviceIndex": 0},
+            },
+            {
+                "NetworkInterfaceId": secondary_eni,
+                "PrivateIpAddress": FAILOVER_CONFIG["secondary_ip"],
+                "Attachment": {"InstanceId": secondary_instance, "DeviceIndex": 0},
+            },
+        ]
+    }
 
 
 def _mock_tunnel(
@@ -106,8 +137,21 @@ def _make_client_error(code: str) -> ClientError:
     )
 
 
-def _describe_addresses_associated(eni: str, alloc: str) -> dict:
-    return {"Addresses": [{"AllocationId": alloc, "NetworkInterfaceId": eni}]}
+def _describe_addresses_associated(
+    instance_id: str,
+    alloc: str = EIP_ALLOC,
+    eni: str | None = None,
+) -> dict:
+    """DescribeAddresses response when the EIP is associated to an instance.
+
+    `eni` is the ENI the EIP is physically attached to — may differ from the
+    primary-IP ENI (e.g. when the EIP is on eth1).  The resolver must use
+    InstanceId, not NetworkInterfaceId, to look up the correct VPN ENI.
+    """
+    addr: dict = {"AllocationId": alloc, "InstanceId": instance_id}
+    if eni is not None:
+        addr["NetworkInterfaceId"] = eni
+    return {"Addresses": [addr]}
 
 
 def _describe_addresses_unassociated() -> dict:
@@ -192,34 +236,88 @@ class TestValidateCidrRules:
 
 
 class TestResolveTargetEni:
-    """Tests for _resolve_target_eni_sync."""
+    """Tests for _resolve_target_eni_sync.
 
-    def _call(
-        self, ec2: MagicMock, failover: dict, tables: list[str]
-    ) -> str:
+    The resolver must return the ENI that holds primary_ip or secondary_ip
+    for the EIP-holder instance — NOT the ENI that the EIP is physically
+    attached to (which may be a different interface such as eth1).
+    This matches the failover script: it only moves routes whose target ENI
+    holds primary_ip or secondary_ip (discovered via DescribeNetworkInterfaces).
+    """
+
+    def _call(self, ec2: MagicMock, failover: dict, tables: list[str]) -> str:
         from app.services.route_service import _resolve_target_eni_sync
 
         return _resolve_target_eni_sync(ec2, failover, tables)
 
-    def test_eip_associated_returns_eni(self) -> None:
+    # ------------------------------------------------------------------
+    # EIP associated — normal path
+    # ------------------------------------------------------------------
+
+    def test_eip_associated_resolves_to_primary_ip_eni(self) -> None:
+        """EIP holder is the primary node → returns the primary-IP ENI (eth0)."""
         ec2 = MagicMock()
-        ec2.describe_addresses.return_value = _describe_addresses_associated(
-            TARGET_ENI, EIP_ALLOC
-        )
+        ec2.describe_network_interfaces.return_value = _describe_network_interfaces_vpn()
+        ec2.describe_addresses.return_value = _describe_addresses_associated(PRIMARY_INSTANCE)
+
         result = self._call(ec2, FAILOVER_CONFIG, MANAGED_TABLES)
+
         assert result == TARGET_ENI
+        ec2.describe_network_interfaces.assert_called_once()
         ec2.describe_addresses.assert_called_once_with(AllocationIds=[EIP_ALLOC])
         ec2.describe_route_tables.assert_not_called()
 
-    def test_eip_not_associated_single_eni_fallback(self) -> None:
+    def test_eip_on_secondary_eni_resolves_to_primary_ip_eni(self) -> None:
+        """EIP is attached to eth1 (EIP_ENI) on the primary node.
+
+        DescribeAddresses.NetworkInterfaceId would be EIP_ENI, but the resolver
+        must use InstanceId to look up the VPN ENI (TARGET_ENI / eth0).
+        """
         ec2 = MagicMock()
+        ec2.describe_network_interfaces.return_value = _describe_network_interfaces_vpn()
+        # EIP physically on eth1 (EIP_ENI), but InstanceId still points to primary
+        ec2.describe_addresses.return_value = _describe_addresses_associated(
+            PRIMARY_INSTANCE, eni=EIP_ENI
+        )
+
+        result = self._call(ec2, FAILOVER_CONFIG, MANAGED_TABLES)
+
+        # Must return the primary-IP ENI, not the EIP's physical ENI
+        assert result == TARGET_ENI
+        assert result != EIP_ENI
+
+    def test_eip_associated_to_secondary_holder(self) -> None:
+        """EIP has failed over to the secondary node → returns secondary-IP ENI."""
+        ec2 = MagicMock()
+        ec2.describe_network_interfaces.return_value = _describe_network_interfaces_vpn()
+        ec2.describe_addresses.return_value = _describe_addresses_associated(SECONDARY_INSTANCE)
+
+        result = self._call(ec2, FAILOVER_CONFIG, MANAGED_TABLES)
+
+        assert result == ALT_ENI
+
+    def test_eip_holder_not_in_vpn_eni_set_raises(self) -> None:
+        """EIP is on an unexpected instance (not primary or secondary) → error."""
+        ec2 = MagicMock()
+        ec2.describe_network_interfaces.return_value = _describe_network_interfaces_vpn()
+        ec2.describe_addresses.return_value = _describe_addresses_associated("i-stranger")
+
+        with pytest.raises(InfrastructureError, match="no VPN ENI"):
+            self._call(ec2, FAILOVER_CONFIG, MANAGED_TABLES)
+
+    # ------------------------------------------------------------------
+    # EIP not associated — fallback: scan tables for VPN ENIs only
+    # ------------------------------------------------------------------
+
+    def test_eip_not_associated_single_vpn_eni_fallback(self) -> None:
+        """EIP not associated; routes target exactly one VPN ENI → that ENI."""
+        ec2 = MagicMock()
+        ec2.describe_network_interfaces.return_value = _describe_network_interfaces_vpn()
         ec2.describe_addresses.return_value = _describe_addresses_unassociated()
 
-        # Both tables have routes to the same ENI
         def _describe_rt(RouteTableIds):  # noqa: N803
-            rtb = RouteTableIds[0]
             return _describe_route_tables_with_routes(
-                rtb,
+                RouteTableIds[0],
                 routes=[{"DestinationCidrBlock": "192.168.1.0/24", "NetworkInterfaceId": TARGET_ENI}],
             )
 
@@ -228,13 +326,36 @@ class TestResolveTargetEni:
         result = self._call(ec2, FAILOVER_CONFIG, MANAGED_TABLES)
         assert result == TARGET_ENI
 
-    def test_eip_not_associated_multiple_enis_raises(self) -> None:
+    def test_eip_not_associated_non_vpn_eni_in_routes_ignored(self) -> None:
+        """Non-VPN ENIs in routes are invisible to failover and must not be counted."""
         ec2 = MagicMock()
+        ec2.describe_network_interfaces.return_value = _describe_network_interfaces_vpn()
+        ec2.describe_addresses.return_value = _describe_addresses_unassociated()
+
+        # Both tables have TARGET_ENI (a VPN ENI) + EIP_ENI (not a VPN ENI)
+        def _describe_rt(RouteTableIds):  # noqa: N803
+            return _describe_route_tables_with_routes(
+                RouteTableIds[0],
+                routes=[
+                    {"DestinationCidrBlock": "192.168.1.0/24", "NetworkInterfaceId": TARGET_ENI},
+                    {"DestinationCidrBlock": "172.16.0.0/16", "NetworkInterfaceId": EIP_ENI},
+                ],
+            )
+
+        ec2.describe_route_tables.side_effect = _describe_rt
+
+        # Only TARGET_ENI is a VPN ENI → resolves unambiguously
+        result = self._call(ec2, FAILOVER_CONFIG, MANAGED_TABLES)
+        assert result == TARGET_ENI
+
+    def test_eip_not_associated_multiple_vpn_enis_raises(self) -> None:
+        """Both VPN ENIs present in routes → ambiguous → error."""
+        ec2 = MagicMock()
+        ec2.describe_network_interfaces.return_value = _describe_network_interfaces_vpn()
         ec2.describe_addresses.return_value = _describe_addresses_unassociated()
 
         def _describe_rt(RouteTableIds):  # noqa: N803
             rtb = RouteTableIds[0]
-            # First table has TARGET_ENI, second has ALT_ENI
             eni = TARGET_ENI if rtb == MANAGED_TABLES[0] else ALT_ENI
             return _describe_route_tables_with_routes(
                 rtb,
@@ -243,23 +364,43 @@ class TestResolveTargetEni:
 
         ec2.describe_route_tables.side_effect = _describe_rt
 
-        with pytest.raises(InfrastructureError, match="multiple candidate ENIs"):
+        with pytest.raises(InfrastructureError, match="multiple VPN ENIs"):
             self._call(ec2, FAILOVER_CONFIG, MANAGED_TABLES)
 
-    def test_eip_not_associated_no_enis_raises(self) -> None:
+    def test_eip_not_associated_no_vpn_eni_in_routes_raises(self) -> None:
+        """No VPN-ENI-targeted routes exist → cannot determine active node."""
         ec2 = MagicMock()
+        ec2.describe_network_interfaces.return_value = _describe_network_interfaces_vpn()
         ec2.describe_addresses.return_value = _describe_addresses_unassociated()
+        # Route targets a non-VPN ENI only
         ec2.describe_route_tables.return_value = _describe_route_tables_with_routes(
-            MANAGED_TABLES[0], routes=[]
+            MANAGED_TABLES[0],
+            routes=[{"DestinationCidrBlock": "192.168.1.0/24", "NetworkInterfaceId": EIP_ENI}],
         )
 
-        with pytest.raises(InfrastructureError, match="no ENI-targeted routes"):
+        with pytest.raises(InfrastructureError, match="no VPN-ENI-targeted routes"):
             self._call(ec2, FAILOVER_CONFIG, MANAGED_TABLES)
+
+    # ------------------------------------------------------------------
+    # Config validation
+    # ------------------------------------------------------------------
 
     def test_missing_eip_key_raises(self) -> None:
         ec2 = MagicMock()
         with pytest.raises(InfrastructureError, match="eip_allocation_id"):
             self._call(ec2, {}, MANAGED_TABLES)
+
+    def test_missing_primary_ip_raises(self) -> None:
+        ec2 = MagicMock()
+        cfg = {k: v for k, v in FAILOVER_CONFIG.items() if k != "primary_ip"}
+        with pytest.raises(InfrastructureError, match="primary_ip"):
+            self._call(ec2, cfg, MANAGED_TABLES)
+
+    def test_missing_secondary_ip_raises(self) -> None:
+        ec2 = MagicMock()
+        cfg = {k: v for k, v in FAILOVER_CONFIG.items() if k != "secondary_ip"}
+        with pytest.raises(InfrastructureError, match="secondary_ip"):
+            self._call(ec2, cfg, MANAGED_TABLES)
 
 
 # ---------------------------------------------------------------------------
@@ -882,3 +1023,56 @@ class TestRouteRoleEnforcement:
         # the actual service (we patched the module-level function), so we just
         # verify auth passed (not 403).
         assert resp.status_code != 403
+
+
+# ---------------------------------------------------------------------------
+# Bug 2 — MANAGED_ROUTE_TABLE_IDS config parsing
+# ---------------------------------------------------------------------------
+
+
+class TestManagedRouteTableIdsConfig:
+    """Settings must accept both comma-separated and JSON-array env values.
+
+    pydantic-settings v2 JSON-decodes list fields before validators run, so
+    'rtb-a,rtb-b' raised a SettingsError at startup.  The fix uses NoDecode
+    so the raw string always reaches the field_validator.
+    """
+
+    def _build(self, env_value: str) -> list:
+        import os
+        from unittest.mock import patch
+
+        # Provide the minimum required fields so Settings() doesn't blow up
+        env = {
+            "MANAGED_ROUTE_TABLE_IDS": env_value,
+            "KMS_PSK_KEY_ID": "alias/test-key",
+            "VPN_PRIMARY_INSTANCE_NAME": "primary",
+            "VPN_SECONDARY_INSTANCE_NAME": "secondary",
+            "JWT_SECRET_KEY": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "AUTH_MODE": "local",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            from app.config import Settings
+
+            s = Settings()
+            return s.managed_route_table_ids
+
+    def test_comma_separated_parses_to_list(self) -> None:
+        result = self._build("rtb-aaaa1111bbbb2222c,rtb-cccc3333dddd4444e")
+        assert result == ["rtb-aaaa1111bbbb2222c", "rtb-cccc3333dddd4444e"]
+
+    def test_comma_separated_strips_whitespace(self) -> None:
+        result = self._build("rtb-aaaa1111bbbb2222c , rtb-cccc3333dddd4444e")
+        assert result == ["rtb-aaaa1111bbbb2222c", "rtb-cccc3333dddd4444e"]
+
+    def test_json_array_parses_to_list(self) -> None:
+        result = self._build('["rtb-aaaa1111bbbb2222c","rtb-cccc3333dddd4444e"]')
+        assert result == ["rtb-aaaa1111bbbb2222c", "rtb-cccc3333dddd4444e"]
+
+    def test_empty_string_parses_to_empty_list(self) -> None:
+        result = self._build("")
+        assert result == []
+
+    def test_single_value_parses_to_single_item_list(self) -> None:
+        result = self._build("rtb-aaaa1111bbbb2222c")
+        assert result == ["rtb-aaaa1111bbbb2222c"]

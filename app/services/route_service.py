@@ -36,9 +36,11 @@ from app.services.aws_client import get_client_for_server
 
 logger = get_logger(__name__)
 
-# Key in failover/config.yaml that lists the route table IDs failover controls
+# Keys in failover/config.yaml
 _FAILOVER_CONFIG_KEY_TABLES = "route_table_ids"
 _FAILOVER_CONFIG_KEY_EIP = "eip_allocation_id"
+_FAILOVER_CONFIG_KEY_PRIMARY_IP = "primary_ip"
+_FAILOVER_CONFIG_KEY_SECONDARY_IP = "secondary_ip"
 
 
 # ---------------------------------------------------------------------------
@@ -180,11 +182,20 @@ def _resolve_target_eni_sync(
     """Synchronous ENI resolution — run via run_in_executor.
 
     Resolution order:
-      1. DescribeAddresses(AllocationIds=[eip_allocation_id]) — if the EIP is
-         associated, use that NetworkInterfaceId.
-      2. If the EIP is not associated: scan all managed route tables for
-         ENI-targeted routes.  If all such routes across all tables target
-         exactly one distinct ENI, use it.  Otherwise fail.
+      1. Read primary_ip and secondary_ip from failover_config.
+      2. DescribeNetworkInterfaces(private-ip-address in {primary_ip, secondary_ip})
+         to build the set of VPN node ENIs (one per node, indexed by InstanceId).
+         This matches how the failover script identifies routes it owns.
+      3. DescribeAddresses(AllocationIds=[eip_allocation_id]) → InstanceId of the
+         current EIP holder.
+      4. If the EIP is associated: return the VPN ENI whose Attachment.InstanceId
+         equals the holder.  Fail if no match.
+      5. If the EIP is not associated: scan the managed route tables and collect
+         ENIs that are in the VPN ENI set.  If all such routes target exactly one
+         distinct VPN ENI, return it.  Otherwise fail explicitly.
+
+    The fallback in step 5 filters to VPN ENIs only — a non-VPN ENI in a route
+    table is invisible to the failover script and must not be returned.
 
     Raises:
         InfrastructureError: When the ENI cannot be unambiguously determined.
@@ -196,26 +207,75 @@ def _resolve_target_eni_sync(
             f"failover/config.yaml missing '{_FAILOVER_CONFIG_KEY_EIP}' key",
         )
 
-    # --- Try EIP association first ---
+    primary_ip: str | None = failover_config.get(_FAILOVER_CONFIG_KEY_PRIMARY_IP)
+    secondary_ip: str | None = failover_config.get(_FAILOVER_CONFIG_KEY_SECONDARY_IP)
+    if not primary_ip or not secondary_ip:
+        raise InfrastructureError(
+            "failover_config",
+            "failover/config.yaml missing 'primary_ip' or 'secondary_ip'; "
+            "these are required to identify the VPN node ENIs",
+        )
+
+    # Discover VPN node ENIs by private IP — mirrors the failover script's approach
+    vpn_ip_values = [primary_ip, secondary_ip]
+    try:
+        ni_resp = ec2_client.describe_network_interfaces(
+            Filters=[{"Name": "private-ip-address", "Values": vpn_ip_values}]
+        )
+        vpn_enis_raw = ni_resp.get("NetworkInterfaces", [])
+    except ClientError as exc:
+        raise InfrastructureError(
+            "EC2",
+            f"DescribeNetworkInterfaces(private-ip-address in {vpn_ip_values}) failed: "
+            f"{exc.response['Error']['Code']}",
+        ) from exc
+
+    # Build {instance_id → eni_id} map and a plain set for fast membership tests
+    vpn_eni_by_instance: dict[str, str] = {}
+    vpn_eni_ids: set[str] = set()
+    for ni in vpn_enis_raw:
+        eni_id: str | None = ni.get("NetworkInterfaceId")
+        instance_id: str | None = ni.get("Attachment", {}).get("InstanceId")
+        if eni_id and instance_id:
+            vpn_eni_by_instance[instance_id] = eni_id
+            vpn_eni_ids.add(eni_id)
+
+    # Determine which instance currently holds the EIP
+    holder_instance_id: str | None = None
     try:
         resp = ec2_client.describe_addresses(AllocationIds=[eip_alloc_id])
         addrs = resp.get("Addresses", [])
         if addrs:
-            eni_id: str | None = addrs[0].get("NetworkInterfaceId")
-            if eni_id:
-                logger.info("route_eni_resolved_via_eip", eni=eni_id, eip=eip_alloc_id)
-                return eni_id
+            holder_instance_id = addrs[0].get("InstanceId")
     except ClientError as exc:
         raise InfrastructureError(
             "EC2",
             f"DescribeAddresses({eip_alloc_id}) failed: {exc.response['Error']['Code']}",
         ) from exc
 
-    # EIP is not currently associated — fall back to inspecting the tables
+    if holder_instance_id:
+        target_eni = vpn_eni_by_instance.get(holder_instance_id)
+        if target_eni:
+            logger.info(
+                "route_eni_resolved_via_primary_ip_eni",
+                eni=target_eni,
+                instance=holder_instance_id,
+                eip=eip_alloc_id,
+            )
+            return target_eni
+        raise InfrastructureError(
+            "EC2",
+            f"EIP is held by instance {holder_instance_id} but no VPN ENI "
+            f"(primary_ip={primary_ip}, secondary_ip={secondary_ip}) is attached to it. "
+            "Check failover/config.yaml primary_ip and secondary_ip.",
+        )
+
+    # EIP is not currently associated — fall back to inspecting the managed tables,
+    # counting only routes that target a known VPN ENI
     logger.warning(
         "route_eip_not_associated",
         eip=eip_alloc_id,
-        message="EIP not associated; scanning managed route tables for ENI consensus",
+        message="EIP not associated; scanning managed route tables for VPN ENI consensus",
     )
 
     candidate_enis: set[str] = set()
@@ -227,7 +287,7 @@ def _resolve_target_eni_sync(
                 continue
             for route in tables[0].get("Routes", []):
                 eni = route.get("NetworkInterfaceId")
-                if eni:
+                if eni and eni in vpn_eni_ids:
                     candidate_enis.add(eni)
         except ClientError as exc:
             raise InfrastructureError(
@@ -236,24 +296,24 @@ def _resolve_target_eni_sync(
             ) from exc
 
     if len(candidate_enis) == 1:
-        eni_id = next(iter(candidate_enis))
+        target_eni = next(iter(candidate_enis))
         logger.info(
             "route_eni_resolved_via_route_scan",
-            eni=eni_id,
+            eni=target_eni,
             tables=managed_tables,
         )
-        return eni_id
+        return target_eni
 
     if len(candidate_enis) == 0:
         raise InfrastructureError(
             "EC2",
-            "EIP is not associated and no ENI-targeted routes exist in the managed "
+            "EIP is not associated and no VPN-ENI-targeted routes exist in the managed "
             "route tables; cannot determine the target ENI. Associate the EIP first.",
         )
 
     raise InfrastructureError(
         "EC2",
-        f"EIP is not associated and multiple candidate ENIs found across managed "
+        f"EIP is not associated and multiple VPN ENIs found across managed "
         f"route tables ({sorted(candidate_enis)}). Cannot determine the active node. "
         "Associate the EIP first.",
     )

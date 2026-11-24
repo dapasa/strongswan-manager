@@ -20,8 +20,9 @@ import ConfirmDialog from '@/components/shared/ConfirmDialog'
 import TunnelStatusCell from '@/components/tunnels/TunnelStatusCell'
 import RouteList from '@/components/routes/RouteList'
 import IPTablesRuleList from '@/components/iptables/IPTablesRuleList'
-import { useTunnel, useDeleteTunnel, useRetryTunnelSync, useRotateTunnelPsk } from '@/hooks/useTunnels'
+import { useTunnel, useDeleteTunnel, useRetryTunnelSync, useRotateTunnelPsk, useAllTunnelsLiveStatus } from '@/hooks/useTunnels'
 import { useRoutes } from '@/hooks/useRoutes'
+import { useIptablesRules } from '@/hooks/useIptablesRules'
 
 function InfoField({ label, children }) {
   return (
@@ -133,7 +134,9 @@ export default function TunnelDetailPage() {
   const [rotateResult, setRotateResult] = useState(null)
   const [showPsk, setShowPsk] = useState(false)
   const tunnel = useTunnel(id)
-  const routes = useRoutes(id)
+  const routes = useRoutes(Number(id))
+  const iptablesRules = useIptablesRules(Number(id))
+  const liveStatus = useAllTunnelsLiveStatus()
   const deleteMutation = useDeleteTunnel()
   const retrySync = useRetryTunnelSync()
   const rotateMutation = useRotateTunnelPsk()
@@ -198,6 +201,7 @@ export default function TunnelDetailPage() {
   }
 
   const data = tunnel.data
+  const liveRow = liveStatus.data?.tunnels?.find((r) => r.tunnel_id === data.id)
 
   return (
     <div className="space-y-6">
@@ -211,7 +215,11 @@ export default function TunnelDetailPage() {
               </Link>
             </Button>
             <h1 className="text-2xl font-bold">{data.name}</h1>
-            <TunnelStatusCell tunnelId={data.id} />
+            <TunnelStatusCell
+              liveRow={liveRow}
+              isLoading={liveStatus.isLoading}
+              isError={liveStatus.isError}
+            />
             {data.sync_status === 'failed' && (
               <RoleGuard requiredRole="operator">
                 <Button
@@ -258,7 +266,7 @@ export default function TunnelDetailPage() {
             Routes ({routes.data?.length ?? 0})
           </TabsTrigger>
           <TabsTrigger value="iptables">
-            IPTables ({data.iptables_rules?.length ?? 0})
+            IPTables ({iptablesRules.data?.length ?? 0})
           </TabsTrigger>
         </TabsList>
         <TabsContent value="info">
