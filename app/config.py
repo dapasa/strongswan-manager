@@ -183,10 +183,11 @@ class Settings(BaseSettings):
 
     # VPC Route Management (sc-31774)
     strongswan_config_bucket: str = Field(
-        ...,
+        default="",
         description=(
             "Name of the S3 bucket that holds the StrongSwan cluster config, "
-            "including failover/config.yaml (eip_allocation_id, route_table_ids, etc.)."
+            "including failover/config.yaml (eip_allocation_id, route_table_ids, etc.). "
+            "Empty disables the route-write feature."
         ),
     )
     managed_route_table_ids: list[str] = Field(

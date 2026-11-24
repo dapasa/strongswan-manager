@@ -603,6 +603,10 @@ def _require_managed_tables(settings: Settings) -> list[str]:
         raise ValidationError(
             "MANAGED_ROUTE_TABLE_IDS is empty; route-write feature is disabled"
         )
+    if not settings.strongswan_config_bucket.strip():
+        raise ValidationError(
+            "STRONGSWAN_CONFIG_BUCKET is empty; route-write feature is disabled"
+        )
     return tables
 
 
