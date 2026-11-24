@@ -310,6 +310,24 @@ class AllTunnelsLiveStatus(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Tunnel control (initiate / terminate)
+# ---------------------------------------------------------------------------
+
+
+class TunnelControlResult(BaseModel):
+    """Response from POST /api/v1/tunnels/{tunnel_id}/initiate|terminate."""
+
+    tunnel_id: int
+    action: Literal["initiate", "terminate"]
+    node: Literal["primary", "secondary"] = Field(
+        description="Which HA node executed the command"
+    )
+    instance_id: str = Field(description="EC2 instance ID of the active node")
+    success: bool = Field(description="True when swanctl exited successfully")
+    output: str = Field(description="Trimmed stdout/stderr from swanctl (max 2000 chars)")
+
+
+# ---------------------------------------------------------------------------
 # PSK rotation
 # ---------------------------------------------------------------------------
 

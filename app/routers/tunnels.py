@@ -17,6 +17,7 @@ from app.schemas.tunnel import (
     RotatePskRequest,
     RotatePskResponse,
     TunnelCheckStatusResult,
+    TunnelControlResult,
     TunnelCreate,
     TunnelDetail,
     TunnelStatus,
@@ -408,3 +409,65 @@ async def create_tunnel_iptables(
         created_at=rule.created_at,
         updated_at=rule.updated_at,
     )
+
+
+# ---------------------------------------------------------------------------
+# Tunnel control endpoints — bring up / bring down on the active HA node
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/{tunnel_id}/initiate",
+    response_model=TunnelControlResult,
+    summary="Bring a tunnel up on the active HA node",
+)
+async def initiate_tunnel(
+    tunnel_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_operator),
+) -> TunnelControlResult:
+    """Run ``swanctl --initiate`` for the tunnel on the active VPN node.
+
+    The active node is the EC2 instance that currently holds the VPN EIP,
+    resolved from ``failover/config.yaml`` in the StrongSwan config S3 bucket.
+
+    Returns 200 with ``success=false`` when swanctl runs but reports failure
+    (e.g. peer not responding).  Returns 4xx/5xx only for auth, tunnel not
+    found, or infrastructure errors (EIP not associated, server not registered).
+    """
+    result = await tunnel_service.initiate_tunnel(
+        db,
+        tunnel_id,
+        user=current_user,
+        request=request,
+    )
+    return TunnelControlResult(**result)
+
+
+@router.post(
+    "/{tunnel_id}/terminate",
+    response_model=TunnelControlResult,
+    summary="Bring a tunnel down on the active HA node",
+)
+async def terminate_tunnel(
+    tunnel_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_operator),
+) -> TunnelControlResult:
+    """Run ``swanctl --terminate`` for the tunnel on the active VPN node.
+
+    The active node is the EC2 instance that currently holds the VPN EIP,
+    resolved from ``failover/config.yaml`` in the StrongSwan config S3 bucket.
+
+    Returns 200 with ``success=false`` when swanctl runs but reports failure.
+    Returns 4xx/5xx only for auth, tunnel not found, or infrastructure errors.
+    """
+    result = await tunnel_service.terminate_tunnel(
+        db,
+        tunnel_id,
+        user=current_user,
+        request=request,
+    )
+    return TunnelControlResult(**result)
