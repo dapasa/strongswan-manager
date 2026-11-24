@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Annotated
 
 import boto3
 from botocore.exceptions import ClientError
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -190,12 +191,15 @@ class Settings(BaseSettings):
             "Empty disables the route-write feature."
         ),
     )
-    managed_route_table_ids: list[str] = Field(
+    managed_route_table_ids: Annotated[list[str], NoDecode] = Field(
         default=[],
         description=(
             "Comma-separated list of VPC route table IDs this manager is allowed to modify "
             "(e.g. 'rtb-aaa111,rtb-bbb222'). Routes are written to ALL listed tables. "
-            "Empty list disables the route-write feature entirely."
+            "Empty list disables the route-write feature entirely. "
+            "Also accepts a JSON array: '[\"rtb-aaa\",\"rtb-bbb\"]'. "
+            "NoDecode prevents pydantic-settings v2 from pre-parsing the value as JSON, "
+            "so the field_validator always receives the raw string."
         ),
     )
 
