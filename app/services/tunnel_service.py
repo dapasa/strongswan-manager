@@ -1155,6 +1155,14 @@ def _route_to_dict(route: Route) -> dict[str, Any]:
 
 _MAX_OUTPUT_CHARS: int = 2000
 
+# Timeout passed to swanctl via --timeout flag (seconds).
+_SWANCTL_TIMEOUT: int = 30
+
+# Timeout passed to execute_command's asyncio.wait_for wrapper (seconds).
+# Must be strictly greater than _SWANCTL_TIMEOUT so the wrapper does not
+# cut off swanctl before swanctl's own timeout fires and returns its output.
+_WRAPPER_TIMEOUT: int = 75
+
 
 def _validate_tunnel_name_safe(name: str) -> None:
     """Ensure the tunnel name is safe to embed in a swanctl shell command.
@@ -1395,51 +1403,97 @@ async def _control_tunnel(
     tunnel = await get_tunnel(session, tunnel_id)
     _validate_tunnel_name_safe(tunnel.name)
 
+    # --- Best-effort audit helper -------------------------------------------
+    # Writes an audit entry and commits.  Swallows any error so a broken audit
+    # path never masks the real operation result or turns a swanctl failure into
+    # an opaque 500.  Called for EVERY outcome: success, command failure,
+    # transport timeout, and node-resolution failures.
+    async def _write_audit(new_state: dict) -> None:
+        try:
+            await audit.log_action(
+                session,
+                user_id=user.id,
+                entity_type="tunnel",
+                entity_id=tunnel_id,
+                action=action,
+                new_state=new_state,
+                request=request,
+            )
+            await session.commit()
+        except Exception as _audit_exc:
+            logger.error(
+                "tunnel_control_audit_failed",
+                action=action,
+                tunnel_id=tunnel_id,
+                error=str(_audit_exc),
+            )
+
+    # -------------------------------------------------------------------------
+
     # 2. Get any active server for AWS credential resolution
-    any_server = await _get_any_active_server(session)
+    try:
+        any_server = await _get_any_active_server(session)
+    except InfrastructureError as exc:
+        await _write_audit({"step": "resolve_server", "error": exc.message})
+        raise
+
     ec2_client = get_client_for_server(any_server, "ec2")
     s3_client = get_client_for_server(any_server, "s3")
 
     # 3. Read failover config from S3
-    failover_config = await _read_failover_config_for_control(
-        s3_client, settings.strongswan_config_bucket
-    )
+    try:
+        failover_config = await _read_failover_config_for_control(
+            s3_client, settings.strongswan_config_bucket
+        )
+    except InfrastructureError as exc:
+        await _write_audit({"step": "read_failover_config", "error": exc.message})
+        raise
 
     # 4. Resolve the active node (EIP holder)
-    holder_instance_id, node_label = await _resolve_active_node(ec2_client, failover_config)
+    try:
+        holder_instance_id, node_label = await _resolve_active_node(ec2_client, failover_config)
+    except InfrastructureError as exc:
+        await _write_audit({"step": "resolve_active_node", "error": exc.message})
+        raise
 
     # 5. Find the registered server for the active instance
-    active_server = await _find_server_by_instance_id(session, holder_instance_id)
+    try:
+        active_server = await _find_server_by_instance_id(session, holder_instance_id)
+    except InfrastructureError as exc:
+        await _write_audit({
+            "node": node_label,
+            "instance_id": holder_instance_id,
+            "step": "find_server",
+            "error": exc.message,
+        })
+        raise
 
-    # 6. Build swanctl command with the manager-validated tunnel name
+    # 6. Build swanctl command.  _SWANCTL_TIMEOUT is passed to swanctl's own
+    #    --timeout flag; _WRAPPER_TIMEOUT wraps the entire execute_command call
+    #    and must be strictly greater so swanctl's real output comes back before
+    #    the outer wait_for fires.
     if action == "initiate":
-        cmd = f"sudo /usr/sbin/swanctl --initiate --child {tunnel.name} --timeout 30"
+        cmd = f"sudo /usr/sbin/swanctl --initiate --child {tunnel.name} --timeout {_SWANCTL_TIMEOUT}"
     else:
-        cmd = f"sudo /usr/sbin/swanctl --terminate --ike {tunnel.name} --timeout 30"
+        cmd = f"sudo /usr/sbin/swanctl --terminate --ike {tunnel.name} --timeout {_SWANCTL_TIMEOUT}"
 
-    # 7. Execute on the active node via the existing transport layer
-    result = await execute_command(session, active_server.id, [cmd])
+    # 7. Execute on the active node.  Explicit timeout avoids relying on the
+    #    global ssh_command_timeout default (which may equal _SWANCTL_TIMEOUT
+    #    and would cut off swanctl before its own timeout fires).
+    result = await execute_command(session, active_server.id, [cmd], timeout=_WRAPPER_TIMEOUT)
 
     # 8. Trim output (stdout on success, error string on failure)
     raw = (result.output if result.success else result.error) or ""
     output = raw[:_MAX_OUTPUT_CHARS].strip()
 
-    # 9. Write audit log and commit
-    await audit.log_action(
-        session,
-        user_id=user.id,
-        entity_type="tunnel",
-        entity_id=tunnel_id,
-        action=action,
-        new_state={
-            "node": node_label,
-            "instance_id": holder_instance_id,
-            "success": result.success,
-            "output": output,
-        },
-        request=request,
-    )
-    await session.commit()
+    # 9. Write audit for every outcome (success or swanctl failure) and commit.
+    await _write_audit({
+        "node": node_label,
+        "instance_id": holder_instance_id,
+        "command": cmd,
+        "success": result.success,
+        "output": output,
+    })
 
     logger.info(
         "tunnel_control_done",

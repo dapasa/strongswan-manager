@@ -6,10 +6,13 @@ Covers:
 - Command built correctly for initiate and terminate actions
 - swanctl success → 200 success=true
 - swanctl command failure → 200 success=false
+- Transport timeout → audit written, 200 success=false
 - SSM infrastructure failure → 502 (InfrastructureError)
 - Tunnel not found → 404
-- EIP not associated → 502
-- Audit entry written on each call
+- EIP not associated → 502, audit entry still written
+- Audit entry written on EVERY outcome (success, failure, timeout, node-resolution failure)
+- Wrapper timeout passed to execute_command is strictly greater than swanctl --timeout
+- Migration 0018 constraint includes initiate and terminate
 """
 
 from __future__ import annotations
@@ -23,6 +26,8 @@ from fastapi import Request
 from app.db.models import Server, Tunnel, User
 from app.exceptions import InfrastructureError, NotFoundError
 from app.services.tunnel_service import (
+    _SWANCTL_TIMEOUT,
+    _WRAPPER_TIMEOUT,
     _control_tunnel,
     _find_server_by_instance_id,
     _resolve_active_node_sync,
@@ -382,7 +387,7 @@ class TestControlTunnel:
     @patch("app.services.tunnel_service.get_client_for_server")
     @patch("app.services.tunnel_service.get_settings")
     @patch("app.services.tunnel_service.audit.log_action", new_callable=AsyncMock)
-    async def test_eip_not_associated_raises_infra_error(
+    async def test_eip_not_associated_raises_infra_error_and_audit_written(
         self,
         mock_audit,
         mock_settings,
@@ -390,6 +395,7 @@ class TestControlTunnel:
         mock_resolve,
         mock_read_failover,
     ):
+        """EIP not associated → 502 re-raised, AND an audit entry is written with the error."""
         mock_settings.return_value.strongswan_config_bucket = "test-bucket"
         mock_read_failover.return_value = FAILOVER_CONFIG
         mock_resolve.side_effect = InfrastructureError(
@@ -403,8 +409,16 @@ class TestControlTunnel:
                 session, 42, action="initiate", user=_make_user(), request=None
             )
         assert "not currently associated" in exc_info.value.message
-        # Audit must NOT be written when we didn't execute the command
-        mock_audit.assert_not_called()
+
+        # Audit MUST be written even when node resolution failed — that is what
+        # lets operators debug "what happened?" in the audit log.
+        mock_audit.assert_called_once()
+        audit_kwargs = mock_audit.call_args.kwargs
+        assert audit_kwargs["action"] == "initiate"
+        assert audit_kwargs["entity_type"] == "tunnel"
+        new_state = audit_kwargs["new_state"]
+        assert "error" in new_state
+        assert "not currently associated" in new_state["error"]
 
     @pytest.mark.anyio
     @patch("app.services.tunnel_service._read_failover_config_for_control", new_callable=AsyncMock)
@@ -444,7 +458,14 @@ class TestControlTunnel:
         assert "/usr/sbin/swanctl" in cmd
         assert "--initiate" in cmd
         assert "--child daniel-local-test" in cmd
-        assert "--timeout 30" in cmd
+        assert f"--timeout {_SWANCTL_TIMEOUT}" in cmd
+
+        # Wrapper timeout must be passed explicitly and be > swanctl timeout
+        wrapper_timeout = mock_execute.call_args.kwargs.get("timeout")
+        assert wrapper_timeout is not None, "timeout kwarg must be passed to execute_command"
+        assert wrapper_timeout > _SWANCTL_TIMEOUT, (
+            f"wrapper timeout {wrapper_timeout} must be > swanctl --timeout {_SWANCTL_TIMEOUT}"
+        )
 
     @pytest.mark.anyio
     @patch("app.services.tunnel_service._read_failover_config_for_control", new_callable=AsyncMock)
@@ -481,7 +502,12 @@ class TestControlTunnel:
         cmd = called_commands[0]
         assert "--terminate" in cmd
         assert "--ike daniel-local-test" in cmd
-        assert "--timeout 30" in cmd
+        assert f"--timeout {_SWANCTL_TIMEOUT}" in cmd
+
+        # Wrapper timeout must exceed the swanctl --timeout
+        wrapper_timeout = mock_execute.call_args.kwargs.get("timeout")
+        assert wrapper_timeout is not None, "timeout kwarg must be passed to execute_command"
+        assert wrapper_timeout > _SWANCTL_TIMEOUT
 
     @pytest.mark.anyio
     @patch("app.services.tunnel_service._read_failover_config_for_control", new_callable=AsyncMock)
@@ -752,3 +778,128 @@ class TestRBACEnforcement:
             assert "peer not responding" in body["output"]
         finally:
             app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# Timeout — wrapper vs swanctl constant relationship
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutConstants:
+    """Static assertions on the timeout constants used in _control_tunnel."""
+
+    def test_wrapper_timeout_greater_than_swanctl_timeout(self):
+        """_WRAPPER_TIMEOUT must be strictly greater than _SWANCTL_TIMEOUT.
+
+        If they are equal (or the wrapper is smaller), asyncio.wait_for will
+        cut off execute_command before swanctl's own --timeout fires, so the
+        real swanctl output never comes back.
+        """
+        assert _WRAPPER_TIMEOUT > _SWANCTL_TIMEOUT, (
+            f"_WRAPPER_TIMEOUT ({_WRAPPER_TIMEOUT}) must be > "
+            f"_SWANCTL_TIMEOUT ({_SWANCTL_TIMEOUT})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Transport timeout — audit written even when execute_command times out
+# ---------------------------------------------------------------------------
+
+
+class TestAuditOnTimeout:
+    """Audit entry must be written even when execute_command returns a timeout."""
+
+    def _make_session_mock(self, tunnel=None, active_server=None, target_server=None):
+        session = AsyncMock()
+        session.commit = AsyncMock()
+        t = tunnel or _make_tunnel()
+        any_srv = active_server or _make_server()
+        tgt_srv = target_server or _make_server()
+        exec_mock = AsyncMock()
+        scalar_mock = MagicMock()
+        scalar_mock.scalar_one_or_none.side_effect = [t, any_srv, tgt_srv]
+        exec_mock.return_value = scalar_mock
+        session.execute = exec_mock
+        return session, t, any_srv, tgt_srv
+
+    @pytest.mark.anyio
+    @patch("app.services.tunnel_service._read_failover_config_for_control", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service._resolve_active_node", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.execute_command", new_callable=AsyncMock)
+    @patch("app.services.tunnel_service.get_client_for_server")
+    @patch("app.services.tunnel_service.get_settings")
+    @patch("app.services.tunnel_service.audit.log_action", new_callable=AsyncMock)
+    async def test_audit_written_on_transport_timeout(
+        self,
+        mock_audit,
+        mock_settings,
+        mock_get_client,
+        mock_execute,
+        mock_resolve,
+        mock_read_failover,
+    ):
+        """execute_command returns success=False with 'Command timed out' → audit still written."""
+        mock_settings.return_value.strongswan_config_bucket = "test-bucket"
+        mock_read_failover.return_value = FAILOVER_CONFIG
+        mock_resolve.return_value = (PRIMARY_INSTANCE, "primary")
+        mock_execute.return_value = ServerResult(
+            server_id=1,
+            server_name="primary",
+            success=False,
+            error="Command timed out",
+        )
+
+        session, t, any_srv, tgt_srv = self._make_session_mock()
+
+        result = await _control_tunnel(
+            session, 42, action="initiate", user=_make_user(), request=_make_request()
+        )
+
+        # Result exposes the timeout as a failed command
+        assert result["success"] is False
+        assert "timed out" in result["output"]
+
+        # Audit must be written even on timeout
+        mock_audit.assert_called_once()
+        audit_kwargs = mock_audit.call_args.kwargs
+        assert audit_kwargs["action"] == "initiate"
+        new_state = audit_kwargs["new_state"]
+        assert new_state["success"] is False
+        assert "command" in new_state, "new_state must include the command that was run"
+
+
+# ---------------------------------------------------------------------------
+# Migration 0018 — constraint must include initiate and terminate
+# ---------------------------------------------------------------------------
+
+
+class TestMigration0018AuditConstraint:
+    """The ck_audit_action constraint added in 0018 must cover the new action values."""
+
+    def test_migration_includes_initiate_and_terminate(self):
+        """Migration 0018 source must contain 'initiate' and 'terminate' in the constraint."""
+        import pathlib
+
+        mig_path = (
+            pathlib.Path(__file__).parent.parent
+            / "alembic" / "versions" / "0018_add_tunnel_control_audit_actions.py"
+        )
+        assert mig_path.exists(), f"Migration file not found: {mig_path}"
+        source = mig_path.read_text()
+        assert "'initiate'" in source, "Migration 0018 must include 'initiate' in ck_audit_action"
+        assert "'terminate'" in source, "Migration 0018 must include 'terminate' in ck_audit_action"
+
+    def test_migration_preserves_existing_actions(self):
+        """Migration 0018 must preserve all pre-existing allowed action values."""
+        import pathlib
+
+        mig_path = (
+            pathlib.Path(__file__).parent.parent
+            / "alembic" / "versions" / "0018_add_tunnel_control_audit_actions.py"
+        )
+        source = mig_path.read_text()
+        # Every value present in migration 0015's constraint must still be present
+        for existing_action in ("'create'", "'update'", "'delete'", "'retry'", "'login'", "'rotate_psk'"):
+            assert existing_action in source, (
+                f"Migration 0018 must preserve existing action {existing_action}"
+            )

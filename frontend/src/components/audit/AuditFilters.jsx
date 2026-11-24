@@ -31,6 +31,8 @@ const ACTIONS = [
   { value: 'delete', label: 'Delete' },
   { value: 'retry', label: 'Retry' },
   { value: 'login', label: 'Login' },
+  { value: 'initiate', label: 'Initiate' },
+  { value: 'terminate', label: 'Terminate' },
 ]
 
 /** Filter param keys we manage. */
