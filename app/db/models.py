@@ -167,12 +167,19 @@ class Route(TimestampMixin, SoftDeleteMixin, Base):
 
 
 class IPTablesRule(TimestampMixin, SoftDeleteMixin, Base):
-    """Structured iptables rule applied via SSM to VPN instances."""
+    """Structured iptables rule applied via SSM to VPN instances.
+
+    Supports two rule families:
+    - filter (default): chain in INPUT/FORWARD/OUTPUT, action in ACCEPT/DROP/REJECT
+    - nat (SNAT): chain=POSTROUTING, action=SNAT, requires to_source (the public IP)
+    """
 
     __tablename__ = "iptables_rules"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     tunnel_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("tunnels.id"), nullable=False)
+    # iptables table: 'filter' (default) or 'nat' (for SNAT rules).
+    rule_table: Mapped[str] = mapped_column(Text, nullable=False, server_default="filter", default="filter")
     chain: Mapped[str] = mapped_column(Text, nullable=False)
     protocol: Mapped[str] = mapped_column(Text, nullable=False)
     source_cidr: Mapped[str | None] = mapped_column(CIDR, nullable=True)
@@ -180,6 +187,8 @@ class IPTablesRule(TimestampMixin, SoftDeleteMixin, Base):
     sport: Mapped[int | None] = mapped_column(Integer, nullable=True)
     dport: Mapped[int | None] = mapped_column(Integer, nullable=True)
     action: Mapped[str] = mapped_column(Text, nullable=False)
+    # SNAT target IP (--to-source). Required when rule_table='nat', NULL otherwise.
+    to_source: Mapped[str | None] = mapped_column(INET, nullable=True)
     state_match: Mapped[list[str] | None] = mapped_column(ARRAY(Text), nullable=True)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     position: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -191,9 +200,27 @@ class IPTablesRule(TimestampMixin, SoftDeleteMixin, Base):
     tunnel: Mapped[Tunnel] = relationship(back_populates="iptables_rules", lazy="noload")
 
     __table_args__ = (
-        CheckConstraint("chain IN ('INPUT', 'FORWARD', 'OUTPUT')", name="ck_iptables_chain"),
+        CheckConstraint(
+            "rule_table IN ('filter', 'nat')",
+            name="ck_iptables_rule_table",
+        ),
+        CheckConstraint(
+            "chain IN ('INPUT', 'FORWARD', 'OUTPUT', 'POSTROUTING')",
+            name="ck_iptables_chain",
+        ),
         CheckConstraint("protocol IN ('tcp', 'udp', 'icmp', 'all')", name="ck_iptables_protocol"),
-        CheckConstraint("action IN ('ACCEPT', 'DROP', 'REJECT')", name="ck_iptables_action"),
+        CheckConstraint(
+            "action IN ('ACCEPT', 'DROP', 'REJECT', 'SNAT')",
+            name="ck_iptables_action",
+        ),
+        # Consistency: filter rules cannot have to_source; nat/SNAT rules require it.
+        CheckConstraint(
+            "(rule_table = 'filter' AND chain IN ('INPUT', 'FORWARD', 'OUTPUT')"
+            " AND action IN ('ACCEPT', 'DROP', 'REJECT') AND to_source IS NULL)"
+            " OR (rule_table = 'nat' AND chain = 'POSTROUTING'"
+            " AND action = 'SNAT' AND to_source IS NOT NULL)",
+            name="ck_iptables_nat_consistency",
+        ),
         CheckConstraint("sport BETWEEN 1 AND 65535", name="ck_iptables_sport"),
         CheckConstraint("dport BETWEEN 1 AND 65535", name="ck_iptables_dport"),
         CheckConstraint(
@@ -213,12 +240,14 @@ class IPTablesRule(TimestampMixin, SoftDeleteMixin, Base):
         Index(
             "idx_iptables_unique_rule",
             "tunnel_id",
+            "rule_table",
             "chain",
             "protocol",
             "source_cidr",
             "dest_cidr",
             "dport",
             "action",
+            "to_source",
             unique=True,
             postgresql_where=text("deleted_at IS NULL"),
         ),

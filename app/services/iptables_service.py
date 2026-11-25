@@ -18,6 +18,7 @@ from app.services.locks import (
     LOCK_IPTABLES_SECONDARY,
     require_lock,
 )
+from app.services.route_service import _validate_cidr_rules
 from app.services.server_service import execute_on_all_servers
 
 logger = get_logger(__name__)
@@ -28,6 +29,7 @@ def _rule_to_dict(rule: IPTablesRule) -> dict[str, Any]:
     return {
         "id": rule.id,
         "tunnel_id": rule.tunnel_id,
+        "rule_table": rule.rule_table,
         "chain": rule.chain,
         "protocol": rule.protocol,
         "source_cidr": str(rule.source_cidr) if rule.source_cidr else None,
@@ -35,6 +37,7 @@ def _rule_to_dict(rule: IPTablesRule) -> dict[str, Any]:
         "sport": rule.sport,
         "dport": rule.dport,
         "action": rule.action,
+        "to_source": str(rule.to_source) if rule.to_source else None,
         "state_match": list(rule.state_match) if rule.state_match else None,
         "comment": rule.comment,
         "position": rule.position,
@@ -49,11 +52,14 @@ def _rule_to_dict(rule: IPTablesRule) -> dict[str, Any]:
 def build_iptables_command(rule: IPTablesRule, *, delete: bool = False) -> str:
     """Generate an iptables command string from structured rule fields.
 
-    Produces a command like:
-        iptables -A FORWARD -p tcp -s 10.0.0.0/24 -d 172.16.0.0/16 --dport 443 -j ACCEPT
+    For filter rules (default):
+        iptables [-A|-D] CHAIN [-p PROTO] [-s SRC] [-d DST] [--dport N] [-j ACTION]
 
-    Only includes flags for non-null fields. When ``delete=True``, uses
-    ``-D`` instead of ``-A`` so the exact matching rule is removed.
+    For nat/SNAT rules:
+        iptables -t nat [-I|-A|-D] POSTROUTING [-p PROTO] [-s SRC] [-d DST] -j SNAT --to-source IP
+
+    Positional insert (-I) is supported for nat rules when ``position`` is set.
+    Filter rule output is unchanged from the original implementation.
 
     Args:
         rule: The structured IPTablesRule model instance.
@@ -62,8 +68,22 @@ def build_iptables_command(rule: IPTablesRule, *, delete: bool = False) -> str:
     Returns:
         Complete iptables command string safe for SSM execution.
     """
-    action_flag = "-D" if delete else "-A"
-    parts: list[str] = ["iptables", action_flag, rule.chain]
+    rule_table = getattr(rule, "rule_table", "filter") or "filter"
+    is_nat = (rule_table == "nat")
+
+    parts: list[str] = ["iptables"]
+
+    # nat table: add -t nat flag
+    if is_nat:
+        parts.extend(["-t", "nat"])
+
+    # Action flag: delete → -D; nat with position → -I; otherwise → -A
+    if delete:
+        parts.extend(["-D", rule.chain])
+    elif is_nat and rule.position is not None:
+        parts.extend(["-I", rule.chain, str(rule.position)])
+    else:
+        parts.extend(["-A", rule.chain])
 
     if rule.protocol and rule.protocol != "all":
         parts.extend(["-p", rule.protocol])
@@ -86,7 +106,12 @@ def build_iptables_command(rule: IPTablesRule, *, delete: bool = False) -> str:
     if rule.comment:
         parts.extend(["-m", "comment", "--comment", f'"{rule.comment}"'])
 
-    parts.extend(["-j", rule.action])
+    # Target / action
+    if is_nat and rule.action == "SNAT":
+        to_source = getattr(rule, "to_source", None)
+        parts.extend(["-j", "SNAT", "--to-source", str(to_source)])
+    else:
+        parts.extend(["-j", rule.action])
 
     return " ".join(parts)
 
@@ -150,14 +175,15 @@ async def create_rule(
     """Create an iptables rule, apply it via SSM, and persist to DB.
 
     1. Verify tunnel exists and is active.
-    2. Insert rule with sync_status='pending'.
-    3. Build iptables command from structured fields.
-    4. Acquire advisory lock(s) for iptables operations.
-    5. Execute command via SSM on both VPN instances.
-    6. Execute iptables-save via SSM.
-    7. Set sync_status='synced' on success, 'failed' on error.
-    8. Create audit log entry.
-    9. Commit transaction.
+    2. For nat/SNAT rules, validate dest_cidr is inside a tunnel remote_cidr.
+    3. Insert rule with sync_status='pending'.
+    4. Build iptables command from structured fields.
+    5. Acquire advisory lock(s) for iptables operations.
+    6. Execute command via SSM on both VPN instances.
+    7. Execute iptables-save via SSM.
+    8. Set sync_status='synced' on success, 'failed' on error.
+    9. Create audit log entry.
+    10. Commit transaction.
 
     Args:
         session: Active database session.
@@ -171,19 +197,27 @@ async def create_rule(
 
     Raises:
         NotFoundError: If the tunnel does not exist.
-        ValidationError: If the tunnel is not active.
+        ValidationError: If the tunnel is not active, or if dest_cidr is not
+            inside any of the tunnel's remote_cidrs (for SNAT rules).
         LockConflictError: If the iptables lock is held.
     """
-    # Verify tunnel
-    await _get_active_tunnel(session, tunnel_id)
+    # Verify tunnel (capture for SNAT validation)
+    tunnel = await _get_active_tunnel(session, tunnel_id)
+
+    # Validate SNAT dest_cidr against tunnel remote_cidrs
+    rule_table = getattr(data, "rule_table", "filter") or "filter"
+    if rule_table == "nat" and data.dest_cidr is not None:
+        _validate_cidr_rules(tunnel, data.dest_cidr)
 
     # Acquire iptables lock (both instances)
     await require_lock(session, LOCK_IPTABLES_PRIMARY)
     await require_lock(session, LOCK_IPTABLES_SECONDARY)
 
     # Insert rule
+    to_source = getattr(data, "to_source", None)
     rule = IPTablesRule(
         tunnel_id=tunnel_id,
+        rule_table=rule_table,
         chain=data.chain,
         protocol=data.protocol,
         source_cidr=str(data.source_cidr) if data.source_cidr else None,
@@ -191,6 +225,7 @@ async def create_rule(
         sport=data.sport,
         dport=data.dport,
         action=data.action,
+        to_source=str(to_source) if to_source else None,
         state_match=list(data.state_match) if data.state_match else None,
         comment=data.comment,
         position=data.position,
@@ -282,8 +317,8 @@ async def update_rule(
 
     # Determine if structural fields changed (requiring SSM re-apply)
     structural_fields = {
-        "chain", "protocol", "source_cidr", "dest_cidr",
-        "sport", "dport", "action", "state_match", "comment",
+        "rule_table", "chain", "protocol", "source_cidr", "dest_cidr",
+        "sport", "dport", "action", "to_source", "state_match", "comment",
     }
     needs_ssm = bool(structural_fields & set(update_data.keys()))
 
@@ -314,6 +349,8 @@ async def update_rule(
     # Apply updates to DB fields
     for field, value in update_data.items():
         if field in ("source_cidr", "dest_cidr") and value is not None:
+            setattr(rule, field, str(value))
+        elif field == "to_source" and value is not None:
             setattr(rule, field, str(value))
         elif field == "state_match" and value is not None:
             setattr(rule, field, list(value))

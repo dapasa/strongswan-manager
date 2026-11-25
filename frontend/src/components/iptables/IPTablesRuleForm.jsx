@@ -17,14 +17,17 @@ import { useCreateIptablesRule, useUpdateIptablesRule } from '@/hooks/useIptable
 import CommandPreview, { buildCommandString } from './CommandPreview'
 
 const cidrRegex = /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\/(?:3[0-2]|[12]?\d)$/
+const ipv4Regex = /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$/
 
-const CHAINS = ['INPUT', 'FORWARD', 'OUTPUT']
+const FILTER_CHAINS = ['INPUT', 'FORWARD', 'OUTPUT']
 const PROTOCOLS = ['tcp', 'udp', 'icmp', 'all']
-const ACTIONS = ['ACCEPT', 'DROP', 'REJECT']
+const FILTER_ACTIONS = ['ACCEPT', 'DROP', 'REJECT']
 const STATE_OPTIONS = ['NEW', 'ESTABLISHED', 'RELATED', 'INVALID']
 
 const iptablesRuleSchema = z.object({
-  chain: z.enum(['INPUT', 'FORWARD', 'OUTPUT']),
+  rule_type: z.enum(['filter', 'snat']),
+  // filter fields
+  chain: z.enum(['INPUT', 'FORWARD', 'OUTPUT', 'POSTROUTING']),
   protocol: z.enum(['tcp', 'udp', 'icmp', 'all']),
   source_cidr: z
     .string()
@@ -44,7 +47,7 @@ const iptablesRuleSchema = z.object({
     .string()
     .transform((v) => (v === '' ? null : Number(v)))
     .pipe(z.number().int().min(1).max(65535).nullable()),
-  action: z.enum(['ACCEPT', 'DROP', 'REJECT']),
+  action: z.enum(['ACCEPT', 'DROP', 'REJECT', 'SNAT']),
   state_match: z.array(z.enum(['NEW', 'ESTABLISHED', 'RELATED', 'INVALID'])).optional().default([]),
   comment: z
     .string()
@@ -59,15 +62,36 @@ const iptablesRuleSchema = z.object({
     .string()
     .transform((v) => (v === '' ? null : Number(v)))
     .pipe(z.number().int().min(0).nullable()),
-}).refine(
-  (data) => {
-    if ((data.sport != null || data.dport != null) && !['tcp', 'udp'].includes(data.protocol)) {
-      return false
+  // SNAT-only fields
+  to_source: z
+    .string()
+    .regex(ipv4Regex, 'Must be a valid IPv4 address (e.g. 18.213.206.192)')
+    .or(z.literal(''))
+    .transform((v) => v || null),
+}).superRefine((data, ctx) => {
+  if (data.rule_type === 'snat') {
+    if (!data.dest_cidr) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Destination CIDR is required for SNAT', path: ['dest_cidr'] })
     }
-    return true
-  },
-  { message: 'Ports require protocol tcp or udp', path: ['protocol'] }
-)
+    if (!data.to_source) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'SNAT source IP is required', path: ['to_source'] })
+    }
+  } else {
+    // filter: port-protocol consistency
+    if ((data.sport != null || data.dport != null) && !['tcp', 'udp'].includes(data.protocol)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Ports require protocol tcp or udp', path: ['protocol'] })
+    }
+  }
+})
+
+/**
+ * Determine rule_type from an existing rule.
+ * @param {object} rule
+ * @returns {'filter'|'snat'}
+ */
+function ruleTypeFromRule(rule) {
+  return rule?.rule_table === 'nat' ? 'snat' : 'filter'
+}
 
 /**
  * Inline form for creating or editing an iptables rule.
@@ -86,6 +110,7 @@ export default function IPTablesRuleForm({ tunnelId, editRule = null, onClose })
 
   const defaultValues = editRule
     ? {
+        rule_type: ruleTypeFromRule(editRule),
         chain: editRule.chain,
         protocol: editRule.protocol,
         source_cidr: editRule.source_cidr ?? '',
@@ -96,8 +121,10 @@ export default function IPTablesRuleForm({ tunnelId, editRule = null, onClose })
         state_match: editRule.state_match ?? [],
         comment: editRule.comment ?? '',
         position: editRule.position != null ? String(editRule.position) : '',
+        to_source: editRule.to_source ?? '',
       }
     : {
+        rule_type: 'filter',
         chain: 'FORWARD',
         protocol: 'tcp',
         source_cidr: '',
@@ -108,6 +135,7 @@ export default function IPTablesRuleForm({ tunnelId, editRule = null, onClose })
         state_match: [],
         comment: '',
         position: '',
+        to_source: '',
       }
 
   const {
@@ -116,6 +144,7 @@ export default function IPTablesRuleForm({ tunnelId, editRule = null, onClose })
     control,
     watch,
     reset,
+    setValue,
     formState: { errors },
   } = useForm({
     resolver: zodResolver(iptablesRuleSchema),
@@ -123,35 +152,75 @@ export default function IPTablesRuleForm({ tunnelId, editRule = null, onClose })
   })
 
   const watchedValues = watch()
+  const ruleType = watchedValues.rule_type
+  const isSnat = ruleType === 'snat'
+
+  // Build live command preview
   const commandPreview = buildCommandString({
-    chain: watchedValues.chain,
+    rule_table: isSnat ? 'nat' : 'filter',
+    chain: isSnat ? 'POSTROUTING' : watchedValues.chain,
     protocol: watchedValues.protocol,
     source_cidr: watchedValues.source_cidr,
     dest_cidr: watchedValues.dest_cidr,
-    sport: watchedValues.sport ? Number(watchedValues.sport) : null,
-    dport: watchedValues.dport ? Number(watchedValues.dport) : null,
-    action: watchedValues.action,
-    state_match: watchedValues.state_match,
+    sport: !isSnat && watchedValues.sport ? Number(watchedValues.sport) : null,
+    dport: !isSnat && watchedValues.dport ? Number(watchedValues.dport) : null,
+    action: isSnat ? 'SNAT' : watchedValues.action,
+    state_match: !isSnat ? watchedValues.state_match : [],
     comment: watchedValues.comment,
     position: watchedValues.position ? Number(watchedValues.position) : null,
+    to_source: isSnat ? watchedValues.to_source : null,
   })
 
   const protocol = watchedValues.protocol
   const portsDisabled = protocol !== 'tcp' && protocol !== 'udp'
   const mutation = isEdit ? updateMutation : createMutation
 
+  // When rule_type changes, auto-set locked fields for SNAT
+  function handleRuleTypeChange(value) {
+    setValue('rule_type', value)
+    if (value === 'snat') {
+      setValue('chain', 'POSTROUTING')
+      setValue('action', 'SNAT')
+    } else {
+      setValue('chain', 'FORWARD')
+      setValue('action', 'ACCEPT')
+      setValue('to_source', '')
+    }
+  }
+
   async function onSubmit(values) {
-    const payload = {
-      chain: values.chain,
-      protocol: values.protocol,
-      source_cidr: values.source_cidr || null,
-      dest_cidr: values.dest_cidr || null,
-      sport: values.sport,
-      dport: values.dport,
-      action: values.action,
-      state_match: values.state_match?.length > 0 ? values.state_match : null,
-      comment: values.comment || null,
-      position: values.position,
+    let payload
+
+    if (values.rule_type === 'snat') {
+      payload = {
+        rule_table: 'nat',
+        chain: 'POSTROUTING',
+        protocol: values.protocol,
+        action: 'SNAT',
+        source_cidr: values.source_cidr || null,
+        dest_cidr: values.dest_cidr || null,
+        to_source: values.to_source || null,
+        comment: values.comment || null,
+        position: values.position,
+        sport: null,
+        dport: null,
+        state_match: null,
+      }
+    } else {
+      payload = {
+        rule_table: 'filter',
+        chain: values.chain,
+        protocol: values.protocol,
+        source_cidr: values.source_cidr || null,
+        dest_cidr: values.dest_cidr || null,
+        sport: values.sport,
+        dport: values.dport,
+        action: values.action,
+        state_match: values.state_match?.length > 0 ? values.state_match : null,
+        comment: values.comment || null,
+        position: values.position,
+        to_source: null,
+      }
     }
 
     if (isEdit) {
@@ -196,28 +265,53 @@ export default function IPTablesRuleForm({ tunnelId, editRule = null, onClose })
       <CommandPreview command={commandPreview} />
 
       <form onSubmit={handleSubmit(onSubmit)} className="space-y-3">
+        {/* Rule Type selector */}
+        <div className="space-y-1.5">
+          <Label>Rule Type *</Label>
+          <Controller
+            name="rule_type"
+            control={control}
+            render={({ field }) => (
+              <Select
+                value={field.value}
+                onValueChange={(v) => handleRuleTypeChange(v)}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select rule type" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="filter">Filter (INPUT / FORWARD / OUTPUT)</SelectItem>
+                  <SelectItem value="snat">SNAT (nat / POSTROUTING)</SelectItem>
+                </SelectContent>
+              </Select>
+            )}
+          />
+        </div>
+
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {/* Chain */}
-          <div className="space-y-1.5">
-            <Label>Chain *</Label>
-            <Controller
-              name="chain"
-              control={control}
-              render={({ field }) => (
-                <Select value={field.value} onValueChange={field.onChange}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="Select chain" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {CHAINS.map((c) => (
-                      <SelectItem key={c} value={c}>{c}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              )}
-            />
-            {errors.chain && <p className="text-xs text-destructive">{errors.chain.message}</p>}
-          </div>
+          {/* Chain — shown for filter only; auto-locked to POSTROUTING for SNAT */}
+          {!isSnat && (
+            <div className="space-y-1.5">
+              <Label>Chain *</Label>
+              <Controller
+                name="chain"
+                control={control}
+                render={({ field }) => (
+                  <Select value={field.value} onValueChange={field.onChange}>
+                    <SelectTrigger>
+                      <SelectValue placeholder="Select chain" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {FILTER_CHAINS.map((c) => (
+                        <SelectItem key={c} value={c}>{c}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+              />
+              {errors.chain && <p className="text-xs text-destructive">{errors.chain.message}</p>}
+            </div>
+          )}
 
           {/* Protocol */}
           <div className="space-y-1.5">
@@ -241,27 +335,29 @@ export default function IPTablesRuleForm({ tunnelId, editRule = null, onClose })
             {errors.protocol && <p className="text-xs text-destructive">{errors.protocol.message}</p>}
           </div>
 
-          {/* Action */}
-          <div className="space-y-1.5">
-            <Label>Action *</Label>
-            <Controller
-              name="action"
-              control={control}
-              render={({ field }) => (
-                <Select value={field.value} onValueChange={field.onChange}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="Select action" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {ACTIONS.map((a) => (
-                      <SelectItem key={a} value={a}>{a}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              )}
-            />
-            {errors.action && <p className="text-xs text-destructive">{errors.action.message}</p>}
-          </div>
+          {/* Action — shown for filter only; auto-locked to SNAT for nat */}
+          {!isSnat && (
+            <div className="space-y-1.5">
+              <Label>Action *</Label>
+              <Controller
+                name="action"
+                control={control}
+                render={({ field }) => (
+                  <Select value={field.value} onValueChange={field.onChange}>
+                    <SelectTrigger>
+                      <SelectValue placeholder="Select action" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {FILTER_ACTIONS.map((a) => (
+                        <SelectItem key={a} value={a}>{a}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+              />
+              {errors.action && <p className="text-xs text-destructive">{errors.action.message}</p>}
+            </div>
+          )}
 
           {/* Source CIDR */}
           <div className="space-y-1.5">
@@ -276,44 +372,63 @@ export default function IPTablesRuleForm({ tunnelId, editRule = null, onClose })
 
           {/* Destination CIDR */}
           <div className="space-y-1.5">
-            <Label htmlFor="rule-dest">Destination CIDR</Label>
+            <Label htmlFor="rule-dest">
+              Destination CIDR{isSnat ? ' *' : ''}
+            </Label>
             <Input
               id="rule-dest"
-              placeholder="192.168.1.0/24"
+              placeholder={isSnat ? '192.168.50.0/24 (must be in tunnel remote_cidrs)' : '192.168.1.0/24'}
               {...register('dest_cidr')}
             />
             {errors.dest_cidr && <p className="text-xs text-destructive">{errors.dest_cidr.message}</p>}
           </div>
 
-          {/* Source Port */}
-          <div className="space-y-1.5">
-            <Label htmlFor="rule-sport">Source Port</Label>
-            <Input
-              id="rule-sport"
-              type="number"
-              min={1}
-              max={65535}
-              placeholder="Optional"
-              disabled={portsDisabled}
-              {...register('sport')}
-            />
-            {errors.sport && <p className="text-xs text-destructive">{errors.sport.message}</p>}
-          </div>
+          {/* SNAT to-source IP */}
+          {isSnat && (
+            <div className="space-y-1.5">
+              <Label htmlFor="rule-to-source">SNAT to (source IP) *</Label>
+              <Input
+                id="rule-to-source"
+                placeholder="18.213.206.192"
+                {...register('to_source')}
+              />
+              {errors.to_source && <p className="text-xs text-destructive">{errors.to_source.message}</p>}
+            </div>
+          )}
 
-          {/* Destination Port */}
-          <div className="space-y-1.5">
-            <Label htmlFor="rule-dport">Destination Port</Label>
-            <Input
-              id="rule-dport"
-              type="number"
-              min={1}
-              max={65535}
-              placeholder="Optional"
-              disabled={portsDisabled}
-              {...register('dport')}
-            />
-            {errors.dport && <p className="text-xs text-destructive">{errors.dport.message}</p>}
-          </div>
+          {/* Source Port — filter only */}
+          {!isSnat && (
+            <div className="space-y-1.5">
+              <Label htmlFor="rule-sport">Source Port</Label>
+              <Input
+                id="rule-sport"
+                type="number"
+                min={1}
+                max={65535}
+                placeholder="Optional"
+                disabled={portsDisabled}
+                {...register('sport')}
+              />
+              {errors.sport && <p className="text-xs text-destructive">{errors.sport.message}</p>}
+            </div>
+          )}
+
+          {/* Destination Port — filter only */}
+          {!isSnat && (
+            <div className="space-y-1.5">
+              <Label htmlFor="rule-dport">Destination Port</Label>
+              <Input
+                id="rule-dport"
+                type="number"
+                min={1}
+                max={65535}
+                placeholder="Optional"
+                disabled={portsDisabled}
+                {...register('dport')}
+              />
+              {errors.dport && <p className="text-xs text-destructive">{errors.dport.message}</p>}
+            </div>
+          )}
 
           {/* Position */}
           <div className="space-y-1.5">
@@ -328,38 +443,40 @@ export default function IPTablesRuleForm({ tunnelId, editRule = null, onClose })
             {errors.position && <p className="text-xs text-destructive">{errors.position.message}</p>}
           </div>
 
-          {/* State Match */}
-          <div className="space-y-1.5">
-            <Label>State Match</Label>
-            <Controller
-              name="state_match"
-              control={control}
-              render={({ field }) => (
-                <div className="flex flex-wrap gap-2">
-                  {STATE_OPTIONS.map((state) => {
-                    const isChecked = field.value?.includes(state)
-                    return (
-                      <label key={state} className="flex items-center gap-1 text-xs">
-                        <input
-                          type="checkbox"
-                          checked={isChecked}
-                          onChange={(e) => {
-                            if (e.target.checked) {
-                              field.onChange([...(field.value ?? []), state])
-                            } else {
-                              field.onChange((field.value ?? []).filter((s) => s !== state))
-                            }
-                          }}
-                          className="h-3.5 w-3.5 rounded border-input"
-                        />
-                        {state}
-                      </label>
-                    )
-                  })}
-                </div>
-              )}
-            />
-          </div>
+          {/* State Match — filter only */}
+          {!isSnat && (
+            <div className="space-y-1.5">
+              <Label>State Match</Label>
+              <Controller
+                name="state_match"
+                control={control}
+                render={({ field }) => (
+                  <div className="flex flex-wrap gap-2">
+                    {STATE_OPTIONS.map((state) => {
+                      const isChecked = field.value?.includes(state)
+                      return (
+                        <label key={state} className="flex items-center gap-1 text-xs">
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                field.onChange([...(field.value ?? []), state])
+                              } else {
+                                field.onChange((field.value ?? []).filter((s) => s !== state))
+                              }
+                            }}
+                            className="h-3.5 w-3.5 rounded border-input"
+                          />
+                          {state}
+                        </label>
+                      )
+                    })}
+                  </div>
+                )}
+              />
+            </div>
+          )}
         </div>
 
         {/* Comment */}

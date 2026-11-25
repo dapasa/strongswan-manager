@@ -18,6 +18,33 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/api/v1/iptables", tags=["iptables"])
 
 
+def _to_detail(rule: object) -> IPTablesRuleDetail:
+    """Map an IPTablesRule ORM instance to IPTablesRuleDetail."""
+    r = rule  # type: ignore[assignment]
+    return IPTablesRuleDetail(
+        id=r.id,
+        tunnel_id=r.tunnel_id,
+        rule_table=getattr(r, "rule_table", "filter") or "filter",
+        chain=r.chain,
+        protocol=r.protocol,
+        source_cidr=str(r.source_cidr) if r.source_cidr else None,
+        dest_cidr=str(r.dest_cidr) if r.dest_cidr else None,
+        sport=r.sport,
+        dport=r.dport,
+        action=r.action,
+        to_source=str(r.to_source) if r.to_source else None,
+        state_match=list(r.state_match) if r.state_match else None,
+        comment=r.comment,
+        position=r.position,
+        sync_status=r.sync_status,
+        sync_error=r.sync_error,
+        command_preview=build_iptables_command(r),
+        created_by=r.created_by,
+        created_at=r.created_at,
+        updated_at=r.updated_at,
+    )
+
+
 @router.get(
     "/",
     response_model=list[IPTablesRuleDetail],
@@ -30,31 +57,7 @@ async def list_rules(
 ) -> list[IPTablesRuleDetail]:
     """List all active iptables rules with optional tunnel filter."""
     rules = await iptables_service.list_rules(db, tunnel_id=tunnel_id)
-    return [
-        IPTablesRuleDetail(
-            **{
-                "id": r.id,
-                "tunnel_id": r.tunnel_id,
-                "chain": r.chain,
-                "protocol": r.protocol,
-                "source_cidr": str(r.source_cidr) if r.source_cidr else None,
-                "dest_cidr": str(r.dest_cidr) if r.dest_cidr else None,
-                "sport": r.sport,
-                "dport": r.dport,
-                "action": r.action,
-                "state_match": list(r.state_match) if r.state_match else None,
-                "comment": r.comment,
-                "position": r.position,
-                "sync_status": r.sync_status,
-                "sync_error": r.sync_error,
-                "command_preview": build_iptables_command(r),
-                "created_by": r.created_by,
-                "created_at": r.created_at,
-                "updated_at": r.updated_at,
-            }
-        )
-        for r in rules
-    ]
+    return [_to_detail(r) for r in rules]
 
 
 @router.get(
@@ -69,25 +72,7 @@ async def get_rule(
 ) -> IPTablesRuleDetail:
     """Get a single iptables rule with generated command preview."""
     rule = await iptables_service.get_rule(db, rule_id)
-    return IPTablesRuleDetail(
-        id=rule.id,
-        tunnel_id=rule.tunnel_id,
-        chain=rule.chain,
-        protocol=rule.protocol,
-        source_cidr=str(rule.source_cidr) if rule.source_cidr else None,
-        dest_cidr=str(rule.dest_cidr) if rule.dest_cidr else None,
-        sport=rule.sport,
-        dport=rule.dport,
-        action=rule.action,
-        state_match=list(rule.state_match) if rule.state_match else None,
-        comment=rule.comment,
-        position=rule.position,
-        sync_status=rule.sync_status,
-        sync_error=rule.sync_error,
-        command_preview=build_iptables_command(rule),
-        created_at=rule.created_at,
-        updated_at=rule.updated_at,
-    )
+    return _to_detail(rule)
 
 
 @router.post(
@@ -111,25 +96,7 @@ async def create_rule(
         user=current_user,
         request=request,
     )
-    return IPTablesRuleDetail(
-        id=rule.id,
-        tunnel_id=rule.tunnel_id,
-        chain=rule.chain,
-        protocol=rule.protocol,
-        source_cidr=str(rule.source_cidr) if rule.source_cidr else None,
-        dest_cidr=str(rule.dest_cidr) if rule.dest_cidr else None,
-        sport=rule.sport,
-        dport=rule.dport,
-        action=rule.action,
-        state_match=list(rule.state_match) if rule.state_match else None,
-        comment=rule.comment,
-        position=rule.position,
-        sync_status=rule.sync_status,
-        sync_error=rule.sync_error,
-        command_preview=build_iptables_command(rule),
-        created_at=rule.created_at,
-        updated_at=rule.updated_at,
-    )
+    return _to_detail(rule)
 
 
 @router.patch(
@@ -152,25 +119,7 @@ async def update_rule(
         user=current_user,
         request=request,
     )
-    return IPTablesRuleDetail(
-        id=rule.id,
-        tunnel_id=rule.tunnel_id,
-        chain=rule.chain,
-        protocol=rule.protocol,
-        source_cidr=str(rule.source_cidr) if rule.source_cidr else None,
-        dest_cidr=str(rule.dest_cidr) if rule.dest_cidr else None,
-        sport=rule.sport,
-        dport=rule.dport,
-        action=rule.action,
-        state_match=list(rule.state_match) if rule.state_match else None,
-        comment=rule.comment,
-        position=rule.position,
-        sync_status=rule.sync_status,
-        sync_error=rule.sync_error,
-        command_preview=build_iptables_command(rule),
-        created_at=rule.created_at,
-        updated_at=rule.updated_at,
-    )
+    return _to_detail(rule)
 
 
 @router.post(
@@ -191,25 +140,7 @@ async def retry_rule(
         user=current_user,
         request=request,
     )
-    return IPTablesRuleDetail(
-        id=rule.id,
-        tunnel_id=rule.tunnel_id,
-        chain=rule.chain,
-        protocol=rule.protocol,
-        source_cidr=str(rule.source_cidr) if rule.source_cidr else None,
-        dest_cidr=str(rule.dest_cidr) if rule.dest_cidr else None,
-        sport=rule.sport,
-        dport=rule.dport,
-        action=rule.action,
-        state_match=list(rule.state_match) if rule.state_match else None,
-        comment=rule.comment,
-        position=rule.position,
-        sync_status=rule.sync_status,
-        sync_error=rule.sync_error,
-        command_preview=build_iptables_command(rule),
-        created_at=rule.created_at,
-        updated_at=rule.updated_at,
-    )
+    return _to_detail(rule)
 
 
 @router.delete(
