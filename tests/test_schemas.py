@@ -299,6 +299,162 @@ def test_iptables_update_comment_injection():
 
 
 # ---------------------------------------------------------------------------
+# IPTablesRuleCreate — SNAT / nat table
+# ---------------------------------------------------------------------------
+
+
+def test_iptables_snat_valid():
+    from ipaddress import IPv4Address, IPv4Network
+
+    rule = IPTablesRuleCreate(
+        rule_table="nat",
+        chain="POSTROUTING",
+        protocol="all",
+        source_cidr="10.0.0.0/16",
+        dest_cidr="192.168.50.0/24",
+        action="SNAT",
+        to_source="18.213.206.192",
+    )
+    assert rule.rule_table == "nat"
+    assert rule.chain == "POSTROUTING"
+    assert rule.action == "SNAT"
+    assert rule.to_source == IPv4Address("18.213.206.192")
+    assert rule.dest_cidr == IPv4Network("192.168.50.0/24")
+
+
+def test_iptables_snat_missing_dest_cidr():
+    with pytest.raises(ValidationError, match="dest_cidr"):
+        IPTablesRuleCreate(
+            rule_table="nat",
+            chain="POSTROUTING",
+            protocol="all",
+            action="SNAT",
+            to_source="18.213.206.192",
+        )
+
+
+def test_iptables_snat_missing_to_source():
+    with pytest.raises(ValidationError, match="to_source"):
+        IPTablesRuleCreate(
+            rule_table="nat",
+            chain="POSTROUTING",
+            protocol="all",
+            dest_cidr="192.168.50.0/24",
+            action="SNAT",
+        )
+
+
+def test_iptables_snat_wrong_chain():
+    with pytest.raises(ValidationError, match="POSTROUTING"):
+        IPTablesRuleCreate(
+            rule_table="nat",
+            chain="FORWARD",
+            protocol="all",
+            dest_cidr="192.168.50.0/24",
+            action="SNAT",
+            to_source="18.213.206.192",
+        )
+
+
+def test_iptables_snat_wrong_action():
+    with pytest.raises(ValidationError, match="SNAT"):
+        IPTablesRuleCreate(
+            rule_table="nat",
+            chain="POSTROUTING",
+            protocol="all",
+            dest_cidr="192.168.50.0/24",
+            action="ACCEPT",
+            to_source="18.213.206.192",
+        )
+
+
+def test_iptables_snat_disallows_state_match():
+    with pytest.raises(ValidationError, match="state_match"):
+        IPTablesRuleCreate(
+            rule_table="nat",
+            chain="POSTROUTING",
+            protocol="all",
+            dest_cidr="192.168.50.0/24",
+            action="SNAT",
+            to_source="18.213.206.192",
+            state_match=["NEW"],
+        )
+
+
+def test_iptables_snat_disallows_dport():
+    with pytest.raises(ValidationError, match="sport/dport"):
+        IPTablesRuleCreate(
+            rule_table="nat",
+            chain="POSTROUTING",
+            protocol="tcp",
+            dest_cidr="192.168.50.0/24",
+            action="SNAT",
+            to_source="18.213.206.192",
+            dport=443,
+        )
+
+
+def test_iptables_filter_disallows_to_source():
+    with pytest.raises(ValidationError, match="to_source"):
+        IPTablesRuleCreate(
+            rule_table="filter",
+            chain="FORWARD",
+            protocol="tcp",
+            action="ACCEPT",
+            to_source="18.213.206.192",
+        )
+
+
+def test_iptables_filter_default_rule_table():
+    """rule_table defaults to 'filter' when omitted."""
+    rule = IPTablesRuleCreate(
+        chain="INPUT",
+        protocol="all",
+        action="DROP",
+    )
+    assert rule.rule_table == "filter"
+
+
+def test_iptables_snat_to_source_must_be_ipv4_address():
+    """to_source must be an IPv4 host address, not a network."""
+    with pytest.raises(ValidationError):
+        IPTablesRuleCreate(
+            rule_table="nat",
+            chain="POSTROUTING",
+            protocol="all",
+            dest_cidr="192.168.50.0/24",
+            action="SNAT",
+            to_source="not-an-ip",
+        )
+
+
+def test_iptables_snat_with_comment():
+    rule = IPTablesRuleCreate(
+        rule_table="nat",
+        chain="POSTROUTING",
+        protocol="all",
+        dest_cidr="192.168.50.0/24",
+        action="SNAT",
+        to_source="18.213.206.192",
+        comment="Acme tunnel SNAT",
+    )
+    assert rule.comment == "Acme tunnel SNAT"
+
+
+def test_iptables_snat_with_position():
+    rule = IPTablesRuleCreate(
+        rule_table="nat",
+        chain="POSTROUTING",
+        protocol="all",
+        dest_cidr="192.168.50.0/24",
+        action="SNAT",
+        to_source="18.213.206.192",
+        position=1,
+    )
+    assert rule.position == 1
+
+
+# ---------------------------------------------------------------------------
 # PaginationParams
 # ---------------------------------------------------------------------------
 

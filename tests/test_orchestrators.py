@@ -16,8 +16,9 @@ from app.exceptions import ConflictError, NotFoundError
 
 class TestBuildIPTablesCommand:
     def _make_rule(self, **kwargs):
-        """Create a mock IPTablesRule with sensible defaults."""
+        """Create a mock IPTablesRule with sensible defaults (filter table)."""
         defaults = {
+            "rule_table": "filter",
             "chain": "FORWARD",
             "protocol": "tcp",
             "source_cidr": "10.0.0.0/24",
@@ -25,6 +26,29 @@ class TestBuildIPTablesCommand:
             "sport": None,
             "dport": 443,
             "action": "ACCEPT",
+            "to_source": None,
+            "state_match": None,
+            "comment": None,
+            "position": None,
+        }
+        defaults.update(kwargs)
+        rule = MagicMock()
+        for k, v in defaults.items():
+            setattr(rule, k, v)
+        return rule
+
+    def _make_snat_rule(self, **kwargs):
+        """Create a mock IPTablesRule for nat/SNAT."""
+        defaults = {
+            "rule_table": "nat",
+            "chain": "POSTROUTING",
+            "protocol": "all",
+            "source_cidr": "10.0.0.0/16",
+            "dest_cidr": "192.168.50.0/24",
+            "sport": None,
+            "dport": None,
+            "action": "SNAT",
+            "to_source": "18.213.206.192",
             "state_match": None,
             "comment": None,
             "position": None,
@@ -98,6 +122,111 @@ class TestBuildIPTablesCommand:
         assert "-p icmp" in cmd
         assert "--sport" not in cmd
         assert "--dport" not in cmd
+
+    # --- SNAT / nat tests ---
+
+    def test_snat_basic_command(self):
+        from app.services.iptables_service import build_iptables_command
+
+        rule = self._make_snat_rule()
+        cmd = build_iptables_command(rule)
+        assert cmd == (
+            "iptables -t nat -A POSTROUTING -s 10.0.0.0/16 -d 192.168.50.0/24"
+            " -j SNAT --to-source 18.213.206.192"
+        )
+
+    def test_snat_delete_command(self):
+        from app.services.iptables_service import build_iptables_command
+
+        rule = self._make_snat_rule()
+        cmd = build_iptables_command(rule, delete=True)
+        assert cmd == (
+            "iptables -t nat -D POSTROUTING -s 10.0.0.0/16 -d 192.168.50.0/24"
+            " -j SNAT --to-source 18.213.206.192"
+        )
+
+    def test_snat_positional_insert(self):
+        from app.services.iptables_service import build_iptables_command
+
+        rule = self._make_snat_rule(position=1)
+        cmd = build_iptables_command(rule)
+        assert "-t nat -I POSTROUTING 1" in cmd
+        assert "-j SNAT --to-source 18.213.206.192" in cmd
+
+    def test_snat_with_source_cidr_only(self):
+        from app.services.iptables_service import build_iptables_command
+
+        rule = self._make_snat_rule(source_cidr=None)
+        cmd = build_iptables_command(rule)
+        assert "-t nat" in cmd
+        assert " -s " not in cmd
+        assert "-d 192.168.50.0/24" in cmd
+
+    def test_filter_rule_unaffected_by_snat_changes(self):
+        """Filter rules must produce the same output as before SNAT support."""
+        from app.services.iptables_service import build_iptables_command
+
+        rule = self._make_rule()
+        cmd = build_iptables_command(rule)
+        assert cmd == "iptables -A FORWARD -p tcp -s 10.0.0.0/24 -d 192.168.1.0/24 --dport 443 -j ACCEPT"
+        assert "-t nat" not in cmd
+        assert "SNAT" not in cmd
+
+    def test_filter_delete_unaffected(self):
+        from app.services.iptables_service import build_iptables_command
+
+        rule = self._make_rule(source_cidr=None, dest_cidr=None, dport=None, sport=None, protocol="all")
+        cmd = build_iptables_command(rule, delete=True)
+        assert cmd == "iptables -D FORWARD -j ACCEPT"
+        assert "-t nat" not in cmd
+
+
+# ---------------------------------------------------------------------------
+# IPTables service — SNAT dest_cidr validation
+# ---------------------------------------------------------------------------
+
+
+class TestSnatDestCidrValidation:
+    """_validate_cidr_rules is reused from route_service for SNAT rules."""
+
+    def _make_tunnel(self, remote_cidrs: list[str]):
+        tunnel = MagicMock()
+        tunnel.remote_cidrs = remote_cidrs
+        return tunnel
+
+    def test_snat_dest_inside_remote_cidr(self):
+        from app.services.route_service import _validate_cidr_rules
+        from ipaddress import IPv4Network
+
+        tunnel = self._make_tunnel(["192.168.50.0/24"])
+        # Should not raise
+        _validate_cidr_rules(tunnel, IPv4Network("192.168.50.0/24"))
+
+    def test_snat_dest_subnet_of_remote_cidr(self):
+        from app.services.route_service import _validate_cidr_rules
+        from ipaddress import IPv4Network
+
+        tunnel = self._make_tunnel(["192.168.50.0/24"])
+        # Subnet is accepted
+        _validate_cidr_rules(tunnel, IPv4Network("192.168.50.0/26"))
+
+    def test_snat_dest_outside_remote_cidr_raises(self):
+        from app.services.route_service import _validate_cidr_rules
+        from app.exceptions import ValidationError
+        from ipaddress import IPv4Network
+
+        tunnel = self._make_tunnel(["192.168.50.0/24"])
+        with pytest.raises(ValidationError, match="not inside any"):
+            _validate_cidr_rules(tunnel, IPv4Network("10.0.0.0/8"))
+
+    def test_snat_dest_default_route_raises(self):
+        from app.services.route_service import _validate_cidr_rules
+        from app.exceptions import ValidationError
+        from ipaddress import IPv4Network
+
+        tunnel = self._make_tunnel(["192.168.50.0/24"])
+        with pytest.raises(ValidationError, match="prefix length 0"):
+            _validate_cidr_rules(tunnel, IPv4Network("0.0.0.0/0"))
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +410,7 @@ class TestIPTablesServiceCreate:
         user.id = 1
 
         data = MagicMock()
+        data.rule_table = "filter"
         data.chain = "FORWARD"
         data.protocol = "tcp"
         data.source_cidr = None
@@ -288,6 +418,7 @@ class TestIPTablesServiceCreate:
         data.sport = None
         data.dport = 443
         data.action = "ACCEPT"
+        data.to_source = None
         data.state_match = None
         data.comment = None
         data.position = None
@@ -336,6 +467,7 @@ class TestIPTablesServiceRetry:
         rule = MagicMock()
         rule.id = 1
         rule.sync_status = "failed"
+        rule.rule_table = "filter"
         rule.chain = "FORWARD"
         rule.protocol = "tcp"
         rule.source_cidr = None
@@ -343,6 +475,7 @@ class TestIPTablesServiceRetry:
         rule.sport = None
         rule.dport = 443
         rule.action = "ACCEPT"
+        rule.to_source = None
         rule.state_match = None
         rule.comment = None
         rule.position = None

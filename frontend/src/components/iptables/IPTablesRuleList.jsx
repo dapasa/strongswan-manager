@@ -111,11 +111,12 @@ export default function IPTablesRuleList({ tunnelId }) {
             <Table>
               <TableHeader>
                 <TableRow>
+                  <TableHead>Table</TableHead>
                   <TableHead>Chain</TableHead>
                   <TableHead>Protocol</TableHead>
                   <TableHead>Source</TableHead>
                   <TableHead>Destination</TableHead>
-                  <TableHead>Port</TableHead>
+                  <TableHead>Port / Target</TableHead>
                   <TableHead>Action</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead>Command</TableHead>
@@ -125,6 +126,11 @@ export default function IPTablesRuleList({ tunnelId }) {
               <TableBody>
                 {data.map((rule) => (
                   <TableRow key={rule.id}>
+                    <TableCell className="font-mono text-xs">
+                      <Badge variant={rule.rule_table === 'nat' ? 'secondary' : 'outline'}>
+                        {rule.rule_table ?? 'filter'}
+                      </Badge>
+                    </TableCell>
                     <TableCell className="font-mono text-xs">{rule.chain}</TableCell>
                     <TableCell className="text-sm">{rule.protocol}</TableCell>
                     <TableCell className="font-mono text-xs">
@@ -134,11 +140,18 @@ export default function IPTablesRuleList({ tunnelId }) {
                       {rule.dest_cidr ?? '-'}
                     </TableCell>
                     <TableCell className="font-mono text-xs">
-                      {rule.dport ?? rule.sport ?? '-'}
-                      {rule.sport && rule.dport ? ` (s:${rule.sport} d:${rule.dport})` : ''}
+                      {rule.rule_table === 'nat'
+                        ? (rule.to_source ? `→ ${rule.to_source}` : '-')
+                        : (
+                            <>
+                              {rule.dport ?? rule.sport ?? '-'}
+                              {rule.sport && rule.dport ? ` (s:${rule.sport} d:${rule.dport})` : ''}
+                            </>
+                          )
+                      }
                     </TableCell>
                     <TableCell>
-                      <Badge variant={rule.action === 'ACCEPT' ? 'success' : rule.action === 'DROP' ? 'error' : 'warning'}>
+                      <Badge variant={rule.action === 'ACCEPT' ? 'success' : rule.action === 'DROP' ? 'error' : rule.action === 'SNAT' ? 'secondary' : 'warning'}>
                         {rule.action}
                       </Badge>
                     </TableCell>

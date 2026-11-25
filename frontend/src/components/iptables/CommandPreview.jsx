@@ -10,20 +10,48 @@
 /**
  * Build an iptables command string from rule fields.
  *
- * @param {{ chain?: string, protocol?: string, source_cidr?: string, dest_cidr?: string, sport?: number, dport?: number, action?: string, state_match?: string[], comment?: string, position?: number }} values
+ * Supports both filter rules (filter table) and nat/SNAT rules (nat table).
+ *
+ * @param {{
+ *   rule_table?: string,
+ *   chain?: string,
+ *   protocol?: string,
+ *   source_cidr?: string,
+ *   dest_cidr?: string,
+ *   sport?: number,
+ *   dport?: number,
+ *   action?: string,
+ *   to_source?: string,
+ *   state_match?: string[],
+ *   comment?: string,
+ *   position?: number,
+ * }} values
  * @returns {string}
  */
 export function buildCommandString(values) {
   if (!values) return ''
 
-  const parts = ['iptables']
-
   const chain = values.chain
   if (!chain) return ''
 
-  // Use -I with position or -A (append)
-  if (values.position != null && values.position >= 0) {
-    parts.push(`-I ${chain} ${values.position}`)
+  const isNat = values.rule_table === 'nat'
+
+  const parts = ['iptables']
+
+  // nat table flag
+  if (isNat) {
+    parts.push('-t nat')
+  }
+
+  // Use -I with position or -A (append); nat supports positional insert
+  if (values.position != null && values.position >= 0 && (isNat || !isNat)) {
+    // For nat rules: -I POSTROUTING <pos>
+    // For filter rules: keep existing behavior (-A, position ignored in backend)
+    if (isNat) {
+      parts.push(`-I ${chain} ${values.position}`)
+    } else {
+      parts.push(`-I ${chain} ${values.position}`)
+    }
   } else {
     parts.push(`-A ${chain}`)
   }
@@ -40,23 +68,29 @@ export function buildCommandString(values) {
     parts.push(`-d ${values.dest_cidr}`)
   }
 
-  if (values.sport) {
-    parts.push(`--sport ${values.sport}`)
-  }
+  // sport/dport only for filter rules
+  if (!isNat) {
+    if (values.sport) {
+      parts.push(`--sport ${values.sport}`)
+    }
 
-  if (values.dport) {
-    parts.push(`--dport ${values.dport}`)
-  }
+    if (values.dport) {
+      parts.push(`--dport ${values.dport}`)
+    }
 
-  if (values.state_match?.length > 0) {
-    parts.push(`-m state --state ${values.state_match.join(',')}`)
+    if (values.state_match?.length > 0) {
+      parts.push(`-m state --state ${values.state_match.join(',')}`)
+    }
   }
 
   if (values.comment) {
     parts.push(`-m comment --comment "${values.comment}"`)
   }
 
-  if (values.action) {
+  // Target action
+  if (isNat && values.action === 'SNAT' && values.to_source) {
+    parts.push(`-j SNAT --to-source ${values.to_source}`)
+  } else if (values.action) {
     parts.push(`-j ${values.action}`)
   }
 

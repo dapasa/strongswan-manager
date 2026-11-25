@@ -85,6 +85,7 @@ class TestIPTablesRouter:
         rule = MagicMock()
         rule.id = 1
         rule.tunnel_id = 10
+        rule.rule_table = "filter"
         rule.chain = "FORWARD"
         rule.protocol = "tcp"
         rule.source_cidr = "10.0.0.0/24"
@@ -92,6 +93,7 @@ class TestIPTablesRouter:
         rule.sport = None
         rule.dport = 443
         rule.action = "ACCEPT"
+        rule.to_source = None
         rule.state_match = None
         rule.comment = None
         rule.position = None
@@ -110,6 +112,7 @@ class TestIPTablesRouter:
         data = resp.json()
         assert data["chain"] == "FORWARD"
         assert data["dport"] == 443
+        assert data["rule_table"] == "filter"
         assert "command_preview" in data
         assert "iptables -A FORWARD" in data["command_preview"]
 
@@ -119,6 +122,7 @@ class TestIPTablesRouter:
         rule = MagicMock()
         rule.id = 1
         rule.tunnel_id = 5
+        rule.rule_table = "filter"
         rule.chain = "FORWARD"
         rule.protocol = "tcp"
         rule.source_cidr = None
@@ -126,6 +130,7 @@ class TestIPTablesRouter:
         rule.sport = None
         rule.dport = 80
         rule.action = "ACCEPT"
+        rule.to_source = None
         rule.state_match = None
         rule.comment = None
         rule.position = None
@@ -166,6 +171,7 @@ class TestIPTablesRouter:
         rule = MagicMock()
         rule.id = 1
         rule.tunnel_id = 5
+        rule.rule_table = "filter"
         rule.chain = "INPUT"
         rule.protocol = "tcp"
         rule.source_cidr = None
@@ -173,6 +179,7 @@ class TestIPTablesRouter:
         rule.sport = None
         rule.dport = 8080
         rule.action = "ACCEPT"
+        rule.to_source = None
         rule.state_match = None
         rule.comment = None
         rule.position = None
@@ -192,6 +199,57 @@ class TestIPTablesRouter:
 
         assert resp.status_code == 200
         assert resp.json()["chain"] == "INPUT"
+
+    @patch("app.services.iptables_service.create_rule", new_callable=AsyncMock)
+    async def test_create_snat_rule_returns_201(self, mock_create):
+        """POST /api/v1/iptables/?tunnel_id=5 with a nat/SNAT payload → 201."""
+        now = datetime.now(timezone.utc)
+        rule = MagicMock()
+        rule.id = 10
+        rule.tunnel_id = 5
+        rule.rule_table = "nat"
+        rule.chain = "POSTROUTING"
+        rule.protocol = "all"
+        rule.source_cidr = "10.0.0.0/16"
+        rule.dest_cidr = "192.168.50.0/24"
+        rule.sport = None
+        rule.dport = None
+        rule.action = "SNAT"
+        rule.to_source = "18.213.206.192"
+        rule.state_match = None
+        rule.comment = None
+        rule.position = None
+        rule.sync_status = "synced"
+        rule.sync_error = None
+        rule.created_by = 1
+        rule.created_at = now
+        rule.updated_at = now
+        mock_create.return_value = rule
+
+        client = await _get_client()
+        async with client:
+            resp = await client.post(
+                "/api/v1/iptables/?tunnel_id=5",
+                json={
+                    "rule_table": "nat",
+                    "chain": "POSTROUTING",
+                    "protocol": "all",
+                    "source_cidr": "10.0.0.0/16",
+                    "dest_cidr": "192.168.50.0/24",
+                    "action": "SNAT",
+                    "to_source": "18.213.206.192",
+                },
+            )
+
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["rule_table"] == "nat"
+        assert data["chain"] == "POSTROUTING"
+        assert data["action"] == "SNAT"
+        assert data["to_source"] == "18.213.206.192"
+        assert "command_preview" in data
+        assert "-t nat" in data["command_preview"]
+        assert "--to-source 18.213.206.192" in data["command_preview"]
 
     async def test_viewer_cannot_create_rule(self):
         viewer = _make_mock_user(role="viewer")

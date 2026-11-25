@@ -173,6 +173,7 @@ class TestOperatorIPTablesAccess:
         mock_rule = MagicMock()
         mock_rule.id = 1
         mock_rule.tunnel_id = 1
+        mock_rule.rule_table = "filter"
         mock_rule.chain = "FORWARD"
         mock_rule.protocol = "tcp"
         mock_rule.source_cidr = "10.0.0.0/24"
@@ -180,6 +181,7 @@ class TestOperatorIPTablesAccess:
         mock_rule.sport = None
         mock_rule.dport = 443
         mock_rule.action = "ACCEPT"
+        mock_rule.to_source = None
         mock_rule.state_match = None
         mock_rule.comment = "test rule"
         mock_rule.position = None
@@ -211,6 +213,7 @@ class TestOperatorIPTablesAccess:
         mock_rule = MagicMock()
         mock_rule.id = 1
         mock_rule.tunnel_id = 1
+        mock_rule.rule_table = "filter"
         mock_rule.chain = "FORWARD"
         mock_rule.protocol = "tcp"
         mock_rule.source_cidr = None
@@ -218,6 +221,7 @@ class TestOperatorIPTablesAccess:
         mock_rule.sport = None
         mock_rule.dport = 8080
         mock_rule.action = "ACCEPT"
+        mock_rule.to_source = None
         mock_rule.state_match = None
         mock_rule.comment = "updated"
         mock_rule.position = None
@@ -252,6 +256,7 @@ class TestOperatorIPTablesAccess:
         mock_rule = MagicMock()
         mock_rule.id = 1
         mock_rule.tunnel_id = 1
+        mock_rule.rule_table = "filter"
         mock_rule.chain = "FORWARD"
         mock_rule.protocol = "tcp"
         mock_rule.source_cidr = None
@@ -259,6 +264,7 @@ class TestOperatorIPTablesAccess:
         mock_rule.sport = None
         mock_rule.dport = 443
         mock_rule.action = "ACCEPT"
+        mock_rule.to_source = None
         mock_rule.state_match = None
         mock_rule.comment = None
         mock_rule.position = None
