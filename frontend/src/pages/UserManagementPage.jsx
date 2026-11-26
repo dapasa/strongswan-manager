@@ -2,10 +2,20 @@ import { useState } from 'react'
 import { Users } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
 import { useUsers, useUpdateUser, useRevokeUserSessions } from '@/hooks/useUsers'
+import { useUserPermissions, useSetUserPermissions } from '@/hooks/usePermissions'
 import ConfirmDialog from '@/components/shared/ConfirmDialog'
 import EmptyState from '@/components/shared/EmptyState'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Select,
@@ -28,6 +38,132 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+
+const TIER1_KEYS = [
+  'tunnels.write',
+  'tunnels.connect',
+  'tunnels.psk',
+  'routes.write',
+  'iptables.filter',
+  'iptables.snat',
+]
+
+/**
+ * Dialog for editing a single operator user's Tier 1 permissions and Shortcut member ID.
+ */
+function PermissionsDialog({ user, open, onOpenChange }) {
+  const permsQuery = useUserPermissions(user?.id, { enabled: open })
+  const setPerms = useSetUserPermissions()
+  const updateUser = useUpdateUser()
+
+  // Local state mirrors the loaded permissions once available
+  const [checkedKeys, setCheckedKeys] = useState(null)
+  const [shortcutId, setShortcutId] = useState(null)
+
+  // Sync local state when query data arrives (and dialog opens fresh)
+  const loaded = permsQuery.data
+  if (loaded && checkedKeys === null) {
+    setCheckedKeys(new Set(loaded.permissions ?? []))
+  }
+  if (user && shortcutId === null) {
+    setShortcutId(user.shortcut_member_id ?? '')
+  }
+
+  function handleOpenChange(next) {
+    if (!next) {
+      // Reset local state so next open starts fresh
+      setCheckedKeys(null)
+      setShortcutId(null)
+    }
+    onOpenChange(next)
+  }
+
+  function toggleKey(key) {
+    setCheckedKeys((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  async function handleSave() {
+    const userId = user.id
+    const permsSave = setPerms.mutateAsync({ userId, permissions: [...(checkedKeys ?? [])] })
+    const idChanged = shortcutId !== (user.shortcut_member_id ?? '')
+    const idSave = idChanged
+      ? updateUser.mutateAsync({ id: userId, data: { shortcut_member_id: shortcutId || null } })
+      : Promise.resolve()
+    await Promise.all([permsSave, idSave])
+    handleOpenChange(false)
+  }
+
+  const isSaving = setPerms.isPending || updateUser.isPending
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent className="max-w-sm">
+        <DialogHeader>
+          <DialogTitle>Permissions — {user?.display_name || user?.email}</DialogTitle>
+        </DialogHeader>
+
+        {permsQuery.isLoading && (
+          <div className="space-y-2 py-2">
+            {[...Array(6)].map((_, i) => <Skeleton key={i} className="h-5 w-full" />)}
+          </div>
+        )}
+
+        {!permsQuery.isLoading && (
+          <div className="space-y-4 py-1">
+            {/* Tier 1 checkboxes */}
+            <div className="space-y-2">
+              <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                Tier 1 Permissions
+              </p>
+              {TIER1_KEYS.map((key) => (
+                <label
+                  key={key}
+                  className="flex items-center gap-2 cursor-pointer select-none"
+                >
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 rounded border-input"
+                    checked={checkedKeys?.has(key) ?? false}
+                    onChange={() => toggleKey(key)}
+                  />
+                  <span className="text-sm font-mono">{key}</span>
+                </label>
+              ))}
+            </div>
+
+            {/* Shortcut member ID */}
+            <div className="space-y-1.5">
+              <Label htmlFor="shortcut-member-id">Shortcut Member ID</Label>
+              <Input
+                id="shortcut-member-id"
+                placeholder="e.g. 5d4a3b2c1e0f..."
+                value={shortcutId ?? ''}
+                onChange={(e) => setShortcutId(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                Required to link Tier 2 access requests to this user's Shortcut account.
+              </p>
+            </div>
+          </div>
+        )}
+
+        <DialogFooter>
+          <Button variant="outline" onClick={() => handleOpenChange(false)} disabled={isSaving}>
+            Cancel
+          </Button>
+          <Button onClick={handleSave} disabled={isSaving || permsQuery.isLoading}>
+            {isSaving ? 'Saving…' : 'Save'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
 
 const ROLES = ['admin', 'operator', 'viewer']
 
@@ -93,6 +229,9 @@ export default function UserManagementPage() {
     variant: 'default',
     onConfirm: () => {},
   })
+
+  // Permissions dialog state
+  const [permDialogUser, setPermDialogUser] = useState(null)
 
   const isSelf = (userId) => currentUser?.id === userId
 
@@ -302,7 +441,15 @@ export default function UserManagementPage() {
                               </Button>
                             </>
                           )}
-
+                          {user.role === 'operator' && (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => setPermDialogUser(user)}
+                            >
+                              Permissions
+                            </Button>
+                          )}
                         </div>
                       </TableCell>
                     </TableRow>
@@ -329,6 +476,15 @@ export default function UserManagementPage() {
         onConfirm={confirmDialog.onConfirm}
         loading={updateUser.isPending}
       />
+
+      {/* Permissions dialog */}
+      {permDialogUser && (
+        <PermissionsDialog
+          user={permDialogUser}
+          open={!!permDialogUser}
+          onOpenChange={(open) => { if (!open) setPermDialogUser(null) }}
+        />
+      )}
     </div>
   )
 }

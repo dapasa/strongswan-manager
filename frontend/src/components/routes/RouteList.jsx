@@ -17,7 +17,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import RoleGuard from '@/components/shared/RoleGuard'
+import PermGuard from '@/components/shared/PermGuard'
 import ConfirmDialog from '@/components/shared/ConfirmDialog'
 import EmptyState from '@/components/shared/EmptyState'
 import { useRoutes, useCreateRoute, useDeleteRoute, useRetryRoute } from '@/hooks/useRoutes'
@@ -261,7 +261,7 @@ export default function RouteList({ tunnelId, remoteCidrs }) {
     <Card className="bg-surface border-surface-border">
       <CardHeader className="flex flex-row items-center justify-between space-y-0">
         <CardTitle>Routes ({data.length})</CardTitle>
-        <RoleGuard requiredRole="operator">
+        <PermGuard permKey="routes.write">
           <Button
             variant="outline"
             size="sm"
@@ -273,7 +273,7 @@ export default function RouteList({ tunnelId, remoteCidrs }) {
               : <Plus className="h-3.5 w-3.5" />}
             {showAddForm ? 'Cancel' : 'Add Route'}
           </Button>
-        </RoleGuard>
+        </PermGuard>
       </CardHeader>
       <CardContent>
         {showAddForm && (
@@ -322,7 +322,7 @@ export default function RouteList({ tunnelId, remoteCidrs }) {
                       {route.target_eni ?? '—'}
                     </TableCell>
                     <TableCell className="text-right">
-                      <RoleGuard requiredRole="operator">
+                      <PermGuard permKey="routes.write">
                         <div className="flex items-center justify-end gap-1">
                           {route.sync_status === 'failed' && (
                             <Button
@@ -349,7 +349,7 @@ export default function RouteList({ tunnelId, remoteCidrs }) {
                             <Trash2 className="h-4 w-4" />
                           </Button>
                         </div>
-                      </RoleGuard>
+                      </PermGuard>
                     </TableCell>
                   </TableRow>
                 ))}

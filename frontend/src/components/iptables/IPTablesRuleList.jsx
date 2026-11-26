@@ -12,7 +12,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import RoleGuard from '@/components/shared/RoleGuard'
+import PermGuard, { useHasPerm } from '@/components/shared/PermGuard'
 import ConfirmDialog from '@/components/shared/ConfirmDialog'
 import EmptyState from '@/components/shared/EmptyState'
 import { useIptablesRules, useDeleteIptablesRule, useRetryIptablesRule } from '@/hooks/useIptablesRules'
@@ -41,6 +41,8 @@ export default function IPTablesRuleList({ tunnelId }) {
   const retryMutation = useRetryIptablesRule(tunnelId)
   const [deleteTarget, setDeleteTarget] = useState(null)
   const [editTarget, setEditTarget] = useState(null)
+  const hasFilter = useHasPerm('iptables.filter')
+  const hasSnat = useHasPerm('iptables.snat')
 
   async function handleDelete() {
     if (!deleteTarget) return
@@ -85,9 +87,9 @@ export default function IPTablesRuleList({ tunnelId }) {
     <Card className="bg-surface border-surface-border">
       <CardHeader className="flex flex-row items-center justify-between space-y-0">
         <CardTitle>IPTables Rules ({data.length})</CardTitle>
-        <RoleGuard requiredRole="operator">
-          {!editTarget && <IPTablesRuleForm tunnelId={tunnelId} />}
-        </RoleGuard>
+        {(hasFilter || hasSnat) && !editTarget && (
+          <IPTablesRuleForm tunnelId={tunnelId} />
+        )}
       </CardHeader>
       <CardContent>
         {editTarget && (
@@ -171,7 +173,7 @@ export default function IPTablesRuleList({ tunnelId }) {
                       )}
                     </TableCell>
                     <TableCell className="text-right">
-                      <RoleGuard requiredRole="operator">
+                      <PermGuard permKey={rule.action === 'SNAT' ? 'iptables.snat' : 'iptables.filter'}>
                         <div className="flex items-center justify-end gap-1">
                           <Button
                             variant="ghost"
@@ -204,7 +206,7 @@ export default function IPTablesRuleList({ tunnelId }) {
                             <Trash2 className="h-4 w-4" />
                           </Button>
                         </div>
-                      </RoleGuard>
+                      </PermGuard>
                     </TableCell>
                   </TableRow>
                 ))}

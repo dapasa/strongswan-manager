@@ -176,17 +176,20 @@ async def create_access_request(
 @router.get(
     "/",
     response_model=list[AccessRequestDetail],
-    summary="List current user's access requests",
+    summary="List access requests",
 )
 async def list_access_requests(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[AccessRequestDetail]:
-    """Return all Tier 2 access requests submitted by the current user, newest first."""
-    result = await db.execute(
-        select(AccessRequest)
-        .where(AccessRequest.user_id == current_user.id)
-        .order_by(AccessRequest.id.desc())
-    )
+    """Return Tier 2 access requests, newest first.
+
+    Admin users see all requests across all users.
+    Non-admin users see only their own requests.
+    """
+    query = select(AccessRequest).order_by(AccessRequest.id.desc())
+    if current_user.role != "admin":
+        query = query.where(AccessRequest.user_id == current_user.id)
+    result = await db.execute(query)
     requests = result.scalars().all()
     return [AccessRequestDetail.from_orm_with_hours(r) for r in requests]

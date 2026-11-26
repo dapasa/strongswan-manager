@@ -1,5 +1,5 @@
 import { NavLink, useLocation } from 'react-router-dom'
-import { LayoutDashboard, Network, Server, ScrollText, Users, Shield } from 'lucide-react'
+import { LayoutDashboard, Network, Server, ScrollText, ShieldCheck, Users, Shield } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import RoleGuard from '@/components/shared/RoleGuard'
 import { Separator } from '@/components/ui/separator'
@@ -9,6 +9,10 @@ const navItems = [
   { to: '/tunnels', label: 'Tunnels', icon: Network },
   { to: '/servers', label: 'Servers', icon: Server },
   { to: '/audit', label: 'Audit Log', icon: ScrollText },
+]
+
+const operatorItems = [
+  { to: '/elevated-access', label: 'Elevated Access', icon: ShieldCheck },
 ]
 
 const adminItems = [
@@ -47,6 +51,13 @@ export default function Sidebar({ className, onNavigate }) {
         {navItems.map((item) => (
           <SidebarLink key={item.to} item={item} onNavigate={onNavigate} />
         ))}
+
+        <RoleGuard requiredRole="operator">
+          <Separator className="my-2 bg-sidebar-border" />
+          {operatorItems.map((item) => (
+            <SidebarLink key={item.to} item={item} onNavigate={onNavigate} />
+          ))}
+        </RoleGuard>
 
         <RoleGuard requiredRole="admin">
           <Separator className="my-2 bg-sidebar-border" />

@@ -14,6 +14,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useCreateIptablesRule, useUpdateIptablesRule } from '@/hooks/useIptablesRules'
+import { useHasPerm } from '@/components/shared/PermGuard'
 import CommandPreview, { buildCommandString } from './CommandPreview'
 
 const cidrRegex = /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\/(?:3[0-2]|[12]?\d)$/
@@ -106,6 +107,7 @@ export default function IPTablesRuleForm({ tunnelId, editRule = null, onClose })
   const [expanded, setExpanded] = useState(!!editRule)
   const createMutation = useCreateIptablesRule(tunnelId)
   const updateMutation = useUpdateIptablesRule(tunnelId)
+  const hasSnat = useHasPerm('iptables.snat')
   const isEdit = !!editRule
 
   const defaultValues = editRule
@@ -281,7 +283,7 @@ export default function IPTablesRuleForm({ tunnelId, editRule = null, onClose })
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="filter">Filter (INPUT / FORWARD / OUTPUT)</SelectItem>
-                  <SelectItem value="snat">SNAT (nat / POSTROUTING)</SelectItem>
+                  {hasSnat && <SelectItem value="snat">SNAT (nat / POSTROUTING)</SelectItem>}
                 </SelectContent>
               </Select>
             )}
