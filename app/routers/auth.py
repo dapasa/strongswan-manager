@@ -4,18 +4,19 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
 from app.auth.local import create_access_token, verify_password
 from app.config import get_settings
-from app.db.models import User
+from app.db.models import TIER1_PERMISSION_KEYS, User
 from app.db.session import get_db
 from app.exceptions import AuthenticationError
 from app.logging_config import get_logger
-from app.schemas.user import UserDetail
+from app.schemas.user import UserDetail, UserProfile
 from app.services import audit, user_service
+from app.services import permissions as perm_service
 
 logger = get_logger(__name__)
 
@@ -81,7 +82,6 @@ async def login(
     token = create_access_token(user_id=user.id, sub=user.sub, role=user.role)
 
     # Update last_login_at
-    from sqlalchemy import func
     user.last_login_at = func.now()
 
     # Audit the successful login
@@ -103,14 +103,35 @@ async def login(
 
 @router.get(
     "/me",
-    response_model=UserDetail,
-    summary="Get current user profile",
+    response_model=UserProfile,
+    summary="Get current user profile with effective permissions",
 )
 async def get_me(
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
-) -> UserDetail:
-    """Return the profile of the currently authenticated user."""
-    return UserDetail.model_validate(current_user)
+) -> UserProfile:
+    """Return the profile of the currently authenticated user.
+
+    Includes ``tier1_permissions`` (Tier 1 grants) and ``active_tier2``
+    (active Tier 2 grants, not expired) so the UI can hide/disable buttons.
+    """
+    # Tier 1
+    if current_user.role == "admin":
+        tier1 = list(TIER1_PERMISSION_KEYS)
+    elif current_user.role == "operator":
+        tier1 = await perm_service.get_user_permission_keys(db, current_user.id)
+    else:
+        tier1 = []
+
+    # Tier 2
+    active_tier2 = await perm_service.get_active_tier2_permission_keys(db, current_user.id)
+
+    profile = UserProfile(
+        **UserDetail.model_validate(current_user).model_dump(),
+        tier1_permissions=tier1,
+        active_tier2=active_tier2,
+    )
+    return profile
 
 
 @router.post(

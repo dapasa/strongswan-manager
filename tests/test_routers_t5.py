@@ -26,6 +26,7 @@ def _make_mock_user(role: str = "admin") -> User:
     user.is_active = True
     user.last_login_at = None
     user.created_at = datetime.now(timezone.utc)
+    user.shortcut_member_id = None
     return user
 
 
@@ -37,7 +38,14 @@ async def _get_client(user: MagicMock | None = None) -> httpx.AsyncClient:
     mock_user = user or _make_mock_user()
 
     async def _override_get_db():
-        yield AsyncMock()
+        # Configure execute result so .scalars().all() returns [] and
+        # .scalar_one_or_none() returns a truthy value (operator permission check).
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = MagicMock()
+        mock_result.scalars.return_value.all.return_value = []
+        db = AsyncMock()
+        db.execute = AsyncMock(return_value=mock_result)
+        yield db
 
     async def _override_get_current_user():
         return mock_user

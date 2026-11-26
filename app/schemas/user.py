@@ -25,8 +25,24 @@ class UserDetail(BaseModel):
     is_active: bool
     last_login_at: datetime | None = None
     created_at: datetime
+    shortcut_member_id: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class UserProfile(UserDetail):
+    """Extended user representation for /me — includes effective permissions.
+
+    tier1_permissions: Tier 1 permission keys the user holds.
+      - admin: all keys (populated server-side, no DB query needed).
+      - operator: only the keys explicitly granted.
+      - viewer: empty list.
+
+    active_tier2: Tier 2 permission keys with an active, non-expired grant.
+    """
+
+    tier1_permissions: list[str] = Field(default_factory=list)
+    active_tier2: list[str] = Field(default_factory=list)
 
 
 class UserCreate(BaseModel):
@@ -38,10 +54,30 @@ class UserCreate(BaseModel):
 
 
 class UserUpdate(BaseModel):
-    """Schema for updating user role/status (admin only)."""
+    """Schema for updating user role/status/shortcut_member_id (admin only)."""
 
     role: str | None = Field(None, pattern="^(admin|operator|viewer)$", description="User role")
     is_active: bool | None = None
+    shortcut_member_id: str | None = None
+
+
+class UserPermissionsUpdate(BaseModel):
+    """Schema for setting the full Tier 1 permission set for a user (admin only)."""
+
+    permissions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Full list of Tier 1 permission keys to grant. Unknown keys are ignored. "
+            "Pass an empty list to revoke all permissions."
+        ),
+    )
+
+
+class UserPermissionsResponse(BaseModel):
+    """Response for GET/PUT /users/{id}/permissions."""
+
+    user_id: int
+    permissions: list[str]
 
 
 class UserListResponse(BaseModel):

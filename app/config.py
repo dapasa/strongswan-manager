@@ -5,7 +5,7 @@ from typing import Annotated
 
 import boto3
 from botocore.exceptions import ClientError
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -181,6 +181,90 @@ class Settings(BaseSettings):
 
     # CORS
     cors_origins: list[str] = Field(default=["http://localhost:3000"])
+
+    # ---------------------------------------------------------------------------
+    # Tier 2 — Shortcut-based access request flow
+    # ---------------------------------------------------------------------------
+    # Tier 2 is enabled when at least one of these is set:
+    #   • SHORTCUT_API_TOKEN (env var, local dev)
+    #   • SHORTCUT_TOKEN_SECRET_ARN (AWS Secrets Manager, production)
+    # When both are unset the poller does not start and POST /access-requests returns 503.
+    shortcut_api_token: SecretStr = Field(
+        default=SecretStr(""),
+        description=(
+            "Shortcut API token (Shortcut-Token header). "
+            "Used when SHORTCUT_TOKEN_SECRET_ARN is unset (local dev / fallback). "
+            "Leave empty when the token is in Secrets Manager."
+        ),
+    )
+    shortcut_token_secret_arn: str | None = Field(
+        default=None,
+        description=(
+            "ARN of an AWS Secrets Manager secret that holds the Shortcut API token. "
+            "When set, the token is read from Secrets Manager using the EC2 instance role "
+            "(default credential chain — no role assumption) and cached for 1 hour so "
+            "rotation is picked up without a restart. "
+            "SHORTCUT_API_TOKEN is used as a fallback when this is unset or the fetch fails. "
+            "Example: arn:aws:secretsmanager:us-east-1:941644385943:secret:"
+            "master/access-grants/shortcut-token-N7nCVh"
+        ),
+    )
+    # Workflow state IDs for the Access Requests workflow
+    shortcut_wf_requested_id: int = Field(
+        default=500006959,
+        description="Shortcut workflow_state_id for 'Requested' state",
+    )
+    shortcut_wf_approved_id: int = Field(
+        default=500006960,
+        description="Shortcut workflow_state_id for 'Approved' state",
+    )
+    shortcut_wf_completed_id: int = Field(
+        default=500006961,
+        description="Shortcut workflow_state_id for 'Completed' state",
+    )
+    shortcut_wf_rejected_id: int = Field(
+        default=500006962,
+        description="Shortcut workflow_state_id for 'Rejected' state",
+    )
+    # Lead member IDs authorised to approve access requests (comma-separated UUIDs)
+    shortcut_lead_member_ids: Annotated[list[str], NoDecode] = Field(
+        default=[
+            "65c1155a-464e-4758-aeed-ba14c1ca20c4",
+            "6463d18b-0b8c-4aa8-8032-1338558d3722",
+            "5f45c611-44cb-43b1-b9e0-d4ca6f70e742",
+        ],
+        description="Comma-separated Shortcut member UUIDs allowed to approve Tier 2 requests",
+    )
+    shortcut_project_id: int = Field(
+        default=3,
+        description="Shortcut project_id for access request stories (DevOps and Infra)",
+    )
+    shortcut_group_id: str = Field(
+        default="650206d4-1ac7-4092-98b4-f19ce7ec639c",
+        description="Shortcut group_id for access request stories (Infrastructure and DevOps)",
+    )
+    shortcut_environment: str = Field(
+        default="dev",
+        description="Environment name shown in the Shortcut card description (dev or prod)",
+    )
+    shortcut_poll_interval_seconds: int = Field(
+        default=120,
+        ge=10,
+        description="How often (seconds) the access-request poller checks Shortcut",
+    )
+
+    @field_validator("shortcut_lead_member_ids", mode="before")
+    @classmethod
+    def parse_shortcut_lead_member_ids(cls, v: object) -> list[str]:
+        """Accept comma-separated string or list for SHORTCUT_LEAD_MEMBER_IDS."""
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return []
+            return [t.strip() for t in v.split(",") if t.strip()]
+        if isinstance(v, list):
+            return v
+        return []
 
     # VPC Route Management (sc-31774)
     strongswan_config_bucket: str = Field(

@@ -13,6 +13,7 @@ from sqlalchemy import (
     Index,
     Integer,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -20,6 +21,31 @@ from sqlalchemy.dialects.postgresql import CIDR, INET, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, SoftDeleteMixin, TimestampMixin
+
+# ---------------------------------------------------------------------------
+# Tier 1 — permission keys that can be granted per-user
+# ---------------------------------------------------------------------------
+TIER1_PERMISSION_KEYS = (
+    "tunnels.write",
+    "tunnels.connect",
+    "tunnels.psk",
+    "routes.write",
+    "iptables.filter",
+    "iptables.snat",
+    "capture.headers",
+)
+
+# SQL literal for the check constraint
+_T1_KEYS_SQL = ", ".join(f"'{k}'" for k in TIER1_PERMISSION_KEYS)
+
+# ---------------------------------------------------------------------------
+# Tier 2 — access-request permission keys (time-limited, Shortcut-approved)
+# ---------------------------------------------------------------------------
+TIER2_PERMISSION_KEYS = ("capture.full",)
+_T2_KEYS_SQL = ", ".join(f"'{k}'" for k in TIER2_PERMISSION_KEYS)
+
+# Access-request final statuses (no further polling)
+ACCESS_REQUEST_FINAL_STATUSES = ("rejected", "invalid", "revoked", "expired")
 
 
 class User(TimestampMixin, Base):
@@ -43,14 +69,103 @@ class User(TimestampMixin, Base):
     # When set, tokens whose iat (issued-at) is earlier than this value are rejected.
     # Set by revoke-sessions / logout-all to invalidate all outstanding tokens.
     tokens_valid_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Shortcut member UUID — required to create a Tier 2 access request.
+    shortcut_member_id: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Relationships
     tunnels: Mapped[list[Tunnel]] = relationship(back_populates="creator", lazy="noload")
     audit_logs: Mapped[list[AuditLog]] = relationship(back_populates="user", lazy="noload")
+    tier1_permissions: Mapped[list[UserPermission]] = relationship(
+        back_populates="user",
+        lazy="noload",
+        cascade="all, delete-orphan",
+    )
+    access_requests: Mapped[list[AccessRequest]] = relationship(
+        back_populates="user",
+        lazy="noload",
+    )
 
     __table_args__ = (
         CheckConstraint("role IN ('admin', 'operator', 'viewer')", name="ck_users_role"),
         Index("idx_users_email", "email"),
+    )
+
+
+class UserPermission(TimestampMixin, Base):
+    """Tier 1 per-user permission grant.
+
+    Operators receive none by default.  An admin explicitly assigns permissions.
+    Admin users always have every Tier 1 permission implicitly (no DB row needed).
+    """
+
+    __tablename__ = "user_permissions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    permission_key: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Relationship
+    user: Mapped[User] = relationship(back_populates="tier1_permissions", lazy="noload")
+
+    __table_args__ = (
+        CheckConstraint(
+            f"permission_key IN ({_T1_KEYS_SQL})",
+            name="ck_user_permissions_key",
+        ),
+        UniqueConstraint("user_id", "permission_key", name="uq_user_permissions"),
+        Index("idx_user_permissions_user_id", "user_id"),
+    )
+
+
+class AccessRequest(TimestampMixin, Base):
+    """Tier 2 time-limited elevated access request, approved via Shortcut.
+
+    Status transitions (non-final → final):
+      requested → active  (approved by an authorized lead, not the requester)
+      requested → rejected (card moved to Rejected/Completed before approval)
+      requested / active → invalid  (approver not in lead list, or was the requester)
+      active → revoked  (card leaves Approved or is gone)
+      active → expired  (expires_at passed)
+    """
+
+    __tablename__ = "access_requests"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
+    permission_key: Mapped[str] = mapped_column(Text, nullable=False)
+    duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    justification: Mapped[str] = mapped_column(Text, nullable=False)
+    # Shortcut story ID and URL set once the card is created
+    shortcut_story_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    shortcut_story_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Status lifecycle
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="requested")
+    approved_by_member_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Human-readable reason for rejection / revocation / invalid approval
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Relationship
+    user: Mapped[User] = relationship(back_populates="access_requests", lazy="noload")
+
+    __table_args__ = (
+        CheckConstraint(
+            f"permission_key IN ({_T2_KEYS_SQL})",
+            name="ck_access_requests_permission_key",
+        ),
+        CheckConstraint(
+            "status IN ('requested', 'active', 'rejected', 'invalid', 'revoked', 'expired')",
+            name="ck_access_requests_status",
+        ),
+        CheckConstraint("duration_seconds > 0", name="ck_access_requests_duration_pos"),
+        Index("idx_access_requests_user_id", "user_id"),
+        Index(
+            "idx_access_requests_active",
+            "status",
+            postgresql_where=text("status IN ('requested', 'active')"),
+        ),
     )
 
 
@@ -374,7 +489,10 @@ class AuditLog(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "action IN ('create', 'update', 'delete', 'retry', 'login', 'rotate_psk', 'revoke_sessions')",
+            "action IN ("
+            "'create', 'update', 'delete', 'retry', 'login', 'rotate_psk', 'revoke_sessions',"
+            " 'access_request', 'access_grant', 'access_revoke', 'access_reject', 'access_invalid'"
+            ")",
             name="ck_audit_action",
         ),
         Index("idx_audit_entity", "entity_type", "entity_id"),
