@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import get_current_user
+from app.auth import get_current_user, require_operator
 from app.config import get_settings
 from app.db.models import AccessRequest, TIER2_PERMISSION_KEYS
 from app.db.session import get_db
@@ -64,7 +64,7 @@ async def get_catalog(
 async def create_access_request(
     data: AccessRequestCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_operator),
 ) -> AccessRequestDetail:
     """Submit a Tier 2 elevated access request.
 
@@ -82,6 +82,12 @@ async def create_access_request(
     token = resolve_shortcut_token(settings)
     if not token:
         raise ValidationError("Elevated access requests require Shortcut integration (not configured)")
+
+    if not current_user.shortcut_member_id:
+        raise ValidationError(
+            "Your account does not have a Shortcut member ID configured. "
+            "Ask an admin to set it via the Users screen before submitting an elevated access request."
+        )
 
     if data.permission_key not in TIER2_CATALOG:
         raise ValidationError(f"Unknown Tier 2 permission key: {data.permission_key!r}")

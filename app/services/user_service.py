@@ -139,7 +139,7 @@ async def update_user(
         request=request,
     )
 
-    await session.flush()
+    await session.commit()
     return user
 
 
