@@ -490,6 +490,9 @@ async def delete_rule(
     7. Create audit log entry.
     8. Commit transaction.
 
+    If removal fails on any node, the rule is NOT soft-deleted: it is marked
+    'failed' with the error and InfrastructureError is re-raised.
+
     Args:
         session: Active database session.
         rule_id: Primary key of the rule to delete.
@@ -499,6 +502,7 @@ async def delete_rule(
     Raises:
         NotFoundError: If the rule does not exist.
         LockConflictError: If the iptables lock is held.
+        InfrastructureError: If removal fails on any node.
     """
     rule = await get_rule(session, rule_id)
     previous_state = _rule_to_dict(rule)
@@ -522,6 +526,12 @@ async def delete_rule(
             rule_id=rule.id,
             error=exc.message,
         )
+        # Keep the rule active: it may still be live on a node. Recording the
+        # failure keeps it visible, and deleting again is safe (`|| true`).
+        rule.sync_status = "failed"
+        rule.sync_error = f"Delete failed: {exc.message}"
+        await session.commit()
+        raise
 
     # Soft-delete in DB
     rule.deleted_at = datetime.now(timezone.utc)

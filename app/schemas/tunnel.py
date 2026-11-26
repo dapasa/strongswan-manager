@@ -232,6 +232,22 @@ class TunnelDetail(BaseModel):
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
+    @field_validator("routes", "iptables_rules", mode="before")
+    @classmethod
+    def drop_soft_deleted(cls, v: Any) -> Any:
+        """Hide soft-deleted routes and rules.
+
+        The Tunnel.routes / Tunnel.iptables_rules relationships load every row,
+        including the soft-deleted ones, so they are filtered here for every
+        endpoint that returns a TunnelDetail.
+        """
+        if not v:
+            return v
+        return [
+            item for item in v
+            if (item.get("deleted_at") if isinstance(item, dict) else getattr(item, "deleted_at", None)) is None
+        ]
+
     @field_serializer("peer_ip")
     def serialize_peer_ip(self, v: Any) -> str:
         return str(v) if v is not None else None
