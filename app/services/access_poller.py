@@ -108,12 +108,22 @@ async def _process_request(
 
     # --- Eager expiry check ---
     if await _expire_active_requests(session, req):
-        # Try to comment on card (best-effort)
+        # Close the card and comment on it (both best-effort). The request is already
+        # final, so the poller never looks at this card again after the move.
         if req.shortcut_story_id:
+            moved = await shortcut_service.move_story(
+                token=token,
+                story_id=req.shortcut_story_id,
+                workflow_state_id=settings.shortcut_wf_completed_id,
+            )
+            expired_at = req.expires_at.isoformat() if req.expires_at else "N/A"
             await shortcut_service.post_comment(
                 token=token,
                 story_id=req.shortcut_story_id,
-                text=f"Access grant **expired** at {req.expires_at.isoformat() if req.expires_at else 'N/A'} UTC.",
+                text=(
+                    f"Access grant **expired** at {expired_at} UTC. "
+                    + ("Card moved to Completed." if moved else "Move this card to Completed.")
+                ),
             )
         await session.commit()
         return

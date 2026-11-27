@@ -157,6 +157,24 @@ async def post_comment(*, token: str, story_id: int, text: str) -> None:
         logger.warning("shortcut_comment_error", story_id=story_id, error=str(exc))
 
 
+async def move_story(*, token: str, story_id: int, workflow_state_id: int) -> bool:
+    """Move a Shortcut story to another workflow state.  Returns False on failure, never raises.
+
+    Best-effort like post_comment: the access state in the database is the record,
+    the card state only mirrors it.
+    """
+    try:
+        async with _client(token) as c:
+            resp = await c.put(f"/stories/{story_id}", json={"workflow_state_id": workflow_state_id})
+            if resp.status_code != 200:
+                logger.warning("shortcut_move_failed", story_id=story_id, status=resp.status_code)
+                return False
+            return True
+    except Exception as exc:
+        logger.warning("shortcut_move_error", story_id=story_id, error=str(exc))
+        return False
+
+
 def find_approver_in_history(
     history: list[dict[str, Any]],
     approved_state_id: int,
