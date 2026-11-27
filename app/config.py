@@ -291,6 +291,29 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ---------------------------------------------------------------------------
+    # Packet capture
+    # ---------------------------------------------------------------------------
+    capture_bucket: str = Field(
+        default="",
+        description=(
+            "S3 bucket name for packet captures. "
+            "Empty string disables the feature (endpoints return 503)."
+        ),
+    )
+    capture_max_duration_seconds: int = Field(
+        default=300,
+        ge=10,
+        le=3600,
+        description="Maximum allowed capture duration in seconds (default 300 = 5 min).",
+    )
+    capture_max_size_mb: int = Field(
+        default=50,
+        ge=1,
+        le=500,
+        description="Maximum capture file size in MB (enforced on-node before upload).",
+    )
+
     @field_validator("managed_route_table_ids", mode="before")
     @classmethod
     def parse_managed_route_table_ids(cls, v: object) -> list[str]:
