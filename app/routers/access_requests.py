@@ -131,7 +131,7 @@ async def create_access_request(
         story = await create_story(
             token=token,
             workflow_state_id=settings.shortcut_wf_requested_id,
-            project_id=settings.shortcut_project_id,
+            epic_id=settings.shortcut_epic_id,
             group_id=settings.shortcut_group_id,
             requested_by_id=current_user.shortcut_member_id,
             name=story_name,

@@ -42,8 +42,8 @@ async def create_story(
     *,
     token: str,
     workflow_state_id: int,
-    project_id: int,
-    group_id: str,
+    epic_id: int | None,
+    group_id: str | None,
     requested_by_id: str | None,
     name: str,
     description: str,
@@ -64,12 +64,14 @@ async def create_story(
     payload: dict[str, Any] = {
         "workflow_state_id": workflow_state_id,
         "story_type": "chore",
-        "project_id": project_id,
-        "group_id": group_id,
         "name": name,
         "description": description,
         "labels": [{"name": lbl} for lbl in labels],
     }
+    if epic_id:
+        payload["epic_id"] = epic_id
+    if group_id:
+        payload["group_id"] = group_id
     if requested_by_id:
         payload["requested_by_id"] = requested_by_id
 

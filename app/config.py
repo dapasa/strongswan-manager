@@ -235,13 +235,17 @@ class Settings(BaseSettings):
         ],
         description="Comma-separated Shortcut member UUIDs allowed to approve Tier 2 requests",
     )
-    shortcut_project_id: int = Field(
-        default=3,
-        description="Shortcut project_id for access request stories (DevOps and Infra)",
+    # Access request stories live in the Access Requests workflow, which belongs to no
+    # project: setting a project_id makes Shortcut reject the story (422). They go to the
+    # Engineers team (whose workflows include Access Requests) under the same epic the
+    # access-grants Lambda uses.
+    shortcut_epic_id: int | None = Field(
+        default=29211,
+        description="Shortcut epic_id for access request stories (Privileged Access Grants)",
     )
-    shortcut_group_id: str = Field(
-        default="650206d4-1ac7-4092-98b4-f19ce7ec639c",
-        description="Shortcut group_id for access request stories (Infrastructure and DevOps)",
+    shortcut_group_id: str | None = Field(
+        default="615256ca-3f27-4a13-88c0-d82b192ab194",
+        description="Shortcut group_id for access request stories (Engineers team)",
     )
     shortcut_environment: str = Field(
         default="dev",
