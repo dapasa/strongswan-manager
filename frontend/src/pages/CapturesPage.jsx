@@ -1,6 +1,8 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { useServers } from '@/hooks/useServers'
 import {
+  useCapture,
   useCaptures,
   useStartCapture,
   useCaptureOutput,
@@ -55,6 +57,7 @@ function formatBytes(bytes) {
 }
 
 export default function CapturesPage() {
+  const queryClient = useQueryClient()
   const { data: servers = [] } = useServers()
   const { data: captures = [], isLoading } = useCaptures()
   const startCapture = useStartCapture()
@@ -71,6 +74,20 @@ export default function CapturesPage() {
   })
   const [viewCapture, setViewCapture] = useState(null)
   const [deleteTarget, setDeleteTarget] = useState(null)
+  // ID of the most recently started capture — used for polling while 'running'
+  const [pollingId, setPollingId] = useState(null)
+
+  // Poll the running capture; stop and refresh the list when it finishes
+  const { data: pollingCapture } = useCapture(pollingId, {
+    enabled: !!pollingId,
+  })
+  useEffect(() => {
+    if (!pollingCapture) return
+    if (pollingCapture.status !== 'running') {
+      setPollingId(null)
+      queryClient.invalidateQueries({ queryKey: ['captures'] })
+    }
+  }, [pollingCapture, queryClient])
 
   function handleStart(e) {
     e.preventDefault()
@@ -83,7 +100,12 @@ export default function CapturesPage() {
     }
     if (form.host_filter) payload.host_filter = form.host_filter
     if (form.port_filter) payload.port_filter = Number(form.port_filter)
-    startCapture.mutate(payload)
+    startCapture.mutate(payload, {
+      onSuccess: (data) => {
+        // 202 Accepted: capture is running in the background — start polling
+        if (data?.id) setPollingId(data.id)
+      },
+    })
   }
 
   return (
@@ -223,9 +245,13 @@ export default function CapturesPage() {
               <div className="col-span-full">
                 <Button
                   type="submit"
-                  disabled={!form.server_id || startCapture.isPending}
+                  disabled={!form.server_id || startCapture.isPending || !!pollingId}
                 >
-                  {startCapture.isPending ? 'Starting…' : 'Start Capture'}
+                  {startCapture.isPending
+                    ? 'Starting…'
+                    : pollingId
+                      ? 'Capture running…'
+                      : 'Start Capture'}
                 </Button>
               </div>
             </form>

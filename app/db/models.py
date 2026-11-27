@@ -488,6 +488,7 @@ class PacketCapture(TimestampMixin, Base):
     # Soft-delete for the capture record (the S3 object is deleted separately)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
+    truncated_by_size: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
 
     __table_args__ = (
         CheckConstraint("mode IN ('headers', 'full')", name="ck_captures_mode"),

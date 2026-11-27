@@ -15,6 +15,11 @@ export const capturesService = {
     return res.data
   },
 
+  async getOne(captureId) {
+    const res = await api.get(`/api/v1/captures/${captureId}`)
+    return res.data
+  },
+
   async readOutput(captureId) {
     const res = await api.get(`/api/v1/captures/${captureId}/output`)
     return res.data

@@ -338,15 +338,90 @@ class TestBuildCaptureScript:
         assert "/dev/shm/capture_999.pcap" in script
 
     def test_size_check_in_script(self):
-        """Script checks file size and aborts if too large."""
+        """Script enforces size limit via ulimit -f (block count = max_size_bytes // 512)."""
+        max_bytes = 52428800  # 50 MiB
+        expected_blocks = max_bytes // 512  # 102400
         script = build_capture_script(
             capture_id=1,
             interface="ens5",
             bpf_filter="",
             duration_seconds=30,
             snaplen=96,
-            max_size_bytes=52428800,
+            max_size_bytes=max_bytes,
             presigned_url="https://example.com/put",
         )
-        assert "52428800" in script
+        assert f"ulimit -f {expected_blocks}" in script
         assert "SIZE" in script
+
+    def test_script_contains_ulimit(self):
+        """Script must set ulimit -f in a subshell before tcpdump."""
+        script = build_capture_script(
+            capture_id=7,
+            interface="ens5",
+            bpf_filter="",
+            duration_seconds=60,
+            snaplen=HEADERS_SNAPLEN,
+            max_size_bytes=10 * 1024 * 1024,
+            presigned_url="https://example.com/put",
+        )
+        assert "ulimit -f" in script
+        # ulimit must be in a subshell (parenthesised) so the limit applies to tcpdump only
+        assert "( ulimit -f" in script
+
+    def test_script_no_sudo(self):
+        """tcpdump command must NOT use sudo (SSM runs as root; ulimit must be inherited)."""
+        script = build_capture_script(
+            capture_id=3,
+            interface="ens5",
+            bpf_filter="",
+            duration_seconds=30,
+            snaplen=HEADERS_SNAPLEN,
+            max_size_bytes=50 * 1024 * 1024,
+            presigned_url="https://example.com/put",
+        )
+        assert "sudo" not in script
+
+    def test_sigxfsz_handling(self):
+        """RC=153 (SIGXFSZ) must be treated as a valid truncated capture, not an error."""
+        script = build_capture_script(
+            capture_id=8,
+            interface="ens5",
+            bpf_filter="",
+            duration_seconds=30,
+            snaplen=HEADERS_SNAPLEN,
+            max_size_bytes=50 * 1024 * 1024,
+            presigned_url="https://example.com/put",
+        )
+        # RC=153 must be in the allowed-RCs list
+        assert "153" in script
+        # Script must set TRUNCATED=1 when RC=153
+        assert "TRUNCATED=1" in script
+        # Script must echo TRUNCATED_BY_SIZE via the variable
+        assert "TRUNCATED_BY_SIZE=$TRUNCATED" in script
+
+    def test_curl_has_max_time(self):
+        """curl upload must have --max-time to prevent indefinite hangs."""
+        script = build_capture_script(
+            capture_id=2,
+            interface="ens5",
+            bpf_filter="",
+            duration_seconds=30,
+            snaplen=HEADERS_SNAPLEN,
+            max_size_bytes=50 * 1024 * 1024,
+            presigned_url="https://example.com/put",
+        )
+        assert "--max-time" in script
+
+    def test_capture_size_echoed(self):
+        """Script must echo CAPTURE_SIZE=<n> so the manager can parse file size from stdout."""
+        script = build_capture_script(
+            capture_id=4,
+            interface="ens5",
+            bpf_filter="",
+            duration_seconds=30,
+            snaplen=HEADERS_SNAPLEN,
+            max_size_bytes=50 * 1024 * 1024,
+            presigned_url="https://example.com/put",
+        )
+        assert "CAPTURE_SIZE=" in script
+        assert "echo" in script

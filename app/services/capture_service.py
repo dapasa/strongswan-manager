@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import shlex
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 import boto3
@@ -36,6 +36,9 @@ _PRESIGN_BUFFER_SECONDS = 180
 
 # Extra SSM timeout beyond capture duration (seconds for upload + overhead)
 _SSM_TIMEOUT_BUFFER_SECONDS = 90
+
+# curl upload timeout — must fit within _SSM_TIMEOUT_BUFFER_SECONDS
+_CURL_TIMEOUT_SECONDS = 60
 
 # Valid interfaces
 _VALID_INTERFACES = frozenset(("ens5", "ens6", "any"))
@@ -166,7 +169,7 @@ def delete_s3_object(bucket: str, key: str) -> None:
             errors = resp.get("Errors", [])
             if errors:
                 detail = "; ".join(
-                    f"{e['Key']}@{e.get('VersionId','')} — {e['Message']}"
+                    f"{e['Key']}@{e.get('VersionId', '')} — {e['Message']}"
                     for e in errors
                 )
                 raise InfrastructureError(
@@ -193,25 +196,35 @@ def build_capture_script(
     snaplen: int,
     max_size_bytes: int,
     presigned_url: str,
+    curl_timeout_seconds: int = _CURL_TIMEOUT_SECONDS,
 ) -> str:
     """Build the shell script that runs on the VPN node.
 
-    The script:
+    Design:
     1. Sets a trap to delete the temp file on EXIT (success or failure).
-    2. Runs tcpdump with timeout, writing to /dev/shm.
-    3. Checks the file size against the limit.
-    4. Uploads via curl to the presigned URL.
+    2. Runs tcpdump in a subshell with ``ulimit -f`` to enforce a hard file-size
+       cap in 512-byte blocks.  SIGXFSZ (RC=153) means size was exceeded — the
+       pcap is still a valid (truncated) capture and is uploaded anyway.
+    3. Echos ``CAPTURE_SIZE=N`` and ``TRUNCATED_BY_SIZE=0/1`` for the manager to
+       parse from SSM stdout.
+    4. Uploads via ``curl`` with ``--max-time`` to bound the upload duration.
 
-    All user-controlled values are either validated integers/enums or passed
-    through shlex.quote to prevent injection.
+    SSM Run Command executes as root on the node, so ``sudo`` is not used —
+    dropping it ensures ``ulimit -f`` is inherited by the tcpdump child.
+
+    All user-controlled values are validated typed fields; the presigned URL
+    and interface name are always passed through ``shlex.quote``.
     """
     tmpfile = f"/dev/shm/capture_{capture_id}.pcap"
     quoted_url = shlex.quote(presigned_url)
     quoted_iface = shlex.quote(interface)
 
-    # Build tcpdump args safely (all validated)
+    # ulimit -f unit is 512-byte blocks
+    ulimit_blocks = max_size_bytes // 512
+
+    # Build tcpdump command — no sudo (SSM runs as root; ulimit must be inherited)
     tcpdump_parts = [
-        "sudo", "tcpdump",
+        "tcpdump",
         "-i", quoted_iface,
         "-s", str(snaplen),
         "-w", tmpfile,
@@ -219,14 +232,16 @@ def build_capture_script(
     if bpf_filter:
         # bpf_filter is built from validated typed fields only, never raw user input
         tcpdump_parts.append(shlex.quote(bpf_filter))
-
     tcpdump_cmd = " ".join(tcpdump_parts)
 
     script = f"""\
 TMPFILE={tmpfile}
 trap 'rm -f "$TMPFILE"' EXIT
-timeout {duration_seconds} {tcpdump_cmd}; RC=$?
-if [ "$RC" -ne 0 ] && [ "$RC" -ne 124 ]; then
+( ulimit -f {ulimit_blocks}; timeout {duration_seconds} {tcpdump_cmd} ); RC=$?
+# RC=0: stopped cleanly, RC=124: timed out by timeout(1), RC=153: SIGXFSZ (size limit)
+# All three produce a valid (possibly truncated) pcap - upload it
+# Any other RC is a real tcpdump error
+if [ "$RC" -ne 0 ] && [ "$RC" -ne 124 ] && [ "$RC" -ne 153 ]; then
   echo "tcpdump exited with RC=$RC" >&2
   exit "$RC"
 fi
@@ -235,13 +250,120 @@ if [ "$SIZE" -eq 0 ]; then
   echo "No packets captured (empty file)" >&2
   exit 1
 fi
-if [ "$SIZE" -gt {max_size_bytes} ]; then
-  echo "Capture too large: $SIZE bytes (limit {max_size_bytes})" >&2
-  exit 1
-fi
-curl -sf -T "$TMPFILE" {quoted_url}
+TRUNCATED=0
+if [ "$RC" -eq 153 ]; then TRUNCATED=1; fi
+echo "CAPTURE_SIZE=$SIZE"
+echo "TRUNCATED_BY_SIZE=$TRUNCATED"
+curl -sf --max-time {curl_timeout_seconds} -T "$TMPFILE" {quoted_url}
 """
     return script
+
+
+# ---------------------------------------------------------------------------
+# Background task
+# ---------------------------------------------------------------------------
+
+async def _run_capture_background(
+    *,
+    capture_id: int,
+    server_id: int,
+    script: str,
+    ssm_timeout: int,
+    user_id: int,
+) -> None:
+    """Background asyncio task: execute SSM capture and persist result to DB.
+
+    Uses its own DB sessions so the HTTP request session is not held open.
+    Fires the ``capture_start`` audit log on completion (success or failure).
+    """
+    from app.db.session import async_session_factory
+
+    logger.info("capture_bg_start", capture_id=capture_id, server_id=server_id)
+
+    status = "failed"
+    error_msg: str | None = None
+    size_bytes: int | None = None
+    truncated_by_size = False
+
+    try:
+        # Fetch the server in its own short-lived session
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(Server).where(Server.id == server_id)
+            )
+            server = result.scalar_one_or_none()
+
+        if server is None:
+            raise InfrastructureError(
+                service="capture",
+                message=f"Server {server_id} not found in background task",
+            )
+
+        transport = get_transport(server)
+        cmd_result = await transport.execute([script], timeout=ssm_timeout)
+
+        # Parse stdout for CAPTURE_SIZE and TRUNCATED_BY_SIZE
+        for line in (cmd_result.stdout or "").splitlines():
+            line = line.strip()
+            if line.startswith("CAPTURE_SIZE="):
+                try:
+                    size_bytes = int(line.split("=", 1)[1])
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("TRUNCATED_BY_SIZE="):
+                truncated_by_size = line.split("=", 1)[1].strip() == "1"
+
+        status = "completed"
+        logger.info(
+            "capture_bg_complete",
+            capture_id=capture_id,
+            size_bytes=size_bytes,
+            truncated_by_size=truncated_by_size,
+        )
+
+    except Exception as exc:
+        error_msg = str(exc)[:500]
+        logger.error("capture_bg_failed", capture_id=capture_id, error=error_msg)
+
+    # Persist result in a fresh session
+    try:
+        async with async_session_factory() as session:
+            cap_result = await session.execute(
+                select(PacketCapture).where(PacketCapture.id == capture_id)
+            )
+            capture = cap_result.scalar_one_or_none()
+            if capture is None:
+                logger.error("capture_bg_row_gone", capture_id=capture_id)
+                return
+
+            capture.status = status
+            capture.completed_at = datetime.now(timezone.utc)
+            capture.size_bytes = size_bytes
+            capture.truncated_by_size = truncated_by_size
+            capture.error = error_msg
+
+            await audit.log_action(
+                session,
+                user_id=user_id,
+                entity_type="packet_capture",
+                entity_id=capture_id,
+                action="capture_start",
+                new_state={
+                    "id": capture_id,
+                    "status": status,
+                    "size_bytes": size_bytes,
+                    "truncated_by_size": truncated_by_size,
+                    "error": error_msg,
+                },
+            )
+            await session.commit()
+
+    except Exception as save_exc:
+        logger.error(
+            "capture_bg_save_failed",
+            capture_id=capture_id,
+            error=str(save_exc),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -266,35 +388,35 @@ async def start_capture(
     user: "User",
     request: Request | None = None,
 ) -> PacketCapture:
-    """Start a packet capture on a VPN node.
+    """Validate, commit a 'running' row, then launch the SSM capture as a background task.
 
-    1. Check permissions (capture.headers for headers mode; capture.full Tier 2 for full).
-    2. Verify no capture is already running on this server.
-    3. Build BPF filter from structured fields.
-    4. Generate presigned S3 PUT URL.
-    5. Insert PacketCapture row (status=running).
-    6. Build node script and run via SSM transport (single server).
-    7. Update row to completed/failed.
-    8. Audit log.
+    Returns immediately with the ``running`` capture so the caller can respond
+    with HTTP 202.  The background task updates the row to ``completed`` or
+    ``failed`` and fires the audit log.
+
+    Per-node concurrency is enforced by the committed ``running`` row: any
+    concurrent request sees it before launching another capture.  Rows that
+    have been ``running`` longer than their max expected duration are treated as
+    stale (manager restart / lost SSM task) and are marked ``failed`` before
+    allowing a new capture.
 
     Args:
-        session: Async DB session.
+        session: Async DB session (used for validation and initial commit only).
         data: Validated CaptureStart payload.
         user: Authenticated user.
-        request: FastAPI request (for audit context).
+        request: FastAPI request (unused here — audit fires in the background).
 
     Returns:
-        The completed PacketCapture row.
+        The newly inserted PacketCapture row (status='running').
     """
     settings = get_settings()
     if not settings.capture_bucket:
         raise ValidationError("Packet capture feature is disabled (CAPTURE_BUCKET not set)")
 
-    # Check duration limit
     max_dur = settings.capture_max_duration_seconds
     if data.duration_seconds > max_dur:
         raise ValidationError(
-            f"duration_seconds exceeds maximum allowed: {data.duration_seconds} > {max_dur}"
+            f"duration_seconds {data.duration_seconds} exceeds maximum {max_dur}"
         )
 
     # Permission check
@@ -302,16 +424,16 @@ async def start_capture(
     from app.exceptions import AuthorizationError
 
     if data.mode == "full":
-        # Tier 2 required at capture start
         if not await has_active_tier2(session, user.id, "capture.full"):
             raise AuthorizationError("Active Tier 2 grant for 'capture.full' required")
     else:
-        # headers mode — Tier 1 or admin
         await assert_permission(user, "capture.headers", session)
 
     server = await _get_server(session, data.server_id)
 
-    # Check for existing running capture on this server
+    now = datetime.now(timezone.utc)
+
+    # Check for running capture; mark stale ones failed so they don't block the node
     result = await session.execute(
         select(PacketCapture).where(
             PacketCapture.server_id == data.server_id,
@@ -321,11 +443,26 @@ async def start_capture(
     )
     existing = result.scalar_one_or_none()
     if existing is not None:
-        raise ConflictError(
-            f"Server {data.server_id} already has a running capture (id={existing.id})"
+        stale_after = timedelta(
+            seconds=existing.duration_seconds + _SSM_TIMEOUT_BUFFER_SECONDS + 60
         )
+        if existing.started_at and (now - existing.started_at) > stale_after:
+            logger.warning(
+                "capture_stale_recovered",
+                capture_id=existing.id,
+                server_id=data.server_id,
+                age_seconds=(now - existing.started_at).total_seconds(),
+            )
+            existing.status = "failed"
+            existing.error = "Capture timed out (stale — manager may have restarted)"
+            existing.completed_at = now
+            await session.flush()
+        else:
+            raise ConflictError(
+                f"Server {data.server_id} already has a running capture (id={existing.id})"
+            )
 
-    # Build BPF filter
+    # Build BPF filter from structured fields
     bpf_filter = build_bpf_filter(
         interface=data.interface,
         host_filter=data.host_filter,
@@ -333,10 +470,9 @@ async def start_capture(
         protocol_filter=data.protocol_filter,
     )
 
-    # Determine snaplen
     snaplen = FULL_SNAPLEN if data.mode == "full" else HEADERS_SNAPLEN
 
-    # Insert capture row (status=running) so we have an ID for the S3 key
+    # Insert running row and flush to obtain the capture ID
     capture = PacketCapture(
         server_id=data.server_id,
         user_id=user.id,
@@ -348,22 +484,22 @@ async def start_capture(
         duration_seconds=data.duration_seconds,
         snaplen=snaplen,
         status="running",
-        started_at=datetime.now(timezone.utc),
+        started_at=now,
     )
     session.add(capture)
     await session.flush()
 
-    # S3 key
-    bucket = settings.capture_bucket
     s3_key = f"captures/{capture.id}.pcap"
     capture.s3_object_key = s3_key
 
-    # Presigned URL TTL = duration + buffer
+    # Generate presigned URL before commit — if this fails, the row is not committed
+    bucket = settings.capture_bucket
     ttl = data.duration_seconds + _PRESIGN_BUFFER_SECONDS
     presigned_url = generate_presigned_put_url(bucket, s3_key, ttl)
 
-    # Build node script
+    # Build the node script
     max_bytes = settings.capture_max_size_mb * 1024 * 1024
+    ssm_timeout = data.duration_seconds + _SSM_TIMEOUT_BUFFER_SECONDS
     script = build_capture_script(
         capture_id=capture.id,
         interface=data.interface,
@@ -374,63 +510,42 @@ async def start_capture(
         presigned_url=presigned_url,
     )
 
-    # SSM timeout: capture duration + buffer
-    ssm_timeout = data.duration_seconds + _SSM_TIMEOUT_BUFFER_SECONDS
-
-    # Execute on the specific server (not all servers — capture is per-node)
-    try:
-        transport = get_transport(server)
-        cmd_result = await transport.execute([script], timeout=ssm_timeout)
-        # Try to extract size from stdout if reported
-        for line in (cmd_result.stdout or "").splitlines():
-            if line.strip().isdigit():
-                try:
-                    capture.size_bytes = int(line.strip())
-                except ValueError:
-                    pass
-        capture.status = "completed"
-        capture.completed_at = datetime.now(timezone.utc)
-        capture.error = None
-        logger.info(
-            "packet_capture_completed",
-            capture_id=capture.id,
-            server_id=data.server_id,
-            mode=data.mode,
-        )
-    except Exception as exc:
-        capture.status = "failed"
-        capture.error = str(exc)
-        capture.completed_at = datetime.now(timezone.utc)
-        logger.error(
-            "packet_capture_failed",
-            capture_id=capture.id,
-            server_id=data.server_id,
-            error=str(exc),
-        )
-
-    # Audit log
-    await audit.log_action(
-        session,
-        user_id=user.id,
-        entity_type="packet_capture",
-        entity_id=capture.id,
-        action="capture_start",
-        new_state={
-            "id": capture.id,
-            "server_id": capture.server_id,
-            "mode": capture.mode,
-            "interface": capture.interface,
-            "host_filter": capture.host_filter,
-            "port_filter": capture.port_filter,
-            "protocol_filter": capture.protocol_filter,
-            "duration_seconds": capture.duration_seconds,
-            "status": capture.status,
-        },
-        request=request,
-    )
-
+    # Commit so concurrent requests see the running row immediately
     await session.commit()
     await session.refresh(capture)
+
+    # Launch background task (the HTTP response is returned before it finishes)
+    asyncio.create_task(
+        _run_capture_background(
+            capture_id=capture.id,
+            server_id=data.server_id,
+            script=script,
+            ssm_timeout=ssm_timeout,
+            user_id=user.id,
+        )
+    )
+
+    logger.info(
+        "capture_accepted",
+        capture_id=capture.id,
+        server_id=data.server_id,
+        mode=data.mode,
+        duration_seconds=data.duration_seconds,
+    )
+    return capture
+
+
+async def get_capture(session: AsyncSession, capture_id: int) -> PacketCapture:
+    """Get a single non-deleted capture by ID (used for status polling)."""
+    result = await session.execute(
+        select(PacketCapture).where(
+            PacketCapture.id == capture_id,
+            PacketCapture.deleted_at.is_(None),
+        )
+    )
+    capture = result.scalar_one_or_none()
+    if capture is None:
+        raise NotFoundError("PacketCapture", capture_id)
     return capture
 
 
@@ -468,7 +583,6 @@ async def read_capture(
     if not settings.capture_bucket:
         raise ValidationError("Packet capture feature is disabled")
 
-    # Permission check at view time
     from app.auth.dependencies import assert_permission
     from app.exceptions import AuthorizationError
 
@@ -480,18 +594,17 @@ async def read_capture(
     else:
         await assert_permission(user, "capture.headers", session)
 
-    # Determine whether to show payload
+    # Payload shown only in full mode (Tier 2 already verified above)
     show_payload = capture.mode == "full"
-    # (Tier 2 already verified above for full mode)
 
-    # Download from S3
+    # Download from S3 in executor to avoid blocking the event loop
     loop = asyncio.get_running_loop()
     pcap_bytes = await loop.run_in_executor(
         None,
         lambda: get_object_bytes(settings.capture_bucket, capture.s3_object_key),
     )
 
-    # Parse with tcpdump -r - -nn [-A]
+    # Parse with tcpdump -r - -nn [-A] on the manager host
     tcpdump_args = ["tcpdump", "-r", "-", "-nn"]
     if show_payload:
         tcpdump_args.append("-A")
@@ -505,7 +618,6 @@ async def read_capture(
         )
         stdout_bytes, stderr_bytes = await proc.communicate(input=pcap_bytes)
         output_text = stdout_bytes.decode("utf-8", errors="replace")
-        # Merge stderr too (tcpdump writes summary to stderr)
         stderr_text = stderr_bytes.decode("utf-8", errors="replace")
         all_lines = output_text.splitlines() + (
             stderr_text.splitlines() if stderr_text.strip() else []
@@ -519,7 +631,6 @@ async def read_capture(
     truncated = len(all_lines) > _MAX_OUTPUT_LINES
     lines = all_lines[:_MAX_OUTPUT_LINES]
 
-    # Audit
     await audit.log_action(
         session,
         user_id=user.id,
@@ -547,10 +658,7 @@ async def delete_capture(
     user: "User",
     request: Request | None = None,
 ) -> None:
-    """Delete a capture: remove S3 object and mark row as deleted.
-
-    Admin can delete any capture. Operators must have capture.headers permission.
-    """
+    """Delete a capture: remove all S3 versions and mark row deleted."""
     result = await session.execute(
         select(PacketCapture).where(
             PacketCapture.id == capture_id,
@@ -563,7 +671,6 @@ async def delete_capture(
 
     settings = get_settings()
 
-    # Delete from S3 if completed and has a key
     if capture.s3_object_key and capture.status == "completed":
         loop = asyncio.get_running_loop()
         try:

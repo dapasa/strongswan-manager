@@ -23,6 +23,19 @@ export function useStartCapture() {
   })
 }
 
+/** Poll a single capture until it leaves the 'running' state (every 3 s). */
+export function useCapture(captureId, { enabled = true } = {}) {
+  return useQuery({
+    queryKey: ['capture', captureId],
+    queryFn: () => capturesService.getOne(captureId),
+    enabled: enabled && !!captureId,
+    refetchInterval: (query) => {
+      const data = query.state.data
+      return data?.status === 'running' ? 3000 : false
+    },
+  })
+}
+
 export function useCaptureOutput(captureId, { enabled = true } = {}) {
   return useQuery({
     queryKey: ['capture-output', captureId],

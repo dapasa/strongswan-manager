@@ -14,7 +14,7 @@ from app.services import capture_service
 router = APIRouter(prefix="/api/v1/captures", tags=["captures"])
 
 
-@router.post("", response_model=CaptureOut, status_code=201)
+@router.post("", response_model=CaptureOut, status_code=202)
 async def start_capture(
     body: CaptureStart,
     request: Request,
@@ -30,6 +30,16 @@ async def start_capture(
         db, data=body, user=current_user, request=request
     )
     return capture
+
+
+@router.get("/{capture_id}", response_model=CaptureOut)
+async def get_capture(
+    capture_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_operator),
+) -> CaptureOut:
+    """Get a single capture by ID (used for status polling after a 202 response)."""
+    return await capture_service.get_capture(db, capture_id)
 
 
 @router.get("", response_model=list[CaptureOut])

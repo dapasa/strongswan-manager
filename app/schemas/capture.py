@@ -82,6 +82,7 @@ class CaptureOut(BaseModel):
     completed_at: datetime | None
     error: str | None
     deleted_at: datetime | None
+    truncated_by_size: bool
     created_at: datetime
 
     model_config = {"from_attributes": True}
