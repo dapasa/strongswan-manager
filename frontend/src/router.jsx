@@ -9,6 +9,7 @@ const ServerFormPage = lazy(() => import('@/pages/ServerFormPage'))
 const AuditLogPage = lazy(() => import('@/pages/AuditLogPage'))
 const UserManagementPage = lazy(() => import('@/pages/UserManagementPage'))
 const ElevatedAccessPage = lazy(() => import('@/pages/ElevatedAccessPage'))
+const CapturesPage = lazy(() => import('@/pages/CapturesPage'))
 const NotFoundPage = lazy(() => import('@/pages/NotFoundPage'))
 const Login = lazy(() => import('@/pages/Login'))
 const Callback = lazy(() => import('@/pages/Callback'))
@@ -63,6 +64,10 @@ export const routes = [
     element: ElevatedAccessPage,
   },
   {
+    path: '/captures',
+    element: CapturesPage,
+  },
+  {
     path: '/login',
     element: Login,
     public: true,
@@ -88,6 +93,7 @@ export {
   AuditLogPage,
   UserManagementPage,
   ElevatedAccessPage,
+  CapturesPage,
   NotFoundPage,
   Login,
   Callback,

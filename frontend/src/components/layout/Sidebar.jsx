@@ -1,5 +1,5 @@
 import { NavLink, useLocation } from 'react-router-dom'
-import { LayoutDashboard, Network, Server, ScrollText, ShieldCheck, Users, Shield } from 'lucide-react'
+import { LayoutDashboard, Network, Radio, Server, ScrollText, ShieldCheck, Users, Shield } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import RoleGuard from '@/components/shared/RoleGuard'
 import { Separator } from '@/components/ui/separator'
@@ -13,6 +13,7 @@ const navItems = [
 
 const operatorItems = [
   { to: '/elevated-access', label: 'Elevated Access', icon: ShieldCheck },
+  { to: '/captures', label: 'Packet Captures', icon: Radio },
 ]
 
 const adminItems = [
