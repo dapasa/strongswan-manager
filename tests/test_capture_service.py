@@ -5,7 +5,14 @@ from __future__ import annotations
 import pytest
 
 from app.schemas.capture import CaptureStart, HEADERS_SNAPLEN, FULL_SNAPLEN
-from app.services.capture_service import build_bpf_filter, build_capture_script
+from app.services.capture_service import (
+    build_bpf_filter,
+    build_capture_script,
+    _audit_capture_start_state,
+    _audit_capture_completion_state,
+    _audit_capture_view_state,
+    _audit_capture_delete_state,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -440,3 +447,172 @@ def test_presigned_put_url_uses_sigv4(monkeypatch):
 
     assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in url
     assert "AWSAccessKeyId=" not in url
+
+
+# ---------------------------------------------------------------------------
+# Audit-state builder tests
+# ---------------------------------------------------------------------------
+
+class TestAuditCaptureStartState:
+    def test_required_keys_present(self):
+        state = _audit_capture_start_state(
+            server_id=5,
+            server_name="vpn-dev-01",
+            interface="ens5",
+            mode="headers",
+            snaplen=HEADERS_SNAPLEN,
+            host_filter="10.0.0.0/24",
+            port_filter=443,
+            protocol_filter="tcp",
+            duration_seconds=60,
+        )
+        for key in (
+            "server_id", "server_name", "interface", "mode",
+            "snaplen", "host_filter", "port_filter",
+            "protocol_filter", "duration_seconds",
+        ):
+            assert key in state, f"Missing key: {key}"
+
+    def test_values_match_input(self):
+        state = _audit_capture_start_state(
+            server_id=7,
+            server_name="vpn-prod-02",
+            interface="ens6",
+            mode="full",
+            snaplen=FULL_SNAPLEN,
+            host_filter=None,
+            port_filter=None,
+            protocol_filter="all",
+            duration_seconds=120,
+        )
+        assert state["server_id"] == 7
+        assert state["server_name"] == "vpn-prod-02"
+        assert state["interface"] == "ens6"
+        assert state["mode"] == "full"
+        assert state["snaplen"] == FULL_SNAPLEN
+        assert state["host_filter"] is None
+        assert state["port_filter"] is None
+        assert state["protocol_filter"] == "all"
+        assert state["duration_seconds"] == 120
+
+    def test_no_status_or_error_fields(self):
+        """capture_start state must not include runtime outcome fields."""
+        state = _audit_capture_start_state(
+            server_id=1, server_name="n", interface="ens5", mode="headers",
+            snaplen=96, host_filter=None, port_filter=None,
+            protocol_filter="all", duration_seconds=30,
+        )
+        assert "status" not in state
+        assert "error" not in state
+        assert "size_bytes" not in state
+
+
+class TestAuditCaptureCompletionState:
+    def test_required_keys_present(self):
+        state = _audit_capture_completion_state(
+            capture_id=42,
+            status="completed",
+            size_bytes=1024,
+            truncated_by_size=False,
+            error=None,
+        )
+        for key in ("capture_id", "status", "size_bytes", "truncated_by_size", "error"):
+            assert key in state, f"Missing key: {key}"
+
+    def test_failed_case(self):
+        state = _audit_capture_completion_state(
+            capture_id=10,
+            status="failed",
+            size_bytes=None,
+            truncated_by_size=False,
+            error="tcpdump exited with RC=1",
+        )
+        assert state["status"] == "failed"
+        assert state["size_bytes"] is None
+        assert state["error"] == "tcpdump exited with RC=1"
+
+    def test_truncated_case(self):
+        state = _audit_capture_completion_state(
+            capture_id=5,
+            status="completed",
+            size_bytes=52428800,
+            truncated_by_size=True,
+            error=None,
+        )
+        assert state["truncated_by_size"] is True
+        assert state["size_bytes"] == 52428800
+
+    def test_no_identifying_fields(self):
+        """Completion state must not duplicate start-time identifying fields."""
+        state = _audit_capture_completion_state(
+            capture_id=1, status="completed",
+            size_bytes=100, truncated_by_size=False, error=None,
+        )
+        assert "server_name" not in state
+        assert "interface" not in state
+        assert "mode" not in state
+
+
+class TestAuditCaptureViewState:
+    def test_required_keys_present(self):
+        state = _audit_capture_view_state(
+            capture_id=3,
+            server_id=1,
+            server_name="vpn-dev-01",
+            mode="headers",
+            interface="ens5",
+            host_filter=None,
+            port_filter=None,
+            protocol_filter="all",
+            payload_shown=False,
+        )
+        for key in (
+            "capture_id", "server_id", "server_name", "mode",
+            "interface", "host_filter", "port_filter",
+            "protocol_filter", "payload_shown",
+        ):
+            assert key in state, f"Missing key: {key}"
+
+    def test_payload_shown_full_mode(self):
+        state = _audit_capture_view_state(
+            capture_id=8, server_id=2, server_name="n",
+            mode="full", interface="ens6",
+            host_filter=None, port_filter=None, protocol_filter="all",
+            payload_shown=True,
+        )
+        assert state["payload_shown"] is True
+        assert state["mode"] == "full"
+
+
+class TestAuditCaptureDeleteState:
+    def test_required_keys_present(self):
+        state = _audit_capture_delete_state(
+            capture_id=9,
+            server_id=3,
+            server_name="vpn-dev-02",
+            mode="headers",
+            interface="ens5",
+            host_filter="10.0.1.0/24",
+            port_filter=22,
+            protocol_filter="tcp",
+            duration_seconds=90,
+            size_bytes=4096,
+            s3_key="captures/9.pcap",
+        )
+        for key in (
+            "capture_id", "server_id", "server_name", "mode",
+            "interface", "host_filter", "port_filter",
+            "protocol_filter", "duration_seconds", "size_bytes", "s3_key",
+        ):
+            assert key in state, f"Missing key: {key}"
+
+    def test_null_size_allowed(self):
+        """A capture that failed before upload has size_bytes=None."""
+        state = _audit_capture_delete_state(
+            capture_id=11, server_id=1, server_name="n",
+            mode="headers", interface="ens5",
+            host_filter=None, port_filter=None, protocol_filter="all",
+            duration_seconds=30, size_bytes=None, s3_key=None,
+        )
+        assert state["size_bytes"] is None
+        assert state["s3_key"] is None

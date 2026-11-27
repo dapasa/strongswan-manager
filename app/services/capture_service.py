@@ -273,6 +273,117 @@ curl -sf --max-time {curl_timeout_seconds} -T "$TMPFILE" {quoted_url}
 
 
 # ---------------------------------------------------------------------------
+# Audit-state builders (pure functions — no DB, testable in isolation)
+# ---------------------------------------------------------------------------
+
+def _audit_capture_start_state(
+    *,
+    server_id: int,
+    server_name: str,
+    interface: str,
+    mode: str,
+    snaplen: int,
+    host_filter: str | None,
+    port_filter: int | None,
+    protocol_filter: str,
+    duration_seconds: int,
+) -> dict:
+    """Return the new_state dict for a capture_start audit entry.
+
+    Written atomically with the running row so the intent is recorded even if
+    the manager restarts before the capture completes.
+    """
+    return {
+        "server_id": server_id,
+        "server_name": server_name,
+        "interface": interface,
+        "mode": mode,
+        "snaplen": snaplen,
+        "host_filter": host_filter,
+        "port_filter": port_filter,
+        "protocol_filter": protocol_filter,
+        "duration_seconds": duration_seconds,
+    }
+
+
+def _audit_capture_completion_state(
+    *,
+    capture_id: int,
+    status: str,
+    size_bytes: int | None,
+    truncated_by_size: bool,
+    error: str | None,
+) -> dict:
+    """Return the new_state dict for the background completion update entry."""
+    return {
+        "capture_id": capture_id,
+        "status": status,
+        "size_bytes": size_bytes,
+        "truncated_by_size": truncated_by_size,
+        "error": error,
+    }
+
+
+def _audit_capture_view_state(
+    *,
+    capture_id: int,
+    server_id: int,
+    server_name: str,
+    mode: str,
+    interface: str,
+    host_filter: str | None,
+    port_filter: int | None,
+    protocol_filter: str,
+    payload_shown: bool,
+) -> dict:
+    """Return the new_state dict for a capture_view audit entry."""
+    return {
+        "capture_id": capture_id,
+        "server_id": server_id,
+        "server_name": server_name,
+        "mode": mode,
+        "interface": interface,
+        "host_filter": host_filter,
+        "port_filter": port_filter,
+        "protocol_filter": protocol_filter,
+        "payload_shown": payload_shown,
+    }
+
+
+def _audit_capture_delete_state(
+    *,
+    capture_id: int,
+    server_id: int,
+    server_name: str,
+    mode: str,
+    interface: str,
+    host_filter: str | None,
+    port_filter: int | None,
+    protocol_filter: str,
+    duration_seconds: int,
+    size_bytes: int | None,
+    s3_key: str | None,
+) -> dict:
+    """Return the previous_state dict for a capture_delete audit entry.
+
+    Uses previous_state (not new_state) since the row is being removed.
+    """
+    return {
+        "capture_id": capture_id,
+        "server_id": server_id,
+        "server_name": server_name,
+        "mode": mode,
+        "interface": interface,
+        "host_filter": host_filter,
+        "port_filter": port_filter,
+        "protocol_filter": protocol_filter,
+        "duration_seconds": duration_seconds,
+        "size_bytes": size_bytes,
+        "s3_key": s3_key,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Background task
 # ---------------------------------------------------------------------------
 
@@ -360,14 +471,14 @@ async def _run_capture_background(
                 user_id=user_id,
                 entity_type="packet_capture",
                 entity_id=capture_id,
-                action="capture_start",
-                new_state={
-                    "id": capture_id,
-                    "status": status,
-                    "size_bytes": size_bytes,
-                    "truncated_by_size": truncated_by_size,
-                    "error": error_msg,
-                },
+                action="update",
+                new_state=_audit_capture_completion_state(
+                    capture_id=capture_id,
+                    status=status,
+                    size_bytes=size_bytes,
+                    truncated_by_size=truncated_by_size,
+                    error=error_msg,
+                ),
             )
             await session.commit()
 
@@ -417,7 +528,7 @@ async def start_capture(
         session: Async DB session (used for validation and initial commit only).
         data: Validated CaptureStart payload.
         user: Authenticated user.
-        request: FastAPI request (unused here — audit fires in the background).
+        request: FastAPI request used for audit IP/user-agent.
 
     Returns:
         The newly inserted PacketCapture row (status='running').
@@ -523,7 +634,30 @@ async def start_capture(
         presigned_url=presigned_url,
     )
 
-    # Commit so concurrent requests see the running row immediately
+    # Write capture_start audit atomically with the running row.
+    # This ensures the intent is recorded even if the manager restarts before
+    # the background task completes.
+    await audit.log_action(
+        session,
+        user_id=user.id,
+        entity_type="packet_capture",
+        entity_id=capture.id,
+        action="capture_start",
+        new_state=_audit_capture_start_state(
+            server_id=server.id,
+            server_name=server.name,
+            interface=data.interface,
+            mode=data.mode,
+            snaplen=snaplen,
+            host_filter=data.host_filter,
+            port_filter=data.port_filter,
+            protocol_filter=data.protocol_filter,
+            duration_seconds=data.duration_seconds,
+        ),
+        request=request,
+    )
+
+    # Commit so concurrent requests see the running row immediately (audit is included)
     await session.commit()
     await session.refresh(capture)
 
@@ -612,6 +746,13 @@ async def read_capture(
     # Payload shown only in full mode (Tier 2 already verified above)
     show_payload = capture.mode == "full"
 
+    # Load server name for audit (best-effort — use placeholder if gone)
+    server_result = await session.execute(
+        select(Server).where(Server.id == capture.server_id)
+    )
+    view_server = server_result.scalar_one_or_none()
+    server_name_for_audit = view_server.name if view_server else f"server:{capture.server_id}"
+
     # Download from S3 in executor to avoid blocking the event loop
     loop = asyncio.get_running_loop()
     pcap_bytes = await loop.run_in_executor(
@@ -652,7 +793,17 @@ async def read_capture(
         entity_type="packet_capture",
         entity_id=capture.id,
         action="capture_view",
-        new_state={"capture_id": capture_id, "payload_shown": show_payload},
+        new_state=_audit_capture_view_state(
+            capture_id=capture_id,
+            server_id=capture.server_id,
+            server_name=server_name_for_audit,
+            mode=capture.mode,
+            interface=capture.interface,
+            host_filter=capture.host_filter,
+            port_filter=capture.port_filter,
+            protocol_filter=capture.protocol_filter,
+            payload_shown=show_payload,
+        ),
         request=request,
     )
     await session.commit()
@@ -686,6 +837,13 @@ async def delete_capture(
 
     settings = get_settings()
 
+    # Load server name for audit before potentially modifying state
+    del_server_result = await session.execute(
+        select(Server).where(Server.id == capture.server_id)
+    )
+    del_server = del_server_result.scalar_one_or_none()
+    del_server_name = del_server.name if del_server else f"server:{capture.server_id}"
+
     if capture.s3_object_key and capture.status == "completed":
         loop = asyncio.get_running_loop()
         try:
@@ -710,7 +868,19 @@ async def delete_capture(
         entity_type="packet_capture",
         entity_id=capture.id,
         action="capture_delete",
-        previous_state={"capture_id": capture_id, "s3_key": capture.s3_object_key},
+        previous_state=_audit_capture_delete_state(
+            capture_id=capture_id,
+            server_id=capture.server_id,
+            server_name=del_server_name,
+            mode=capture.mode,
+            interface=capture.interface,
+            host_filter=capture.host_filter,
+            port_filter=capture.port_filter,
+            protocol_filter=capture.protocol_filter,
+            duration_seconds=capture.duration_seconds,
+            size_bytes=capture.size_bytes,
+            s3_key=capture.s3_object_key,
+        ),
         request=request,
     )
     await session.commit()
