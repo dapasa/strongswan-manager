@@ -26,6 +26,7 @@ def _make_mock_user(role: str = "admin", user_id: int = 1) -> User:
     user.display_name = f"Test {role.capitalize()}"
     user.role = role
     user.is_active = True
+    user.shortcut_member_id = None
     return user
 
 
@@ -207,8 +208,9 @@ class TestOperatorIPTablesAccess:
             )
         assert resp.status_code == 201
 
+    @patch("app.services.iptables_service.get_rule", new_callable=AsyncMock)
     @patch("app.services.iptables_service.update_rule", new_callable=AsyncMock)
-    async def test_operator_can_update_iptables(self, mock_update):
+    async def test_operator_can_update_iptables(self, mock_update, mock_get_rule):
         now = datetime.now(timezone.utc)
         mock_rule = MagicMock()
         mock_rule.id = 1
@@ -230,6 +232,7 @@ class TestOperatorIPTablesAccess:
         mock_rule.created_at = now
         mock_rule.updated_at = now
         mock_update.return_value = mock_rule
+        mock_get_rule.return_value = mock_rule
 
         operator = _make_mock_user("operator", user_id=3)
         client = await _get_client(operator)
@@ -240,9 +243,13 @@ class TestOperatorIPTablesAccess:
             )
         assert resp.status_code == 200
 
+    @patch("app.services.iptables_service.get_rule", new_callable=AsyncMock)
     @patch("app.services.iptables_service.delete_rule", new_callable=AsyncMock)
-    async def test_operator_can_delete_iptables(self, mock_delete):
+    async def test_operator_can_delete_iptables(self, mock_delete, mock_get_rule):
         mock_delete.return_value = None
+        mock_existing = MagicMock()
+        mock_existing.action = "ACCEPT"
+        mock_get_rule.return_value = mock_existing
 
         operator = _make_mock_user("operator", user_id=3)
         client = await _get_client(operator)
@@ -250,8 +257,9 @@ class TestOperatorIPTablesAccess:
             resp = await client.delete("/api/v1/iptables/1")
         assert resp.status_code == 204
 
+    @patch("app.services.iptables_service.get_rule", new_callable=AsyncMock)
     @patch("app.services.iptables_service.retry_rule", new_callable=AsyncMock)
-    async def test_operator_can_retry_iptables(self, mock_retry):
+    async def test_operator_can_retry_iptables(self, mock_retry, mock_get_rule):
         now = datetime.now(timezone.utc)
         mock_rule = MagicMock()
         mock_rule.id = 1
@@ -273,6 +281,7 @@ class TestOperatorIPTablesAccess:
         mock_rule.created_at = now
         mock_rule.updated_at = now
         mock_retry.return_value = mock_rule
+        mock_get_rule.return_value = mock_rule
 
         operator = _make_mock_user("operator", user_id=3)
         client = await _get_client(operator)
@@ -336,7 +345,11 @@ class TestViewerCannotWrite:
             )
         assert resp.status_code == 403
 
-    async def test_viewer_cannot_update_iptables(self):
+    @patch("app.services.iptables_service.get_rule", new_callable=AsyncMock)
+    async def test_viewer_cannot_update_iptables(self, mock_get_rule):
+        mock_existing = MagicMock()
+        mock_existing.action = "ACCEPT"
+        mock_get_rule.return_value = mock_existing
         viewer = _make_mock_user("viewer", user_id=2)
         client = await _get_client(viewer)
         async with client:
@@ -346,7 +359,11 @@ class TestViewerCannotWrite:
             )
         assert resp.status_code == 403
 
-    async def test_viewer_cannot_delete_iptables(self):
+    @patch("app.services.iptables_service.get_rule", new_callable=AsyncMock)
+    async def test_viewer_cannot_delete_iptables(self, mock_get_rule):
+        mock_existing = MagicMock()
+        mock_existing.action = "ACCEPT"
+        mock_get_rule.return_value = mock_existing
         viewer = _make_mock_user("viewer", user_id=2)
         client = await _get_client(viewer)
         async with client:

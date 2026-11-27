@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from app.routers.access_requests import router as access_requests_router
 from app.routers.audit import router as audit_router
 from app.routers.auth import router as auth_router
 from app.routers.dashboard import router as dashboard_router
@@ -15,6 +16,7 @@ from app.routers.tunnels import router as tunnels_router
 from app.routers.users import router as users_router
 
 __all__ = [
+    "access_requests_router",
     "audit_router",
     "auth_router",
     "dashboard_router",

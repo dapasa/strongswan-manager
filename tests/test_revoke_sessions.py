@@ -45,6 +45,7 @@ def _make_mock_user(
     user.tokens_valid_after = tokens_valid_after
     user.last_login_at = None
     user.created_at = datetime.now(timezone.utc)
+    user.shortcut_member_id = None
     return user
 
 
@@ -309,6 +310,7 @@ class TestAdminRevokeSessionsEndpoint:
         target_user.is_active = True
         target_user.last_login_at = now
         target_user.created_at = now
+        target_user.shortcut_member_id = None
         mock_revoke.return_value = target_user
 
         admin = _make_mock_user("admin", user_id=1)

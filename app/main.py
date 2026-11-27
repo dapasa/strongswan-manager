@@ -21,6 +21,7 @@ from app.middleware import (
     register_exception_handlers,
 )
 from app.routers import (
+    access_requests_router,
     audit_router,
     auth_router,
     dashboard_router,
@@ -33,6 +34,7 @@ from app.routers import (
     tunnels_router,
     users_router,
 )
+from app.services.access_poller import access_poller_loop
 from app.services.reconciler import reconciler_loop
 
 logger = get_logger(__name__)
@@ -76,11 +78,21 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         reconciler_loop(async_session_factory, settings)
     )
 
+    # Start the Tier 2 access poller (polls Shortcut for approvals/rejections)
+    access_poller_task = asyncio.create_task(
+        access_poller_loop(async_session_factory, settings)
+    )
+
     yield
 
     reconciler_task.cancel()
+    access_poller_task.cancel()
     try:
         await reconciler_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await access_poller_task
     except asyncio.CancelledError:
         pass
 
@@ -133,6 +145,7 @@ def create_app() -> FastAPI:
     app.include_router(audit_router)
     app.include_router(operations_router)
     app.include_router(users_router)
+    app.include_router(access_requests_router)
 
     return app
 

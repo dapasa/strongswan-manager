@@ -15,7 +15,7 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import RoleGuard from '@/components/shared/RoleGuard'
+import PermGuard from '@/components/shared/PermGuard'
 import ConfirmDialog from '@/components/shared/ConfirmDialog'
 import TunnelStatusCell from '@/components/tunnels/TunnelStatusCell'
 import RouteList from '@/components/routes/RouteList'
@@ -224,7 +224,7 @@ export default function TunnelDetailPage() {
               isError={liveStatus.isError}
             />
             {data.sync_status === 'failed' && (
-              <RoleGuard requiredRole="operator">
+              <PermGuard permKey="tunnels.write">
                 <Button
                   variant="outline"
                   size="sm"
@@ -234,15 +234,15 @@ export default function TunnelDetailPage() {
                   <RefreshCw className={cn('h-4 w-4', retrySync.isPending && 'animate-spin')} />
                   Retry Sync
                 </Button>
-              </RoleGuard>
+              </PermGuard>
             )}
           </div>
           {data.description && (
             <p className="ml-12 text-sm text-muted-foreground">{data.description}</p>
           )}
         </div>
-        <RoleGuard requiredRole="operator">
-          <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2">
+          <PermGuard permKey="tunnels.connect">
             <Button
               variant="outline"
               disabled={initiateMutation.isPending || terminateMutation.isPending}
@@ -251,6 +251,8 @@ export default function TunnelDetailPage() {
               <Zap className={cn('h-4 w-4', initiateMutation.isPending && 'animate-pulse')} />
               {initiateMutation.isPending ? 'Bringing up…' : 'Bring up'}
             </Button>
+          </PermGuard>
+          <PermGuard permKey="tunnels.connect">
             <Button
               variant="outline"
               disabled={initiateMutation.isPending || terminateMutation.isPending}
@@ -259,22 +261,28 @@ export default function TunnelDetailPage() {
               <ZapOff className={cn('h-4 w-4', terminateMutation.isPending && 'animate-pulse')} />
               {terminateMutation.isPending ? 'Bringing down…' : 'Bring down'}
             </Button>
+          </PermGuard>
+          <PermGuard permKey="tunnels.write">
             <Button variant="outline" asChild>
               <Link to={`/tunnels/${id}/edit`}>
                 <Pencil className="h-4 w-4" />
                 Edit
               </Link>
             </Button>
+          </PermGuard>
+          <PermGuard permKey="tunnels.psk">
             <Button variant="outline" onClick={() => setShowRotateConfirm(true)}>
               <Key className="h-4 w-4" />
               Rotate PSK
             </Button>
+          </PermGuard>
+          <PermGuard permKey="tunnels.write">
             <Button variant="destructive" onClick={() => setShowDelete(true)}>
               <Trash2 className="h-4 w-4" />
               Delete
             </Button>
-          </div>
-        </RoleGuard>
+          </PermGuard>
+        </div>
       </div>
 
       {/* Tabs */}

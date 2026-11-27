@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.db.models import User
+from app.db.models import User, UserPermission
 from app.db.session import get_db
 from app.exceptions import AuthenticationError, AuthorizationError
 from app.logging_config import get_logger
@@ -212,3 +212,82 @@ async def require_viewer(current_user: User = Depends(get_current_user)) -> User
     this is functionally identical but makes the intent explicit in router code.
     """
     return current_user
+
+
+# ---------------------------------------------------------------------------
+# Tier 1 — per-action permission enforcement
+# ---------------------------------------------------------------------------
+
+async def _has_tier1_permission(
+    user: User,
+    perm_key: str,
+    db: AsyncSession,
+) -> bool:
+    """Return True if the user holds the given Tier 1 permission.
+
+    Rules:
+    - admin: always True (implicit grant, no DB query).
+    - viewer: always False (viewer is read-only).
+    - operator: query user_permissions table.
+    """
+    if user.role == "admin":
+        return True
+    if _ROLE_HIERARCHY.get(user.role, 0) < _ROLE_HIERARCHY["operator"]:
+        return False
+    result = await db.execute(
+        select(UserPermission).where(
+            UserPermission.user_id == user.id,
+            UserPermission.permission_key == perm_key,
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def assert_permission(
+    user: User,
+    perm_key: str,
+    db: AsyncSession,
+) -> None:
+    """Raise AuthorizationError if the user lacks the given Tier 1 permission.
+
+    Usage in route handlers::
+
+        await assert_permission(current_user, "tunnels.write", db)
+    """
+    if not await _has_tier1_permission(user, perm_key, db):
+        logger.warning(
+            "insufficient_tier1_permission",
+            user_id=user.id,
+            user_role=user.role,
+            required_permission=perm_key,
+        )
+        raise AuthorizationError(f"Permission '{perm_key}' required")
+
+
+def require_permission(perm_key: str) -> Callable[..., Any]:
+    """Return a FastAPI dependency that enforces a Tier 1 permission.
+
+    Admin always passes.  Operators must have the permission in user_permissions.
+    Viewers always fail.
+
+    Usage::
+
+        @router.post("/tunnels", dependencies=[Depends(require_permission("tunnels.write"))])
+        async def create_tunnel(...): ...
+
+    Or to also receive the current_user::
+
+        @router.post("/tunnels")
+        async def create_tunnel(
+            current_user: User = Depends(require_permission("tunnels.write")),
+            ...
+        ): ...
+    """
+    async def _check(
+        db: AsyncSession = Depends(get_db),
+        current_user: User = Depends(get_current_user),
+    ) -> User:
+        await assert_permission(current_user, perm_key, db)
+        return current_user
+
+    return _check

@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import require_operator, require_viewer
+from app.auth import assert_permission, get_current_user, require_viewer
 from app.db.models import User
 from app.db.session import get_db
 from app.logging_config import get_logger
@@ -43,6 +43,11 @@ def _to_detail(rule: object) -> IPTablesRuleDetail:
         created_at=r.created_at,
         updated_at=r.updated_at,
     )
+
+
+def _perm_for_action(action: str) -> str:
+    """Return the required permission key for the given iptables action."""
+    return "iptables.snat" if action == "SNAT" else "iptables.filter"
 
 
 @router.get(
@@ -86,9 +91,16 @@ async def create_rule(
     request: Request,
     tunnel_id: int = Query(..., description="Tunnel this rule belongs to"),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(get_current_user),
 ) -> IPTablesRuleDetail:
-    """Create an iptables rule, apply via SSM, and persist."""
+    """Create an iptables rule, apply via SSM, and persist.
+
+    Requires 'iptables.filter' for ACCEPT/DROP/REJECT actions or
+    'iptables.snat' for SNAT actions.
+    """
+    perm = _perm_for_action(data.action)
+    await assert_permission(current_user, perm, db)
+
     rule = await iptables_service.create_rule(
         db,
         tunnel_id=tunnel_id,
@@ -109,9 +121,23 @@ async def update_rule(
     data: IPTablesRuleUpdate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(get_current_user),
 ) -> IPTablesRuleDetail:
-    """Update an iptables rule — removes old and applies new via SSM if structural fields changed."""
+    """Update an iptables rule — removes old and applies new via SSM if structural fields changed.
+
+    Checks permission based on the existing rule's action. If the update
+    changes the action to SNAT, 'iptables.snat' is also required.
+    """
+    existing = await iptables_service.get_rule(db, rule_id)
+    perm = _perm_for_action(existing.action)
+    await assert_permission(current_user, perm, db)
+
+    # If action is being changed, also check the new action's permission
+    if data.action is not None and data.action != existing.action:
+        new_perm = _perm_for_action(data.action)
+        if new_perm != perm:
+            await assert_permission(current_user, new_perm, db)
+
     rule = await iptables_service.update_rule(
         db,
         rule_id,
@@ -131,9 +157,16 @@ async def retry_rule(
     rule_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(get_current_user),
 ) -> IPTablesRuleDetail:
-    """Retry a failed iptables rule sync. Only works when sync_status='failed'."""
+    """Retry a failed iptables rule sync. Only works when sync_status='failed'.
+
+    Requires the permission matching the existing rule's action.
+    """
+    existing = await iptables_service.get_rule(db, rule_id)
+    perm = _perm_for_action(existing.action)
+    await assert_permission(current_user, perm, db)
+
     rule = await iptables_service.retry_rule(
         db,
         rule_id,
@@ -152,9 +185,16 @@ async def delete_rule(
     rule_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(get_current_user),
 ) -> None:
-    """Remove iptables rule via SSM and soft-delete from database."""
+    """Remove iptables rule via SSM and soft-delete from database.
+
+    Requires the permission matching the existing rule's action.
+    """
+    existing = await iptables_service.get_rule(db, rule_id)
+    perm = _perm_for_action(existing.action)
+    await assert_permission(current_user, perm, db)
+
     await iptables_service.delete_rule(
         db,
         rule_id,

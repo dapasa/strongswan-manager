@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import require_operator, require_viewer
+from app.auth import require_permission, require_viewer
 from app.db.models import User
 from app.db.session import get_db
 from app.logging_config import get_logger
@@ -123,7 +123,7 @@ async def create_tunnel(
     data: TunnelCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(require_permission("tunnels.write")),
 ) -> TunnelDetail:
     """Create a new IPSec tunnel and sync to infrastructure."""
     tunnel = await tunnel_service.create_tunnel(
@@ -146,7 +146,7 @@ async def update_tunnel(
     data: TunnelUpdate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(require_permission("tunnels.write")),
 ) -> TunnelDetail:
     """Update an existing tunnel and re-sync if connection parameters changed."""
     await tunnel_service.update_tunnel(
@@ -169,7 +169,7 @@ async def delete_tunnel(
     tunnel_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(require_permission("tunnels.write")),
 ) -> None:
     """Soft-delete a tunnel and cascade to routes and iptables rules."""
     await tunnel_service.delete_tunnel(
@@ -189,7 +189,7 @@ async def retry_tunnel_sync(
     tunnel_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(require_permission("tunnels.write")),
 ) -> TunnelDetail:
     """Retry a failed tunnel sync operation. Only works when sync_status='failed'."""
     await tunnel_service.retry_tunnel_sync(
@@ -214,7 +214,7 @@ async def rotate_tunnel_psk(
     request: Request,
     response: Response,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(require_permission("tunnels.psk")),
 ) -> RotatePskResponse:
     """Rotate the PSK for a tunnel.
 
@@ -309,7 +309,7 @@ async def create_tunnel_route(
     data: RouteCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(require_permission("routes.write")),
 ) -> RouteDetail:
     """Create a VPC route for a tunnel via the AWS EC2 API.
 
@@ -380,9 +380,20 @@ async def create_tunnel_iptables(
     data: IPTablesRuleCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(require_permission("iptables.filter")),
 ) -> IPTablesRuleDetail:
-    """Create an iptables rule on a tunnel, apply via SSM."""
+    """Create an iptables rule on a tunnel, apply via SSM.
+
+    Requires 'iptables.filter' for ACCEPT/DROP/REJECT rules,
+    or 'iptables.snat' for SNAT rules.  The stricter permission is enforced
+    here (the endpoint also accepts the .snat check implicitly via the
+    iptables router POST which does the inline action-based check).
+    """
+    from app.auth import assert_permission
+    # Determine required permission from the action
+    perm = "iptables.snat" if data.action == "SNAT" else "iptables.filter"
+    await assert_permission(current_user, perm, db)
+
     rule = await iptables_service.create_rule(
         db,
         tunnel_id=tunnel_id,
@@ -425,7 +436,7 @@ async def initiate_tunnel(
     tunnel_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(require_permission("tunnels.connect")),
 ) -> TunnelControlResult:
     """Run ``swanctl --initiate`` for the tunnel on the active VPN node.
 
@@ -454,7 +465,7 @@ async def terminate_tunnel(
     tunnel_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(require_permission("tunnels.connect")),
 ) -> TunnelControlResult:
     """Run ``swanctl --terminate`` for the tunnel on the active VPN node.
 

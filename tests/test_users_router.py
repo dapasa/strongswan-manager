@@ -30,6 +30,7 @@ def _make_mock_user(role: str = "admin", user_id: int = 1) -> User:
     user.display_name = f"Test {role.capitalize()}"
     user.role = role
     user.is_active = True
+    user.shortcut_member_id = None
     return user
 
 
@@ -70,6 +71,7 @@ class TestAdminListUsers:
         mock_user_obj.is_active = True
         mock_user_obj.last_login_at = now
         mock_user_obj.created_at = now
+        mock_user_obj.shortcut_member_id = None
         mock_list.return_value = ([mock_user_obj], 1)
 
         admin = _make_mock_user("admin", user_id=1)
@@ -116,6 +118,7 @@ class TestAdminGetUser:
         mock_user_obj.is_active = True
         mock_user_obj.last_login_at = now
         mock_user_obj.created_at = now
+        mock_user_obj.shortcut_member_id = None
         mock_get.return_value = mock_user_obj
 
         admin = _make_mock_user("admin", user_id=1)
@@ -145,6 +148,7 @@ class TestAdminUpdateUser:
         mock_user_obj.is_active = True
         mock_user_obj.last_login_at = now
         mock_user_obj.created_at = now
+        mock_user_obj.shortcut_member_id = None
         mock_update.return_value = mock_user_obj
 
         admin = _make_mock_user("admin", user_id=1)
@@ -170,6 +174,7 @@ class TestAdminUpdateUser:
         mock_user_obj.is_active = False
         mock_user_obj.last_login_at = now
         mock_user_obj.created_at = now
+        mock_user_obj.shortcut_member_id = None
         mock_update.return_value = mock_user_obj
 
         admin = _make_mock_user("admin", user_id=1)

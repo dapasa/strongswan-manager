@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import require_operator, require_viewer
+from app.auth import require_permission, require_viewer
 from app.db.models import User
 from app.db.session import get_db
 from app.logging_config import get_logger
@@ -61,7 +61,7 @@ async def create_route(
     data: RouteCreate = ...,
     request: Request = ...,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(require_permission("routes.write")),
 ) -> RouteDetail:
     """Create a VPC route via the AWS EC2 API.
 
@@ -101,7 +101,7 @@ async def delete_route(
     route_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(require_permission("routes.write")),
 ) -> None:
     """Delete a VPC route via the AWS EC2 API.
 
@@ -127,7 +127,7 @@ async def retry_route(
     route_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_operator),
+    current_user: User = Depends(require_permission("routes.write")),
 ) -> RouteDetail:
     """Retry AWS route provisioning for a route in 'failed' state.
 
