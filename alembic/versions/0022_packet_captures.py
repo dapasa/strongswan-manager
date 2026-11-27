@@ -65,13 +65,15 @@ def upgrade() -> None:
     )
 
     # Extend the audit_logs action check constraint to include capture actions.
-    # Drop and recreate (PostgreSQL requires this for CHECK constraints).
+    # Drop and recreate (PostgreSQL requires this for CHECK constraints). The list must
+    # keep every action allowed by 0021, including the tunnel control ones from 0018.
     op.drop_constraint("ck_audit_action", "audit_logs")
     op.create_check_constraint(
         "ck_audit_action",
         "audit_logs",
         "action IN ("
         "'create', 'update', 'delete', 'retry', 'login', 'rotate_psk', 'revoke_sessions',"
+        " 'initiate', 'terminate',"
         " 'access_request', 'access_grant', 'access_revoke', 'access_reject', 'access_invalid',"
         " 'capture_start', 'capture_view', 'capture_delete'"
         ")",
@@ -85,6 +87,7 @@ def downgrade() -> None:
         "audit_logs",
         "action IN ("
         "'create', 'update', 'delete', 'retry', 'login', 'rotate_psk', 'revoke_sessions',"
+        " 'initiate', 'terminate',"
         " 'access_request', 'access_grant', 'access_revoke', 'access_reject', 'access_invalid'"
         ")",
     )

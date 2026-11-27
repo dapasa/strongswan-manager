@@ -544,6 +544,7 @@ class AuditLog(Base):
         CheckConstraint(
             "action IN ("
             "'create', 'update', 'delete', 'retry', 'login', 'rotate_psk', 'revoke_sessions',"
+            " 'initiate', 'terminate',"
             " 'access_request', 'access_grant', 'access_revoke', 'access_reject', 'access_invalid',"
             " 'capture_start', 'capture_view', 'capture_delete'"
             ")",
