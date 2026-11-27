@@ -464,6 +464,59 @@ class AsyncOperation(TimestampMixin, Base):
     )
 
 
+class PacketCapture(TimestampMixin, Base):
+    """Packet capture record — one entry per capture session on a VPN node."""
+
+    __tablename__ = "packet_captures"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    server_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("servers.id"), nullable=False)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
+    mode: Mapped[str] = mapped_column(Text, nullable=False)  # 'headers' | 'full'
+    interface: Mapped[str] = mapped_column(Text, nullable=False)  # e.g. 'ens5'
+    host_filter: Mapped[str | None] = mapped_column(Text, nullable=True)   # validated IP/CIDR
+    port_filter: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    protocol_filter: Mapped[str] = mapped_column(Text, nullable=False, server_default="all")
+    duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    snaplen: Mapped[int] = mapped_column(Integer, nullable=False)  # 96=headers, 0=full
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="running")
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    s3_object_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Soft-delete for the capture record (the S3 object is deleted separately)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
+    truncated_by_size: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+
+    __table_args__ = (
+        CheckConstraint("mode IN ('headers', 'full')", name="ck_captures_mode"),
+        CheckConstraint(
+            "protocol_filter IN ('tcp', 'udp', 'icmp', 'all')",
+            name="ck_captures_protocol",
+        ),
+        CheckConstraint(
+            "status IN ('running', 'completed', 'failed', 'deleted')",
+            name="ck_captures_status",
+        ),
+        CheckConstraint(
+            "port_filter IS NULL OR port_filter BETWEEN 1 AND 65535",
+            name="ck_captures_port",
+        ),
+        CheckConstraint("duration_seconds > 0", name="ck_captures_duration_pos"),
+        CheckConstraint("snaplen >= 0", name="ck_captures_snaplen"),
+        Index("idx_captures_server_id", "server_id"),
+        Index("idx_captures_user_id", "user_id"),
+        Index(
+            "idx_captures_server_running",
+            "server_id",
+            "status",
+            postgresql_where=text("status = 'running' AND deleted_at IS NULL"),
+        ),
+    )
+
+
 class AuditLog(Base):
     """Immutable audit trail for all CUD operations."""
 
@@ -491,7 +544,9 @@ class AuditLog(Base):
         CheckConstraint(
             "action IN ("
             "'create', 'update', 'delete', 'retry', 'login', 'rotate_psk', 'revoke_sessions',"
-            " 'access_request', 'access_grant', 'access_revoke', 'access_reject', 'access_invalid'"
+            " 'initiate', 'terminate',"
+            " 'access_request', 'access_grant', 'access_revoke', 'access_reject', 'access_invalid',"
+            " 'capture_start', 'capture_view', 'capture_delete'"
             ")",
             name="ck_audit_action",
         ),
