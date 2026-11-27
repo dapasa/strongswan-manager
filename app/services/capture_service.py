@@ -43,6 +43,10 @@ _CURL_TIMEOUT_SECONDS = 60
 # Valid interfaces
 _VALID_INTERFACES = frozenset(("ens5", "ens6", "any"))
 
+# Strong references to in-flight capture tasks: the event loop only keeps weak ones,
+# so an unreferenced task can be garbage-collected before it finishes.
+_background_tasks: set[asyncio.Task] = set()
+
 
 # ---------------------------------------------------------------------------
 # BPF filter builder
@@ -515,7 +519,7 @@ async def start_capture(
     await session.refresh(capture)
 
     # Launch background task (the HTTP response is returned before it finishes)
-    asyncio.create_task(
+    task = asyncio.create_task(
         _run_capture_background(
             capture_id=capture.id,
             server_id=data.server_id,
@@ -524,6 +528,8 @@ async def start_capture(
             user_id=user.id,
         )
     )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     logger.info(
         "capture_accepted",
