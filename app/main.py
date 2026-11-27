@@ -24,6 +24,7 @@ from app.routers import (
     access_requests_router,
     audit_router,
     auth_router,
+    captures_router,
     dashboard_router,
     health_router,
     iptables_router,
@@ -136,6 +137,7 @@ def create_app() -> FastAPI:
     # Routers already carry their own prefixes and tags.
     app.include_router(health_router)
     app.include_router(auth_router)
+    app.include_router(captures_router)
     app.include_router(tunnels_router)
     app.include_router(servers_router)
     app.include_router(routes_router)
