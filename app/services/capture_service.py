@@ -131,10 +131,48 @@ def get_object_bytes(bucket: str, key: str) -> bytes:
 
 
 def delete_s3_object(bucket: str, key: str) -> None:
-    """Delete an S3 object (idempotent — missing key is OK)."""
+    """Hard-delete all versions and delete markers for *key* in a versioned bucket.
+
+    A simple ``delete_object`` on a versioned bucket only inserts a delete
+    marker — the data is not removed.  This function lists all versions and
+    delete markers with the exact ``key`` prefix and issues a per-version
+    delete so the object is fully purged.
+
+    Idempotent: a key with no versions produces no error.
+    """
     s3 = _s3_client()
     try:
-        s3.delete_object(Bucket=bucket, Key=key)
+        paginator = s3.get_paginator("list_object_versions")
+        pages = paginator.paginate(Bucket=bucket, Prefix=key)
+        objects_to_delete: list[dict] = []
+        for page in pages:
+            for ver in page.get("Versions", []):
+                if ver["Key"] == key:
+                    objects_to_delete.append({"Key": ver["Key"], "VersionId": ver["VersionId"]})
+            for dm in page.get("DeleteMarkers", []):
+                if dm["Key"] == key:
+                    objects_to_delete.append({"Key": dm["Key"], "VersionId": dm["VersionId"]})
+
+        if not objects_to_delete:
+            return  # Key never existed or already fully deleted
+
+        # delete_objects supports up to 1000 items per call
+        for i in range(0, len(objects_to_delete), 1000):
+            batch = objects_to_delete[i : i + 1000]
+            resp = s3.delete_objects(
+                Bucket=bucket,
+                Delete={"Objects": batch, "Quiet": True},
+            )
+            errors = resp.get("Errors", [])
+            if errors:
+                detail = "; ".join(
+                    f"{e['Key']}@{e.get('VersionId','')} — {e['Message']}"
+                    for e in errors
+                )
+                raise InfrastructureError(
+                    service="s3",
+                    message=f"Failed to delete {len(errors)} object version(s): {detail}",
+                )
     except ClientError as exc:
         raise InfrastructureError(
             service="s3",
