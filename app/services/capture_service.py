@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from fastapi import Request
 from sqlalchemy import select
@@ -100,9 +101,17 @@ def build_bpf_filter(
 # ---------------------------------------------------------------------------
 
 def _s3_client():
-    """Return a boto3 S3 client using the default credential chain."""
+    """Return a boto3 S3 client using the default credential chain.
+
+    SigV4 is forced: botocore can still presign with SigV2 for S3, and the captures
+    bucket encrypts with SSE-KMS by default, which rejects anything but SigV4.
+    """
     settings = get_settings()
-    return boto3.client("s3", region_name=settings.aws_region)
+    return boto3.client(
+        "s3",
+        region_name=settings.aws_region,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+    )
 
 
 def generate_presigned_put_url(bucket: str, key: str, ttl_seconds: int) -> str:

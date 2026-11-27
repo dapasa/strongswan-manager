@@ -425,3 +425,18 @@ class TestBuildCaptureScript:
         )
         assert "CAPTURE_SIZE=" in script
         assert "echo" in script
+
+
+def test_presigned_put_url_uses_sigv4(monkeypatch):
+    """The captures bucket is SSE-KMS by default, which only accepts SigV4 requests."""
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEEXAMPLE00")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "example-secret-key-for-presign-tests-only")
+    monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+
+    from app.services.capture_service import generate_presigned_put_url
+
+    url = generate_presigned_put_url("dev-strongswan-captures", "captures/1.pcap", 300)
+
+    assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in url
+    assert "AWSAccessKeyId=" not in url
